@@ -185,56 +185,47 @@ fn parse_single_param(v: &lexpr::Value, span: Span) -> Result<Param, ParseError>
 }
 
 pub(crate) fn parse_type_expr(v: &lexpr::Value, span: Span) -> Result<TypeExprAst, ParseError> {
+    // Atomic type name.
     if let Some(sym) = v.as_symbol() {
         if sym == UNION_BAR_SENTINEL {
             return Err(ParseError {
                 span,
-                message: "unexpected `|` in type position".into(),
+                message: "unexpected `|` in atomic type position; use `(| A B ...)` for unions"
+                    .into(),
             });
         }
         return Ok(TypeExprAst::Named(sym.to_string()));
     }
-    // Otherwise it should be a list with '|' separators after preprocessing:
-    // e.g. (PlainText __agnes_union_bar__ Markdown __agnes_union_bar__ HTML)
+    // Compound: (head arg1 arg2 ...). Head is a symbol (possibly the sentinel `|`).
     let items = as_list(v, span)?;
-    let mut members = Vec::new();
-    let mut expect_type = true;
-    for item in items {
-        if expect_type {
-            let sym = item.as_symbol().ok_or_else(|| ParseError {
-                span,
-                message: "type name (symbol) expected".into(),
-            })?;
-            if sym == UNION_BAR_SENTINEL {
-                return Err(ParseError {
-                    span,
-                    message: "expected type name, got `|`".into(),
-                });
-            }
-            members.push(TypeExprAst::Named(sym.to_string()));
-            expect_type = false;
-        } else {
-            let sep = item.as_symbol().ok_or_else(|| ParseError {
-                span,
-                message: "expected `|` between type expressions".into(),
-            })?;
-            if sep != UNION_BAR_SENTINEL {
-                return Err(ParseError {
-                    span,
-                    message: format!("expected `|`, got `{sep}`"),
-                });
-            }
-            expect_type = true;
-        }
+    if items.is_empty() {
+        return Err(ParseError {
+            span,
+            message: "empty type expression `()` is not a valid type".into(),
+        });
     }
-    if members.len() == 1 {
-        Ok(members.into_iter().next().unwrap())
+    let head_sym = items[0].as_symbol().ok_or_else(|| ParseError {
+        span,
+        message: "type expression head (symbol) expected".into(),
+    })?;
+    let head = if head_sym == UNION_BAR_SENTINEL {
+        "|".to_string()
     } else {
-        Ok(TypeExprAst::App {
-            head: "|".into(),
-            args: members,
-        })
+        head_sym.to_string()
+    };
+    // Verify no sentinel appears in the args (would mean infix `|` was used).
+    let mut args: Vec<TypeExprAst> = Vec::with_capacity(items.len() - 1);
+    for item in &items[1..] {
+        if item.as_symbol() == Some(UNION_BAR_SENTINEL) {
+            return Err(ParseError {
+                span,
+                message: "infix `|` is not allowed in type expressions; union types now use prefix form `(| A B C)`"
+                    .into(),
+            });
+        }
+        args.push(parse_type_expr(item, span)?);
     }
+    Ok(TypeExprAst::App { head, args })
 }
 
 fn parse_literal(v: &lexpr::Value, span: Span) -> Result<Literal, ParseError> {

@@ -6,11 +6,14 @@
 //! ## lexpr 0.2 adaptations
 //!
 //! - `lexpr` 0.2 does not accept a bare `|` as a symbol start (SYMBOL_EXTENDED
-//!   in `lexpr/src/parse/mod.rs` excludes `|`), so the DSL's `(A | B)` union
-//!   syntax fails at tokenization. We preprocess the source, replacing every
-//!   `|` byte that is not inside a string literal with the sentinel symbol
-//!   `__agnes_union_bar__`, then interpret that sentinel back to a union
-//!   separator when building the `TypeExprAst`.
+//!   in `lexpr/src/parse/mod.rs` excludes `|`), so a source form like
+//!   `(| A B C)` (prefix union) fails at tokenization. We preprocess the
+//!   source, replacing every `|` byte that is not inside a string literal
+//!   with the sentinel symbol `__agnes_union_bar__`. `parse_type_expr` then
+//!   translates the sentinel back to head `"|"` when it appears at the head
+//!   position of a type expression, and rejects it (with a migration hint)
+//!   anywhere else — that non-head appearance is the tell of the old infix
+//!   `(A | B)` syntax.
 //! - `Value::as_vector()` does not exist in 0.2; we use `Value::to_vec()` which
 //!   works for both `[...]` (with default `Brackets::List`, parsed as a list)
 //!   and `(...)` forms.

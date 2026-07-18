@@ -41,7 +41,7 @@ fn parses_declare_type() {
 
 #[test]
 fn parses_declare_type_alias() {
-    let src = r#"(declare type-alias TextLike (PlainText | Markdown | HTML))"#;
+    let src = r#"(declare type-alias TextLike (| PlainText Markdown HTML))"#;
     let p = parse(src).expect("parse ok");
     match &p.toplevels[0] {
         TopLevel::DeclareTypeAlias { name, expr, .. } => {
@@ -51,7 +51,7 @@ fn parses_declare_type_alias() {
                     assert_eq!(head, "|");
                     assert_eq!(args.len(), 3);
                 }
-                other => panic!("expected App with head `|`, got {other:?}"),
+                other => panic!("expected App union, got {other:?}"),
             }
         }
         other => panic!("expected DeclareTypeAlias, got {other:?}"),
@@ -59,11 +59,41 @@ fn parses_declare_type_alias() {
 }
 
 #[test]
+fn parses_prefix_union() {
+    let src = r#"(declare type-alias TextLike (| PlainText Markdown HTML))"#;
+    let p = parse(src).expect("parse ok");
+    match &p.toplevels[0] {
+        TopLevel::DeclareTypeAlias { name, expr, .. } => {
+            assert_eq!(name, "TextLike");
+            match expr {
+                TypeExprAst::App { head, args } => {
+                    assert_eq!(head, "|");
+                    assert_eq!(args.len(), 3);
+                }
+                other => panic!("expected App, got {other:?}"),
+            }
+        }
+        other => panic!("expected DeclareTypeAlias, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_infix_union() {
+    let src = r#"(declare type-alias T (PlainText | Markdown))"#;
+    let err = parse(src).expect_err("must reject infix union");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("union") && msg.contains("prefix"),
+        "expected migration hint about prefix form, got: {msg}"
+    );
+}
+
+#[test]
 fn parses_declare_tool_position_based_param() {
     // (source (| PDF Image)) — no trailing colon on the name.
     let src = r#"
         (declare tool ocr
-          :requires [(source (PDF | Image))]
+          :requires [(source (| PDF Image))]
           :provides PlainText)
     "#;
     let p = parse(src).expect("parse ok");
