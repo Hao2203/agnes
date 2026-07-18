@@ -19,6 +19,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agnes-compiler"
+version = "0.1.0"
+dependencies = [
+ "agnes-ast",
+ "agnes-parser",
+ "agnes-registry",
+ "agnes-types",
+ "thiserror",
+]
+
+[[package]]
 name = "agnes-parser"
 version = "0.1.0"
 dependencies = [
