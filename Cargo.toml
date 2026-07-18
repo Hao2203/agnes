@@ -4,9 +4,9 @@ members = [
     "crates/agnes-ast",
     "crates/agnes-types",
     "crates/agnes-parser",
+    "crates/agnes-registry",
 ]
 # members = [
-#     "crates/agnes-registry",
 #     "crates/agnes-checker",
 #     "crates/agnes-compiler",
 #     "crates/agnes-runtime",

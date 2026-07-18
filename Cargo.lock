@@ -17,6 +17,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agnes-registry"
+version = "0.1.0"
+dependencies = [
+ "agnes-ast",
+ "agnes-types",
+ "thiserror",
+]
+
+[[package]]
 name = "agnes-types"
 version = "0.1.0"
 dependencies = [
