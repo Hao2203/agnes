@@ -3,8 +3,9 @@
 //! `validate` walks the expected `TypeExpr` and enforces the JSON payload's
 //! structural conformity. Named types run their registered `Validator`;
 //! union types (`(| A B ...)`) pick the member matching the value's declared
-//! type and recurse into it. Task 8 will add the List case; for now, other
-//! App heads are treated as an internal-error condition.
+//! type and recurse into it. `(List T)` requires a JSON array and recurses
+//! into each element against `T`. Other App heads remain an internal-error
+//! condition (they shouldn't appear in canonical form).
 
 use agnes_registry::Registry;
 use agnes_types::{TypeExpr, TypeName, Value, type_expr_matches};
@@ -38,8 +39,45 @@ pub fn validate(
                 }),
             }
         }
+        TypeExpr::App { head, args } if head.0 == "List" => {
+            if args.len() != 1 {
+                return Err(RuntimeError::RuntimeTypeError {
+                    tool: tool.to_string(),
+                    direction,
+                    ty: TypeName(expected.to_string()),
+                    cause: format!("List type has arity {}; expected 1", args.len()),
+                });
+            }
+            let arr = val.data.as_array().ok_or_else(|| RuntimeError::RuntimeTypeError {
+                tool: tool.to_string(),
+                direction,
+                ty: TypeName(expected.to_string()),
+                cause: format!("expected JSON array for List type, got {:?}", val.data),
+            })?;
+            let inner = &args[0];
+            for (i, elem_data) in arr.iter().enumerate() {
+                let elem_value = Value {
+                    data: elem_data.clone(),
+                    declared_type: inner.clone(),
+                };
+                validate(reg, tool, direction, inner, &elem_value).map_err(|e| {
+                    // Wrap error to add element index for locatability.
+                    match e {
+                        RuntimeError::RuntimeTypeError { tool, direction, ty, cause } => {
+                            RuntimeError::RuntimeTypeError {
+                                tool,
+                                direction,
+                                ty,
+                                cause: format!("element [{i}]: {cause}"),
+                            }
+                        }
+                        other => other,
+                    }
+                })?;
+            }
+            Ok(())
+        }
         TypeExpr::App { head, .. } => {
-            // Task 8 will add List. Any other head here is an internal error.
             Err(RuntimeError::RuntimeTypeError {
                 tool: tool.to_string(),
                 direction,

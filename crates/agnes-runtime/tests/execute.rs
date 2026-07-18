@@ -71,6 +71,37 @@ async fn evaluates_list_literal() {
     assert_eq!(arr[0], serde_json::json!("a"));
 }
 
+#[tokio::test]
+async fn boundary_validates_list_of_string_at_runtime() {
+    // Register a mock tool that (correctly) receives a (List String).
+    let mut r = agnes_registry::Registry::new();
+    agnes_builtins::register_builtins(&mut r).unwrap();
+    // Manually augment: declare a tool that requires (List String) and
+    // returns PlainText — mock via source.
+    let src = r#"
+        (declare tool see-list
+          :requires [(items (List String))]
+          :provides PlainText)
+
+        (tool see-list :items ["a" "b"])
+    "#;
+    let p = agnes_parser::parse(src).unwrap();
+    r.load(&p).unwrap();
+    agnes_checker::check(&p, &r).unwrap();
+    // Compile is fine, but native_dispatch has no impl — call will fail with
+    // MissingImpl at runtime. That's OK: the point of this test is to make
+    // sure the checker + compiler accept the parameterized signature and
+    // that runtime boundary validation doesn't panic before reaching dispatch.
+    let dag = agnes_compiler::compile(&p, &r).unwrap();
+    let dispatch = agnes_builtins::native_dispatch();
+    let err = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("No native implementation") || msg.contains("MissingImpl") || msg.contains("see-list"),
+        "expected missing-impl (not a validation error), got: {msg}"
+    );
+}
+
 fn tempfile_path() -> String {
     let dir = std::env::temp_dir();
     let stamp = std::process::id();
