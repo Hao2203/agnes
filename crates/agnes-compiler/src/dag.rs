@@ -15,6 +15,8 @@ pub enum NodeKind {
     Foreach { item: String },
     Retry { times: u32, backoff: Option<String> },
     Catch { on: Option<String>, fallback: NodeId },
+    /// Inputs are all `Input::Kw` entries with keys matching the llm builtin's
+    /// parameter names (`prompt`, `input`). No positional inputs.
     Llm,
     Return,
     Literal(Literal),
@@ -24,7 +26,13 @@ pub enum NodeKind {
 #[derive(Debug, Clone)]
 pub enum Input {
     FromNode(NodeId),
+    /// Reserved for future use (define inlining, literal argument optimization).
+    /// Not currently constructed by the lowering — kwargs and pipe flow all
+    /// resolve to Input::FromNode or Input::Kw. See docs/superpowers/plans/2026-07-18-agnes-dsl-mvp.md.
     Literal(Literal),
+    /// Reserved for future use (define inlining, literal argument optimization).
+    /// Not currently constructed by the lowering — kwargs and pipe flow all
+    /// resolve to Input::FromNode or Input::Kw. See docs/superpowers/plans/2026-07-18-agnes-dsl-mvp.md.
     Var(String),
     /// Keyword-bound edge: same as FromNode but tagged with the parameter
     /// name so the runtime knows which slot to fill.

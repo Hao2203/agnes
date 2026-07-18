@@ -142,15 +142,15 @@ impl<'a> Lowering<'a> {
             Expr::Llm {
                 positional, args, ..
             } => {
-                let mut inputs = Vec::new();
-                // Positional args: bind under synthetic index keys (arg0, arg1, ...)
-                for (i, e) in positional.iter().enumerate() {
-                    let src = self.lower_expr(e, None)?;
-                    inputs.push(Input::Kw {
-                        key: format!("arg{i}"),
-                        source: Box::new(Input::FromNode(src)),
+                if !positional.is_empty() {
+                    return Err(crate::CompileError::UnknownDefine {
+                        name: format!(
+                            "(llm ...) does not accept positional args; use :prompt and :input keyword args (got {} positional)",
+                            positional.len()
+                        ),
                     });
                 }
+                let mut inputs = Vec::new();
                 for (k, v) in args {
                     let src = self.lower_expr(v, None)?;
                     inputs.push(Input::Kw {
@@ -158,8 +158,10 @@ impl<'a> Lowering<'a> {
                         source: Box::new(Input::FromNode(src)),
                     });
                 }
-                // Flowed-in upstream lands under key "input" (runtime convention).
-                if let Some(up) = upstream {
+                // Flowed-in upstream fills the :input slot when not already provided.
+                if let Some(up) = upstream
+                    && !args.iter().any(|(k, _)| k == "input")
+                {
                     inputs.push(Input::Kw {
                         key: "input".into(),
                         source: Box::new(Input::FromNode(up)),

@@ -34,6 +34,25 @@ fn compiles_a_pipe() {
     let r = seed();
     let dag = compile(&p, &r).expect("compile ok");
     assert!(dag.nodes.len() >= 2);
+
+    // Find the summarize node
+    let summarize_node = dag
+        .nodes
+        .iter()
+        .find(|n| matches!(&n.kind, agnes_compiler::NodeKind::Tool { name } if name == "summarize"))
+        .expect("summarize node must exist");
+    // It should have exactly one Kw input keyed "input" pointing at another node
+    let input_kw = summarize_node
+        .inputs
+        .iter()
+        .find(|i| matches!(i, agnes_compiler::Input::Kw { key, .. } if key == "input"))
+        .expect("summarize should have :input kwarg from upstream flow");
+    match input_kw {
+        agnes_compiler::Input::Kw { source, .. } => {
+            assert!(matches!(**source, agnes_compiler::Input::FromNode(_)));
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[test]
