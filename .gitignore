@@ -1,2 +1,5 @@
 /target
+Cargo.lock.new
+**/*.rs.bk
+.direnv/
 /.superpowers/
