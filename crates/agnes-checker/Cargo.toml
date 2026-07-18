@@ -1,0 +1,16 @@
+[package]
+name = "agnes-checker"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agnes-ast.workspace = true
+agnes-types.workspace = true
+agnes-registry.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+agnes-parser.workspace = true
+insta.workspace = true

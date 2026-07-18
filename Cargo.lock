@@ -7,6 +7,18 @@ name = "agnes-ast"
 version = "0.1.0"
 
 [[package]]
+name = "agnes-checker"
+version = "0.1.0"
+dependencies = [
+ "agnes-ast",
+ "agnes-parser",
+ "agnes-registry",
+ "agnes-types",
+ "insta",
+ "thiserror",
+]
+
+[[package]]
 name = "agnes-parser"
 version = "0.1.0"
 dependencies = [
