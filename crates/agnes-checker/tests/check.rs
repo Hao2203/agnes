@@ -121,6 +121,67 @@ fn list_of_mixed_types_rejected_where_list_of_string_expected() {
 }
 
 #[test]
+fn empty_list_adapts_to_hint() {
+    // Given a tool requiring (List String), passing [] should succeed.
+    let mut r = Registry::new();
+    r.register_type("String", None).unwrap();
+    r.register_type("PlainText", None).unwrap();
+    r.register_type("Unknown", None).unwrap();
+    r.register_tool(
+        "consume-strings",
+        ToolSignature {
+            requires: vec![(
+                "items".into(),
+                TypeExpr::App {
+                    head: agnes_types::TypeName("List".into()),
+                    args: vec![TypeExpr::named("String")],
+                },
+            )],
+            provides: TypeExpr::named("PlainText"),
+        },
+    )
+    .unwrap();
+
+    let src = r#"(tool consume-strings :items [])"#;
+    let p = parse(src).unwrap();
+    check(&p, &r).expect("empty list must adapt to (List String)");
+}
+
+#[test]
+fn unbound_empty_list_via_let_is_still_list_unknown() {
+    // No hint at let site → empty list types as (List Unknown).
+    let mut r = Registry::new();
+    r.register_type("String", None).unwrap();
+    r.register_type("Unknown", None).unwrap();
+    r.register_type("PlainText", None).unwrap();
+    r.register_tool(
+        "consume-strings",
+        ToolSignature {
+            requires: vec![(
+                "items".into(),
+                TypeExpr::App {
+                    head: agnes_types::TypeName("List".into()),
+                    args: vec![TypeExpr::named("String")],
+                },
+            )],
+            provides: TypeExpr::named("PlainText"),
+        },
+    )
+    .unwrap();
+
+    let src = r#"
+        (pipe
+          (let xs [])
+          (tool consume-strings :items xs))
+    "#;
+    let p = parse(src).unwrap();
+    let err = check(&p, &r).expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("List"), "got: {msg}");
+    assert!(msg.contains("Unknown") || msg.contains("String"), "got: {msg}");
+}
+
+#[test]
 fn unknown_tool_reports() {
     let src = r#"(tool no-such-tool)"#;
     let p = parse(src).unwrap();

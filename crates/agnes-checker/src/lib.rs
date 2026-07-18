@@ -32,7 +32,7 @@ pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
                 let ty_expr = reg.resolve(&p.ty)?;
                 env.set(p.name.clone(), ty_expr);
             }
-            let body_ty = check_expr(body, reg, &mut env, None)?;
+            let body_ty = check_expr(body, reg, &mut env, None, None)?;
             let declared = reg.resolve(provides)?;
             if !type_expr_matches(&body_ty, &declared) {
                 return Err(CheckError::DefineSignatureMismatch {
@@ -45,7 +45,7 @@ pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
     }
     if let Some(main) = &program.main {
         let mut env = env::Env::default();
-        check_expr(main, reg, &mut env, None)?;
+        check_expr(main, reg, &mut env, None, None)?;
     }
     Ok(())
 }
@@ -55,6 +55,7 @@ fn check_expr(
     reg: &Registry,
     env: &mut env::Env,
     flowed_in: Option<TypeExpr>,
+    hint: Option<&TypeExpr>,
 ) -> Result<TypeExpr, CheckError> {
     match e {
         Expr::Tool {
@@ -67,7 +68,7 @@ fn check_expr(
             let mut upstream: Option<TypeExpr> = None;
             let mut last: Option<TypeExpr> = None;
             for step in steps {
-                let ty = check_expr(step, reg, env, upstream.clone())?;
+                let ty = check_expr(step, reg, env, upstream.clone(), None)?;
                 upstream = Some(ty.clone());
                 last = Some(ty);
             }
@@ -78,7 +79,7 @@ fn check_expr(
         Expr::Par { branches, .. } => {
             let mut last = None;
             for b in branches {
-                last = Some(check_expr(b, reg, env, None)?);
+                last = Some(check_expr(b, reg, env, None, None)?);
             }
             last.ok_or_else(|| CheckError::UnknownVar {
                 name: "(empty par)".into(),
@@ -89,7 +90,7 @@ fn check_expr(
                 None => flowed_in.clone().ok_or_else(|| CheckError::UnknownVar {
                     name: format!("(let {name}) with no upstream to name"),
                 })?,
-                Some(v) => check_expr(v, reg, env, None)?,
+                Some(v) => check_expr(v, reg, env, None, None)?,
             };
             env.set(name.clone(), bound.clone());
             Ok(bound)
@@ -100,18 +101,18 @@ fn check_expr(
             else_branch,
             ..
         } => {
-            let _ = check_expr(cond, reg, env, None)?;
-            let t = check_expr(then_branch, reg, env, None)?;
-            let _ = check_expr(else_branch, reg, env, None)?;
+            let _ = check_expr(cond, reg, env, None, None)?;
+            let t = check_expr(then_branch, reg, env, None, None)?;
+            let _ = check_expr(else_branch, reg, env, None, None)?;
             Ok(t)
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            let _ = check_expr(scrutinee, reg, env, None)?;
+            let _ = check_expr(scrutinee, reg, env, None, None)?;
             let mut last = None;
             for (_, arm) in arms {
-                last = Some(check_expr(arm, reg, env, None)?);
+                last = Some(check_expr(arm, reg, env, None, None)?);
             }
             last.ok_or_else(|| CheckError::UnknownVar {
                 name: "(empty match)".into(),
@@ -120,27 +121,27 @@ fn check_expr(
         Expr::Foreach {
             body, collection, ..
         } => {
-            let _ = check_expr(collection, reg, env, None)?;
-            check_expr(body, reg, env, None)
+            let _ = check_expr(collection, reg, env, None, None)?;
+            check_expr(body, reg, env, None, None)
         }
-        Expr::Retry { body, .. } => check_expr(body, reg, env, flowed_in),
+        Expr::Retry { body, .. } => check_expr(body, reg, env, flowed_in, None),
         Expr::Catch { body, fallback, .. } => {
-            let t = check_expr(body, reg, env, flowed_in.clone())?;
-            let _ = check_expr(fallback, reg, env, flowed_in)?;
+            let t = check_expr(body, reg, env, flowed_in.clone(), None)?;
+            let _ = check_expr(fallback, reg, env, flowed_in, None)?;
             Ok(t)
         }
         Expr::Llm {
             positional, args, ..
         } => {
             for pv in positional {
-                let _ = check_expr(pv, reg, env, None)?;
+                let _ = check_expr(pv, reg, env, None, None)?;
             }
             for (_, v) in args {
-                let _ = check_expr(v, reg, env, None)?;
+                let _ = check_expr(v, reg, env, None, None)?;
             }
             Ok(TypeExpr::Named(TypeName("PlainText".into())))
         }
-        Expr::Return { value, .. } => check_expr(value, reg, env, None),
+        Expr::Return { value, .. } => check_expr(value, reg, env, None, None),
         Expr::Literal { lit, .. } => Ok(literal_type(lit)),
         Expr::Var { name, .. } => env
             .get(name)
@@ -148,6 +149,16 @@ fn check_expr(
             .ok_or_else(|| CheckError::UnknownVar { name: name.clone() }),
         Expr::List { items, .. } => {
             if items.is_empty() {
+                // Rule 3 (literal adaptation): if the caller passed a
+                // structurally compatible hint `(List T)`, adopt it.
+                if let Some(TypeExpr::App { head, args }) = hint {
+                    if head.0 == "List" && args.len() == 1 {
+                        return Ok(TypeExpr::App {
+                            head: head.clone(),
+                            args: args.clone(),
+                        });
+                    }
+                }
                 return Ok(TypeExpr::App {
                     head: TypeName("List".into()),
                     args: vec![TypeExpr::Named(TypeName("Unknown".into()))],
@@ -155,7 +166,7 @@ fn check_expr(
             }
             let mut elem_types: Vec<TypeExpr> = Vec::with_capacity(items.len());
             for it in items {
-                elem_types.push(check_expr(it, reg, env, None)?);
+                elem_types.push(check_expr(it, reg, env, None, None)?);
             }
             let inner = canonicalize_union(elem_types);
             Ok(TypeExpr::App {
@@ -184,10 +195,10 @@ fn check_arg(
     env: &mut env::Env,
 ) -> Result<(), CheckError> {
     if matches!(arg, Expr::Literal { .. }) {
-        let _ = check_expr(arg, reg, env, None)?;
+        let _ = check_expr(arg, reg, env, None, None)?;
         return Ok(());
     }
-    let actual = check_expr(arg, reg, env, None)?;
+    let actual = check_expr(arg, reg, env, None, Some(expected))?;
     if !type_expr_matches(&actual, expected) {
         return Err(CheckError::ParamMismatch {
             tool: tool_name.to_string(),
