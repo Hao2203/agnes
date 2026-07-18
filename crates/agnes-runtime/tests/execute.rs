@@ -96,9 +96,19 @@ async fn boundary_validates_list_of_string_at_runtime() {
     let dispatch = agnes_builtins::native_dispatch();
     let err = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap_err();
     let msg = format!("{err}");
+    // Under Task 6 the boundary walker recurses into (List T) — array
+    // elements pass validation, and the runtime reaches dispatch, which
+    // fails because see-list has no native implementation registered.
+    // Before Task 6 the walker rejected any non-`|` App head with a
+    // "unknown type constructor" RuntimeTypeError before dispatch. This
+    // assertion must fail against the pre-Task-6 behavior.
     assert!(
-        msg.contains("No native implementation") || msg.contains("MissingImpl") || msg.contains("see-list"),
-        "expected missing-impl (not a validation error), got: {msg}"
+        msg.contains("No native implementation"),
+        "expected MissingImpl (not a validation error). got: {msg}"
+    );
+    assert!(
+        !msg.contains("unknown type constructor"),
+        "boundary walker still rejects (List T) — Task 6 regression. got: {msg}"
     );
 }
 
