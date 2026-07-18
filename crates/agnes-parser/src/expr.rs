@@ -6,6 +6,16 @@ use crate::toplevel::parse_kwargs;
 pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
     // Atoms
     if let Some(sym) = v.as_symbol() {
+        // The bare symbol `nil` is the nil literal, not a variable reference.
+        // lexpr's `Value::Nil` is only produced for `#nil`; a plain `nil`
+        // token surfaces as a symbol. Normalize it here so the checker and
+        // compiler see `Literal::Nil` uniformly.
+        if sym == "nil" {
+            return Ok(Expr::Literal {
+                span,
+                lit: Literal::Nil,
+            });
+        }
         return Ok(Expr::Var {
             span,
             name: sym.to_string(),

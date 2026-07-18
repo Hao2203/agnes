@@ -204,7 +204,7 @@ impl<'a> Lowering<'a> {
                 let elem_ty = if elem_types.is_empty() {
                     TypeExpr::named("Unknown")
                 } else {
-                    agnes_types::canonicalize_union(elem_types.clone())
+                    agnes_types::canonicalize_union(elem_types)
                 };
                 let provides = TypeExpr::App {
                     head: agnes_types::TypeName("List".into()),

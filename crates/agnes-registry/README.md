@@ -34,7 +34,7 @@ pub fn defines_of(program: &Program) -> Vec<&TopLevel>;
 - `UnknownName { name }` — a `TypeExprAst::Named` referenced a name that
   wasn't declared, or a `TypeExprAst::App` used a head other than the
   built-in constructors (`|`, `List`, `Option`).
-- `ArityMismatch { head, expected, actual, plural }` — a container
+- `ArityMismatch { head, expected, actual }` — a container
   constructor was applied with the wrong number of type arguments
   (`List` and `Option` both expect exactly 1).
 

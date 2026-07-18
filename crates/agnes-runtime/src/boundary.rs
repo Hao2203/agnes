@@ -22,22 +22,32 @@ pub fn validate(
     match expected {
         TypeExpr::Named(n) => run_named_validator(reg, tool, direction, n, val),
         TypeExpr::App { head, args } if head.0 == "|" => {
-            // Pick the union member matching the value's declared type and recurse.
-            let matched = args
+            // Fast path: pick the union member matching the value's declared type
+            // and recurse.
+            if let Some(m) = args
                 .iter()
-                .find(|m| type_expr_matches(&val.declared_type, m));
-            match matched {
-                Some(m) => validate(reg, tool, direction, m, val),
-                None => Err(RuntimeError::RuntimeTypeError {
-                    tool: tool.to_string(),
-                    direction,
-                    ty: TypeName(expected.to_string()),
-                    cause: format!(
-                        "value's declared type {} is not a member of expected union {}",
-                        val.declared_type, expected
-                    ),
-                }),
+                .find(|m| type_expr_matches(&val.declared_type, m))
+            {
+                return validate(reg, tool, direction, m, val);
             }
+            // Fallback: declared_type didn't match a member directly (e.g. because
+            // it's itself a union produced by list canonicalization). Try each
+            // member's validator against the value's data. Accept the first that
+            // passes; error only if none accept.
+            for m in args {
+                if validate(reg, tool, direction, m, val).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(RuntimeError::RuntimeTypeError {
+                tool: tool.to_string(),
+                direction,
+                ty: TypeName(expected.to_string()),
+                cause: format!(
+                    "value's declared type {} is not a member of expected union {} and no member validator accepts the value",
+                    val.declared_type, expected
+                ),
+            })
         }
         TypeExpr::App { head, args } if head.0 == "List" => {
             if args.len() != 1 {
@@ -58,11 +68,10 @@ pub fn validate(
                     cause: format!("expected JSON array for List type, got {:?}", val.data),
                 })?;
             let inner = &args[0];
-            // The list value's own declared_type is `(List T_actual)` where
-            // T_actual was derived from the element producers. Use T_actual as
-            // each element's declared_type so unions in `expected` can be
-            // resolved by matching a concrete member. If the list was produced
-            // outside this convention, fall back to the expected inner.
+            // The list value's own declared_type is `(List T_actual)`. Use T_actual
+            // as each element's declared_type so unions in `expected` are resolved
+            // by matching a concrete member. Fall back to the expected inner if the
+            // outer value's shape is unexpected.
             let actual_inner = match &val.declared_type {
                 TypeExpr::App {
                     head,
@@ -71,10 +80,7 @@ pub fn validate(
                 _ => inner.clone(),
             };
             for (i, elem_data) in arr.iter().enumerate() {
-                let elem_value = Value {
-                    data: elem_data.clone(),
-                    declared_type: actual_inner.clone(),
-                };
+                let elem_value = Value::typed_expr(elem_data.clone(), actual_inner.clone());
                 validate(reg, tool, direction, inner, &elem_value).map_err(|e| {
                     // Wrap error to add element index for locatability.
                     match e {

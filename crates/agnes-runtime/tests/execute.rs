@@ -114,6 +114,41 @@ async fn boundary_validates_list_of_string_at_runtime() {
     );
 }
 
+#[tokio::test]
+async fn boundary_validates_list_of_union_at_runtime() {
+    // Regression: when validating (List T) with T a union member set, the
+    // walker must pass each element as a Value whose declared_type is a
+    // concrete Named (inferred from JSON shape) — not the outer list's
+    // union inner. Prior code re-passed the union expected as the element's
+    // declared_type, breaking the union-arm set-membership check.
+    //
+    // join-lines requires (List (| PlainText Markdown)). Feeding a list of
+    // two read-file outputs (both PlainText) must succeed end-to-end.
+    let tmp = std::env::temp_dir().join(format!("agnes-boundary-union-{}.md", std::process::id()));
+    tokio::fs::write(&tmp, "hello world\n").await.unwrap();
+    let src = format!(
+        r#"
+        (pipe
+          (let a (tool read-file :path "{p}"))
+          (tool join-lines :lines [a a]))
+        "#,
+        p = tmp.display()
+    );
+    let mut r = agnes_registry::Registry::new();
+    agnes_builtins::register_builtins(&mut r).unwrap();
+    let p = agnes_parser::parse(&src).unwrap();
+    r.load(&p).unwrap();
+    agnes_checker::check(&p, &r).unwrap();
+    let dag = agnes_compiler::compile(&p, &r).unwrap();
+    let dispatch = agnes_builtins::native_dispatch();
+    let out = agnes_runtime::execute(&dag, &r, &dispatch)
+        .await
+        .expect("List (| PlainText Markdown) boundary must accept PlainText elements");
+    let s = out.data.as_str().expect("string result");
+    assert!(s.contains("hello world"), "got: {s}");
+    let _ = tokio::fs::remove_file(&tmp).await;
+}
+
 fn tempfile_path() -> String {
     let dir = std::env::temp_dir();
     let stamp = std::process::id();

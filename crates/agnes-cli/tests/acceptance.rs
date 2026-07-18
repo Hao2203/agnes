@@ -95,6 +95,19 @@ async fn positive_option_string_declares_param() {
 }
 
 #[tokio::test]
+async fn positive_option_string_accepts_nil() {
+    let src = r#"
+        (define maybe-greet
+          :params [(name (Option String))]
+          :provides PlainText
+          (tool llm :prompt "greet" :input "hi"))
+        (tool maybe-greet :name nil)
+    "#;
+    let out = run(src).await.expect("Option String param must accept nil");
+    assert!(out.contains("[LLM"), "got: {out}");
+}
+
+#[tokio::test]
 async fn negative_list_arity_mismatch() {
     let src = r#"(declare tool bad :requires [(x (List))] :provides PlainText)"#;
     let err = run(src).await.expect_err("must fail");

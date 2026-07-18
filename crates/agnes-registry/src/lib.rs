@@ -40,13 +40,12 @@ pub enum RegistryError {
     )]
     UnknownName { name: String },
     #[error(
-        "Type constructor `{head}` expects {expected} arg(s), got {actual}.\n  Fix: `({head} ...)` takes {expected} type argument{plural}."
+        "Type constructor `{head}` expects {expected} arg(s), got {actual}.\n  Fix: `({head} ...)` takes {expected} type argument(s)."
     )]
     ArityMismatch {
         head: String,
         expected: usize,
         actual: usize,
-        plural: &'static str,
     },
 }
 
@@ -178,7 +177,6 @@ impl Registry {
                         head: "Option".into(),
                         expected: 1,
                         actual: args.len(),
-                        plural: "",
                     });
                 }
                 let inner = self.resolve(&args[0])?;
@@ -191,7 +189,6 @@ impl Registry {
                         head: "List".into(),
                         expected: 1,
                         actual: args.len(),
-                        plural: "",
                     });
                 }
                 let inner = self.resolve(&args[0])?;

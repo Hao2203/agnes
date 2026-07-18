@@ -63,10 +63,9 @@ impl fmt::Display for TypeExpr {
 }
 
 /// Canonicalize a set of union members: flatten nested `(| ...)`, deduplicate,
-/// sort alphabetically for stable Hash/Eq, collapse to `Named` if exactly one
-/// remains. All arguments MUST resolve to `Named` after flattening — nested
-/// `(| ...)` gets flattened but non-`|` App members (e.g. `(List String)`)
-/// are preserved as-is inside the union args set.
+/// sort by Display for stable canonical order, and collapse a singleton to `Named`.
+/// Nested `(| ...)` members are flattened into the enclosing union; non-`|`
+/// members (Named or non-union `App`, e.g. `(List String)`) are preserved as-is.
 ///
 /// The result is either `Named(n)` (if 1 unique element) or
 /// `App { head: TypeName("|"), args: sorted_unique }`.
@@ -109,6 +108,12 @@ pub struct ToolSignature {
 
 /// A value flowing between tools at runtime. Carries the type declared by
 /// the producing tool for boundary validation.
+///
+/// For list literals whose static provides is `(List Unknown)` — e.g. lists
+/// of variables whose types aren't propagated through the compiler — the
+/// runtime scheduler narrows `declared_type` to the actual observed element
+/// types. This lets boundary validation match against the concrete inner
+/// union of the expected type.
 #[derive(Debug, Clone)]
 pub struct Value {
     pub data: JsonValue,

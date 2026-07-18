@@ -36,10 +36,7 @@ fn eval_node<'a>(
         }
         let node = dag.get(id);
         let value = match &node.kind {
-            NodeKind::Literal(lit) => Value {
-                data: lit_to_json(lit),
-                declared_type: TypeExpr::Named(lit_type(lit)),
-            },
+            NodeKind::Literal(lit) => Value::typed(lit_to_json(lit), lit_type(lit)),
             NodeKind::Var(name) => {
                 env.get(name)
                     .cloned()
@@ -71,10 +68,7 @@ fn eval_node<'a>(
                 for input in &node.inputs {
                     let _ = eval_input(dag, input, reg, dispatch, cache, env).await?;
                 }
-                Value {
-                    data: JsonValue::Null,
-                    declared_type: TypeExpr::Named(TypeName("Unit".into())),
-                }
+                Value::typed(JsonValue::Null, "Unit")
             }
             NodeKind::If => {
                 let cond = eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?;
@@ -157,10 +151,7 @@ fn eval_node<'a>(
                     }
                     _ => node.provides.clone(),
                 };
-                Value {
-                    data,
-                    declared_type,
-                }
+                Value::typed_expr(data, declared_type)
             }
         };
         cache.insert(id, value.clone());
@@ -179,10 +170,7 @@ fn eval_input<'a>(
     Box::pin(async move {
         match input {
             Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, cache, env).await,
-            Input::Literal(lit) => Ok(Value {
-                data: lit_to_json(lit),
-                declared_type: TypeExpr::Named(lit_type(lit)),
-            }),
+            Input::Literal(lit) => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Input::Var(name) => env
                 .get(name)
                 .cloned()
@@ -278,10 +266,7 @@ fn dispatch_define<'a>(
                     if let Some(default) = &p.default {
                         sub_env.insert(
                             p.name.clone(),
-                            Value {
-                                data: lit_to_json(default),
-                                declared_type: TypeExpr::Named(lit_type(default)),
-                            },
+                            Value::typed(lit_to_json(default), lit_type(default)),
                         );
                     } else {
                         return Err(RuntimeError::ToolFailed {
@@ -337,10 +322,7 @@ fn eval_expr<'a>(
                 for b in branches {
                     let _ = eval_expr(b, None, reg, dispatch, env).await?;
                 }
-                Ok(Value {
-                    data: JsonValue::Null,
-                    declared_type: TypeExpr::Named(TypeName("Unit".into())),
-                })
+                Ok(Value::typed(JsonValue::Null, "Unit"))
             }
             Expr::Let { name, value, .. } => {
                 let bound = match value {
@@ -418,10 +400,7 @@ fn eval_expr<'a>(
                 call_native("llm", kwargs, dispatch, reg, &provides).await
             }
             Expr::Return { value, .. } => eval_expr(value, None, reg, dispatch, env).await,
-            Expr::Literal { lit, .. } => Ok(Value {
-                data: lit_to_json(lit),
-                declared_type: TypeExpr::Named(lit_type(lit)),
-            }),
+            Expr::Literal { lit, .. } => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Expr::Var { name, .. } => {
                 env.get(name)
                     .cloned()
@@ -444,13 +423,13 @@ fn eval_expr<'a>(
                     canonicalize_union(elem_types)
                 };
                 let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
-                Ok(Value {
+                Ok(Value::typed_expr(
                     data,
-                    declared_type: TypeExpr::App {
+                    TypeExpr::App {
                         head: TypeName("List".into()),
                         args: vec![elem_ty],
                     },
-                })
+                ))
             }
         }
     })
