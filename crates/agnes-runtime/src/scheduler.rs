@@ -136,11 +136,30 @@ fn eval_node<'a>(
                     elems.push(eval_input(dag, input, reg, dispatch, cache, env).await?);
                 }
                 let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
-                // Use the checker-derived provides for declared_type; scheduler
-                // does not re-derive.
+                // Prefer the checker-derived provides for declared_type, but if
+                // it's `(List Unknown)` (e.g. list contains Var inputs whose
+                // static provides is Unknown), fall back to the runtime-observed
+                // element types so downstream boundary validation can resolve
+                // union members.
+                let declared_type = match &node.provides {
+                    TypeExpr::App { head, args } if head.0 == "List" && args.len() == 1 => {
+                        let stale = matches!(&args[0], TypeExpr::Named(n) if n.0 == "Unknown");
+                        if stale && !elems.is_empty() {
+                            let elem_types: Vec<TypeExpr> =
+                                elems.iter().map(|v| v.declared_type.clone()).collect();
+                            TypeExpr::App {
+                                head: TypeName("List".into()),
+                                args: vec![canonicalize_union(elem_types)],
+                            }
+                        } else {
+                            node.provides.clone()
+                        }
+                    }
+                    _ => node.provides.clone(),
+                };
                 Value {
                     data,
-                    declared_type: node.provides.clone(),
+                    declared_type,
                 }
             }
         };

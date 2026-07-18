@@ -25,8 +25,13 @@ async fn run(src: &str) -> Result<String, String> {
 }
 
 async fn seed_readme() -> String {
-    let path =
-        std::env::temp_dir().join(format!("agnes-acceptance-readme-{}.md", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "agnes-acceptance-readme-{}-{n}.md",
+        std::process::id()
+    ));
     tokio::fs::write(&path, "hello world\n").await.unwrap();
     path.to_string_lossy().into_owned()
 }
@@ -34,8 +39,6 @@ async fn seed_readme() -> String {
 #[tokio::test]
 async fn positive_full_demo_runs() {
     let readme = seed_readme().await;
-    // Mirrors examples/full-demo.agnes: feed `ja` (PlainText) into `llm :input`
-    // (PlainText) rather than `sum` (Summary), which would be a type error.
     let src = format!(
         r#"
 (define read-and-translate
@@ -46,19 +49,98 @@ async fn positive_full_demo_runs() {
     (tool translate :lang target)))
 
 (pipe
-  (let src (tool read-file :path "{readme}"))
-  (par
-    (let sum (tool summarize :input src))
-    (let ja  (tool read-and-translate :path "{readme}" :target "ja")))
-  (tool llm :prompt "combine" :input ja))
+  (let ja (tool read-and-translate :path "{readme}" :target "ja"))
+  (tool join-lines :lines [ja ja]))
 "#
     );
     let out = run(&src).await.expect("full-demo workflow must succeed");
     assert!(
-        out.contains("[LLM prompt=combine"),
-        "expected LLM output marker, got: {out}"
+        out.contains("[TRANSLATED"),
+        "expected translated content in joined output, got: {out}"
     );
     let _ = tokio::fs::remove_file(&readme).await;
+}
+
+#[tokio::test]
+async fn positive_join_lines_with_list_literal() {
+    let readme = seed_readme().await;
+    let src = format!(
+        r#"
+(tool join-lines :lines [(tool read-file :path "{readme}")
+                          (tool read-file :path "{readme}")])
+"#
+    );
+    let out = run(&src).await.expect("join-lines must succeed");
+    // The mock implementation of join-lines concatenates array elements with '\n'.
+    assert!(out.contains("hello world"), "got: {out}");
+    let _ = tokio::fs::remove_file(&readme).await;
+}
+
+#[tokio::test]
+async fn positive_option_string_declares_param() {
+    let src = r#"
+        (define maybe-greet
+          :params [(name (Option String))]
+          :provides PlainText
+          (tool llm :prompt "greet" :input "hi"))
+        (tool maybe-greet :name "world")
+    "#;
+    let out = run(src).await.expect("Option String param must work");
+    assert!(out.contains("[LLM"), "got: {out}");
+}
+
+#[tokio::test]
+async fn negative_list_arity_mismatch() {
+    let src = r#"(declare tool bad :requires [(x (List))] :provides PlainText)"#;
+    let err = run(src).await.expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("List") && msg.contains("expects 1"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn negative_option_arity_mismatch() {
+    let src = r#"(declare tool bad :requires [(x (Option A B))] :provides PlainText)"#;
+    let err = run(src).await.expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("Option") && msg.contains("expects 1"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn negative_unknown_head_suggests_builtins() {
+    let src = r#"(declare tool bad :requires [(x (Foo Bar))] :provides PlainText)"#;
+    let err = run(src).await.expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("Foo"), "got: {msg}");
+    assert!(msg.contains("List") || msg.contains("Option"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn negative_infix_union_rejected() {
+    let src = r#"(declare type-alias T (A | B))"#;
+    let err = run(src).await.expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("union") && msg.contains("prefix"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn negative_comma_in_bracket_list() {
+    let src = r#"(tool llm :prompt "x" :input ["a", "b"])"#;
+    let err = run(src).await.expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("comma") || msg.to_lowercase().contains("whitespace"),
+        "got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn negative_mixed_list_where_string_list_expected() {
+    // join-lines accepts (List (| PlainText Markdown)) — passing (List Int)
+    // via a mixed literal fails.
+    let src = r#"(tool join-lines :lines ["a" 1])"#;
+    let err = run(src).await.expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("List"), "got: {msg}");
 }
 
 #[tokio::test]

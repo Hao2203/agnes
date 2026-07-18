@@ -115,6 +115,25 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
         }),
     );
 
+    m.insert(
+        "join-lines".into(),
+        Arc::new(|args| {
+            Box::pin(async move {
+                let lines = args
+                    .get("lines")
+                    .ok_or("missing :lines")?
+                    .data
+                    .as_array()
+                    .ok_or("lines is not a JSON array")?
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(Value::typed(JsonValue::String(lines), "PlainText"))
+            })
+        }),
+    );
+
     m
 }
 

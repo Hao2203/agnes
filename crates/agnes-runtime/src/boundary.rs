@@ -55,10 +55,23 @@ pub fn validate(
                 cause: format!("expected JSON array for List type, got {:?}", val.data),
             })?;
             let inner = &args[0];
+            // The list value's own declared_type is `(List T_actual)` where
+            // T_actual was derived from the element producers. Use T_actual as
+            // each element's declared_type so unions in `expected` can be
+            // resolved by matching a concrete member. If the list was produced
+            // outside this convention, fall back to the expected inner.
+            let actual_inner = match &val.declared_type {
+                TypeExpr::App { head, args: outer_args }
+                    if head.0 == "List" && outer_args.len() == 1 =>
+                {
+                    outer_args[0].clone()
+                }
+                _ => inner.clone(),
+            };
             for (i, elem_data) in arr.iter().enumerate() {
                 let elem_value = Value {
                     data: elem_data.clone(),
-                    declared_type: inner.clone(),
+                    declared_type: actual_inner.clone(),
                 };
                 validate(reg, tool, direction, inner, &elem_value).map_err(|e| {
                     // Wrap error to add element index for locatability.

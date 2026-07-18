@@ -1,11 +1,7 @@
 ;; Full demo (spec §VII shape): declare a compound `read-and-translate`
-;; and dispatch it at runtime. `par` runs both branches; each `(let ...)`
-;; inside a branch binds its side value into the surrounding env, so the
-;; final `llm` step can reference `ja`.
-;;
-;; Note: the spec's original example feeds `sum` (Summary) to `llm :input`
-;; (PlainText). That's actually a type error — we feed `ja` (PlainText)
-;; instead.
+;; and dispatch it. Also exercises the new list literal + parameterized
+;; type flow via `join-lines`.
+
 (define read-and-translate
   :params  [(path Path) (target String)]
   :provides PlainText
@@ -18,4 +14,4 @@
   (par
     (let sum (tool summarize :input src))
     (let ja  (tool read-and-translate :path "README.md" :target "ja")))
-  (tool llm :prompt "combine summary and translation" :input ja))
+  (tool join-lines :lines [sum ja]))

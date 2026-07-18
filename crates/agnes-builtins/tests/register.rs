@@ -27,3 +27,16 @@ fn native_dispatch_has_all_impls() {
         assert!(d.contains_key(name), "missing impl for {name}");
     }
 }
+
+#[test]
+fn join_lines_registered() {
+    let mut r = Registry::new();
+    register_builtins(&mut r).expect("builtins load");
+    assert!(r.tool_signature("join-lines").is_some());
+}
+
+#[test]
+fn native_dispatch_has_join_lines() {
+    let d = native_dispatch();
+    assert!(d.contains_key("join-lines"));
+}

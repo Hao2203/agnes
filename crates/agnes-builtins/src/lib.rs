@@ -7,7 +7,7 @@ mod types;
 pub use tools::{BoxFuture, ToolImpl, native_dispatch};
 
 use agnes_registry::{Registry, RegistryError};
-use agnes_types::{ToolSignature, TypeExpr, canonicalize_union};
+use agnes_types::{ToolSignature, TypeExpr, TypeName, canonicalize_union};
 
 pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     // --- Types + validators ---
@@ -93,7 +93,24 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
                 ("prompt".into(), string_ty.clone()),
                 ("input".into(), plaintext.clone()),
             ],
-            provides: plaintext,
+            provides: plaintext.clone(),
+        },
+    )?;
+    let text_or_md = canonicalize_union([
+        TypeExpr::named("PlainText"),
+        TypeExpr::named("Markdown"),
+    ]);
+    reg.register_tool(
+        "join-lines",
+        ToolSignature {
+            requires: vec![(
+                "lines".into(),
+                TypeExpr::App {
+                    head: TypeName("List".into()),
+                    args: vec![text_or_md],
+                },
+            )],
+            provides: plaintext.clone(),
         },
     )?;
     Ok(())
