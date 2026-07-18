@@ -35,8 +35,19 @@ pub enum RegistryError {
         existing_kind: EntryKind,
         attempted_kind: EntryKind,
     },
-    #[error("Unknown name in type expression: `{name}`\n  Fix: (declare type {name})")]
+    #[error(
+        "Unknown name in type expression: `{name}`\n  Fix: (declare type {name})\n  or use one of the built-in type constructors: List, Option, |"
+    )]
     UnknownName { name: String },
+    #[error(
+        "Type constructor `{head}` expects {expected} arg(s), got {actual}.\n  Fix: `({head} ...)` takes {expected} type argument{plural}."
+    )]
+    ArityMismatch {
+        head: String,
+        expected: usize,
+        actual: usize,
+        plural: &'static str,
+    },
 }
 
 pub struct Registry {
@@ -140,9 +151,9 @@ impl Registry {
     }
 
     /// Resolve a syntactic TypeExprAst into a canonical TypeExpr.
-    /// This task's scope: only `Named` and `App { head: "|", ... }` are
-    /// handled semantically. Any other App head is rejected with
-    /// UnknownName — Task 6 adds List / Option / arity checks.
+    /// Recognizes `Named`, `App { head: "|", ... }`, `App { head: "List", ... }`,
+    /// and `App { head: "Option", ... }`. Any other App head fails with
+    /// `UnknownName` (the message points at the built-in constructors).
     pub fn resolve(&self, ast: &TypeExprAst) -> Result<TypeExpr, RegistryError> {
         match ast {
             TypeExprAst::Named(n) => {
@@ -161,8 +172,35 @@ impl Registry {
                 }
                 Ok(canonicalize_union(resolved))
             }
+            TypeExprAst::App { head, args } if head == "Option" => {
+                if args.len() != 1 {
+                    return Err(RegistryError::ArityMismatch {
+                        head: "Option".into(),
+                        expected: 1,
+                        actual: args.len(),
+                        plural: "",
+                    });
+                }
+                let inner = self.resolve(&args[0])?;
+                let unit = self.resolve(&TypeExprAst::Named("Unit".into()))?;
+                Ok(canonicalize_union([inner, unit]))
+            }
+            TypeExprAst::App { head, args } if head == "List" => {
+                if args.len() != 1 {
+                    return Err(RegistryError::ArityMismatch {
+                        head: "List".into(),
+                        expected: 1,
+                        actual: args.len(),
+                        plural: "",
+                    });
+                }
+                let inner = self.resolve(&args[0])?;
+                Ok(TypeExpr::App {
+                    head: TypeName("List".into()),
+                    args: vec![inner],
+                })
+            }
             TypeExprAst::App { head, .. } => {
-                // List/Option and other constructors land in Task 6.
                 Err(RegistryError::UnknownName { name: head.clone() })
             }
         }
