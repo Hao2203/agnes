@@ -1,0 +1,14 @@
+[package]
+name = "agnes-parser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agnes-ast.workspace = true
+lexpr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
