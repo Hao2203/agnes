@@ -1,5 +1,5 @@
 use agnes_registry::Registry;
-use agnes_types::TypeName;
+use agnes_types::{TypeExpr, TypeName, canonicalize_union};
 
 #[test]
 fn duplicate_type_is_rejected() {
@@ -15,7 +15,7 @@ fn duplicate_type_is_rejected() {
 fn alias_conflicts_with_type() {
     let mut r = Registry::new();
     r.register_type("Text", None).unwrap();
-    let expr = agnes_types::TypeExpr::Named(TypeName("PDF".into()));
+    let expr = TypeExpr::Named(TypeName("PDF".into()));
     let err = r.register_alias("Text", expr).unwrap_err();
     assert!(format!("{err}").contains("Name conflict"));
 }
@@ -29,27 +29,34 @@ fn resolve_alias_flattens_nested_union() {
     r.register_type("HTML", None).unwrap();
     r.register_alias(
         "TextLike",
-        agnes_types::TypeExpr::Union(
-            [
-                TypeName("PlainText".into()),
-                TypeName("Markdown".into()),
-                TypeName("HTML".into()),
-            ]
-            .into_iter()
-            .collect(),
-        ),
+        canonicalize_union([
+            TypeExpr::named("PlainText"),
+            TypeExpr::named("Markdown"),
+            TypeExpr::named("HTML"),
+        ]),
     )
     .unwrap();
 
-    // (TextLike | PDF) should resolve to a flat 4-member set.
+    // (| TextLike PDF) should resolve to a flat 4-member union.
     r.register_type("PDF", None).unwrap();
-    let ast = TypeExprAst::Union(vec![
-        TypeExprAst::Named("TextLike".into()),
-        TypeExprAst::Named("PDF".into()),
-    ]);
+    let ast = TypeExprAst::App {
+        head: "|".into(),
+        args: vec![
+            TypeExprAst::Named("TextLike".into()),
+            TypeExprAst::Named("PDF".into()),
+        ],
+    };
     let resolved = r.resolve(&ast).unwrap();
-    let set = resolved.as_set();
-    assert_eq!(set.len(), 4);
-    assert!(set.contains(&TypeName("PlainText".into())));
-    assert!(set.contains(&TypeName("PDF".into())));
+    match resolved {
+        TypeExpr::App { head, args } => {
+            assert_eq!(head.0, "|");
+            assert_eq!(args.len(), 4);
+            let names: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert!(names.contains(&"PlainText".into()));
+            assert!(names.contains(&"PDF".into()));
+            assert!(names.contains(&"Markdown".into()));
+            assert!(names.contains(&"HTML".into()));
+        }
+        other => panic!("expected App with head `|`, got {other:?}"),
+    }
 }

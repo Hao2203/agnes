@@ -47,8 +47,11 @@ fn parses_declare_type_alias() {
         TopLevel::DeclareTypeAlias { name, expr, .. } => {
             assert_eq!(name, "TextLike");
             match expr {
-                TypeExprAst::Union(members) => assert_eq!(members.len(), 3),
-                other => panic!("expected Union, got {other:?}"),
+                TypeExprAst::App { head, args } => {
+                    assert_eq!(head, "|");
+                    assert_eq!(args.len(), 3);
+                }
+                other => panic!("expected App with head `|`, got {other:?}"),
             }
         }
         other => panic!("expected DeclareTypeAlias, got {other:?}"),

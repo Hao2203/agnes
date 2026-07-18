@@ -38,7 +38,7 @@ fn eval_node<'a>(
         let value = match &node.kind {
             NodeKind::Literal(lit) => Value {
                 data: lit_to_json(lit),
-                declared_type: lit_type(lit),
+                declared_type: TypeExpr::Named(lit_type(lit)),
             },
             NodeKind::Var(name) => {
                 env.get(name)
@@ -73,7 +73,7 @@ fn eval_node<'a>(
                 }
                 Value {
                     data: JsonValue::Null,
-                    declared_type: TypeName("Unit".into()),
+                    declared_type: TypeExpr::Named(TypeName("Unit".into())),
                 }
             }
             NodeKind::If => {
@@ -149,7 +149,7 @@ fn eval_input<'a>(
             Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, cache, env).await,
             Input::Literal(lit) => Ok(Value {
                 data: lit_to_json(lit),
-                declared_type: lit_type(lit),
+                declared_type: TypeExpr::Named(lit_type(lit)),
             }),
             Input::Var(name) => env
                 .get(name)
@@ -202,8 +202,7 @@ async fn call_native(
     if let Some(sig) = reg.tool_signature(tool) {
         for (k, expected) in &sig.requires {
             if let Some(v) = args.get(k) {
-                validate(reg, tool, "requires", &v.declared_type, v)?;
-                let _ = expected;
+                validate(reg, tool, "requires", expected, v)?;
             }
         }
     }
@@ -221,11 +220,7 @@ async fn call_native(
         });
     };
     // Validate `provides`.
-    let ty: TypeName = match provides {
-        TypeExpr::Named(n) => n.clone(),
-        TypeExpr::Union(_) => result.declared_type.clone(),
-    };
-    validate(reg, tool, "provides", &ty, &result)?;
+    validate(reg, tool, "provides", provides, &result)?;
     Ok(result)
 }
 
@@ -253,7 +248,7 @@ fn dispatch_define<'a>(
                             p.name.clone(),
                             Value {
                                 data: lit_to_json(default),
-                                declared_type: lit_type(default),
+                                declared_type: TypeExpr::Named(lit_type(default)),
                             },
                         );
                     } else {
@@ -312,7 +307,7 @@ fn eval_expr<'a>(
                 }
                 Ok(Value {
                     data: JsonValue::Null,
-                    declared_type: TypeName("Unit".into()),
+                    declared_type: TypeExpr::Named(TypeName("Unit".into())),
                 })
             }
             Expr::Let { name, value, .. } => {
@@ -393,7 +388,7 @@ fn eval_expr<'a>(
             Expr::Return { value, .. } => eval_expr(value, None, reg, dispatch, env).await,
             Expr::Literal { lit, .. } => Ok(Value {
                 data: lit_to_json(lit),
-                declared_type: lit_type(lit),
+                declared_type: TypeExpr::Named(lit_type(lit)),
             }),
             Expr::Var { name, .. } => {
                 env.get(name)

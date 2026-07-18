@@ -7,7 +7,7 @@ mod types;
 pub use tools::{BoxFuture, ToolImpl, native_dispatch};
 
 use agnes_registry::{Registry, RegistryError};
-use agnes_types::{ToolSignature, TypeExpr, TypeName};
+use agnes_types::{ToolSignature, TypeExpr, canonicalize_union};
 
 pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     // --- Types + validators ---
@@ -31,11 +31,11 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     reg.register_alias("VisualDoc", aliases::visual_doc())?;
 
     // --- Tools ---
-    let path = TypeExpr::Named(TypeName("Path".into()));
-    let plaintext = TypeExpr::Named(TypeName("PlainText".into()));
-    let summary = TypeExpr::Named(TypeName("Summary".into()));
-    let unit = TypeExpr::Named(TypeName("Unit".into()));
-    let string_ty = TypeExpr::Named(TypeName("String".into()));
+    let path = TypeExpr::named("Path");
+    let plaintext = TypeExpr::named("PlainText");
+    let summary = TypeExpr::named("Summary");
+    let unit = TypeExpr::named("Unit");
+    let string_ty = TypeExpr::named("String");
 
     reg.register_tool(
         "read-file",
@@ -59,11 +59,12 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
         ToolSignature {
             requires: vec![(
                 "input".into(),
-                TypeExpr::Union({
-                    let mut s = aliases::text_like().as_set();
-                    s.insert(TypeName("PDF".into()));
-                    s
-                }),
+                canonicalize_union([
+                    TypeExpr::named("PlainText"),
+                    TypeExpr::named("Markdown"),
+                    TypeExpr::named("HTML"),
+                    TypeExpr::named("PDF"),
+                ]),
             )],
             provides: summary.clone(),
         },

@@ -2,11 +2,11 @@
 
 pub mod loader;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 use agnes_ast::{Expr, Param, Program, TopLevel, TypeExprAst};
-use agnes_types::{ToolSignature, TypeExpr, TypeName, Validator};
+use agnes_types::{ToolSignature, TypeExpr, TypeName, Validator, canonicalize_union};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
@@ -140,10 +140,9 @@ impl Registry {
     }
 
     /// Resolve a syntactic TypeExprAst into a canonical TypeExpr.
-    /// - Named that refers to an alias -> the alias's TypeExpr
-    /// - Named that refers to a type -> Named
-    /// - Named that is unknown -> UnknownName error
-    /// - Union -> flat union of resolved members
+    /// This task's scope: only `Named` and `App { head: "|", ... }` are
+    /// handled semantically. Any other App head is rejected with
+    /// UnknownName — Task 6 adds List / Option / arity checks.
     pub fn resolve(&self, ast: &TypeExprAst) -> Result<TypeExpr, RegistryError> {
         match ast {
             TypeExprAst::Named(n) => {
@@ -155,19 +154,16 @@ impl Registry {
                     Err(RegistryError::UnknownName { name: n.clone() })
                 }
             }
-            TypeExprAst::Union(members) => {
-                let mut set: HashSet<TypeName> = HashSet::new();
-                for m in members {
-                    let resolved = self.resolve(m)?;
-                    for t in resolved.as_set() {
-                        set.insert(t);
-                    }
+            TypeExprAst::App { head, args } if head == "|" => {
+                let mut resolved: Vec<TypeExpr> = Vec::with_capacity(args.len());
+                for m in args {
+                    resolved.push(self.resolve(m)?);
                 }
-                if set.len() == 1 {
-                    Ok(TypeExpr::Named(set.into_iter().next().unwrap()))
-                } else {
-                    Ok(TypeExpr::Union(set))
-                }
+                Ok(canonicalize_union(resolved))
+            }
+            TypeExprAst::App { head, .. } => {
+                // List/Option and other constructors land in Task 6.
+                Err(RegistryError::UnknownName { name: head.clone() })
             }
         }
     }

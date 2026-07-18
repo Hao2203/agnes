@@ -1,8 +1,11 @@
 //! Type checker for agnes DSL.
-//! Enforces exactly two rules:
-//!   1. Parameter satisfaction: each argument's type is member of tool's require.
-//!   2. Flow satisfaction: pipe upstream's provides is member of downstream's require
+//!
+//! Enforces:
+//!   1. Parameter satisfaction: each argument's type satisfies the tool's require.
+//!   2. Flow satisfaction: pipe upstream's provides satisfies downstream's require
 //!      (when downstream is a single-param tool with an unbound positional slot).
+//!
+//! Both rules bottom out at `agnes_types::type_expr_matches`.
 
 pub mod env;
 pub mod error;
@@ -15,7 +18,6 @@ pub use error::CheckError;
 
 /// Top-level entry.
 pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
-    // First, check every `define`'s body in isolation.
     for tl in &program.toplevels {
         if let TopLevel::Define {
             name,
@@ -28,10 +30,7 @@ pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
             let mut env = env::Env::default();
             for p in params {
                 let ty_expr = reg.resolve(&p.ty)?;
-                let single = single_type(&ty_expr).ok_or_else(|| CheckError::UnknownVar {
-                    name: format!("param `{}` must have a concrete or unioned type", p.name),
-                })?;
-                env.set(p.name.clone(), single);
+                env.set(p.name.clone(), ty_expr);
             }
             let body_ty = check_expr(body, reg, &mut env, None)?;
             let declared = reg.resolve(provides)?;
@@ -44,7 +43,6 @@ pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
             }
         }
     }
-    // Then the main workflow, if any.
     if let Some(main) = &program.main {
         let mut env = env::Env::default();
         check_expr(main, reg, &mut env, None)?;
@@ -52,14 +50,12 @@ pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
     Ok(())
 }
 
-/// Walk an expression, returning the type it produces. `flowed_in` is the
-/// upstream type (if we're inside a `pipe` and this expr is not the first).
 fn check_expr(
     e: &Expr,
     reg: &Registry,
     env: &mut env::Env,
-    flowed_in: Option<TypeName>,
-) -> Result<TypeName, CheckError> {
+    flowed_in: Option<TypeExpr>,
+) -> Result<TypeExpr, CheckError> {
     match e {
         Expr::Tool {
             name,
@@ -68,8 +64,8 @@ fn check_expr(
             ..
         } => check_tool_call(name, positional, args, reg, env, flowed_in),
         Expr::Pipe { steps, .. } => {
-            let mut upstream: Option<TypeName> = None;
-            let mut last: Option<TypeName> = None;
+            let mut upstream: Option<TypeExpr> = None;
+            let mut last: Option<TypeExpr> = None;
             for step in steps {
                 let ty = check_expr(step, reg, env, upstream.clone())?;
                 upstream = Some(ty.clone());
@@ -136,15 +132,13 @@ fn check_expr(
         Expr::Llm {
             positional, args, ..
         } => {
-            // Walk sub-expressions so unknown vars / bad refs inside an llm call
-            // are still surfaced. MVP: llm always provides PlainText.
             for pv in positional {
                 let _ = check_expr(pv, reg, env, None)?;
             }
             for (_, v) in args {
                 let _ = check_expr(v, reg, env, None)?;
             }
-            Ok(TypeName("PlainText".into()))
+            Ok(TypeExpr::Named(TypeName("PlainText".into())))
         }
         Expr::Return { value, .. } => check_expr(value, reg, env, None),
         Expr::Literal { lit, .. } => Ok(literal_type(lit)),
@@ -155,29 +149,15 @@ fn check_expr(
     }
 }
 
-fn literal_type(lit: &agnes_ast::Literal) -> TypeName {
+fn literal_type(lit: &agnes_ast::Literal) -> TypeExpr {
     match lit {
-        agnes_ast::Literal::String(_) => TypeName("String".into()),
-        agnes_ast::Literal::Int(_) => TypeName("Int".into()),
-        agnes_ast::Literal::Bool(_) => TypeName("Bool".into()),
-        agnes_ast::Literal::Nil => TypeName("Unit".into()),
+        agnes_ast::Literal::String(_) => TypeExpr::Named(TypeName("String".into())),
+        agnes_ast::Literal::Int(_) => TypeExpr::Named(TypeName("Int".into())),
+        agnes_ast::Literal::Bool(_) => TypeExpr::Named(TypeName("Bool".into())),
+        agnes_ast::Literal::Nil => TypeExpr::Named(TypeName("Unit".into())),
     }
 }
 
-fn single_type(t: &TypeExpr) -> Option<TypeName> {
-    match t {
-        TypeExpr::Named(n) => Some(n.clone()),
-        TypeExpr::Union(_) => None,
-    }
-}
-
-/// Check a single argument (positional or keyword) against a require's TypeExpr.
-///
-/// Literal arguments (String / Int / Bool / Nil) are admitted without type
-/// matching — their conformance to the require's TypeExpr is a runtime
-/// boundary validation, since the checker cannot know whether a `String`
-/// literal is a valid `Path`, `Url`, etc. Non-literal args (variables, tool
-/// results) must match structurally.
 fn check_arg(
     tool_name: &str,
     param: &str,
@@ -187,8 +167,6 @@ fn check_arg(
     env: &mut env::Env,
 ) -> Result<(), CheckError> {
     if matches!(arg, Expr::Literal { .. }) {
-        // Walk it anyway so any nested checks happen (there are none for a
-        // bare literal, but this keeps the pattern uniform).
         let _ = check_expr(arg, reg, env, None)?;
         return Ok(());
     }
@@ -204,20 +182,14 @@ fn check_arg(
     Ok(())
 }
 
-/// Check a `(tool name pos... :kw v ...)` call.
-///
-/// Positional args bind to `sig.requires[i]` by index. Keyword args bind to
-/// the require whose name matches the key. If exactly one required slot is
-/// left unfilled after positional + keyword binding and we have a `flowed_in`
-/// upstream (i.e. we're inside a `pipe`), the upstream fills that slot.
 fn check_tool_call(
     tool_name: &str,
     positional: &[Expr],
     args: &agnes_ast::KwArgs,
     reg: &Registry,
     env: &mut env::Env,
-    flowed_in: Option<TypeName>,
-) -> Result<TypeName, CheckError> {
+    flowed_in: Option<TypeExpr>,
+) -> Result<TypeExpr, CheckError> {
     let sig: ToolSignature =
         reg.tool_signature(tool_name)
             .cloned()
@@ -225,10 +197,8 @@ fn check_tool_call(
                 name: tool_name.to_string(),
             })?;
 
-    // Track which sig params were filled.
     let mut filled: Vec<bool> = vec![false; sig.requires.len()];
 
-    // 1. Positional args fill sig.requires in order.
     for (i, pv) in positional.iter().enumerate() {
         if i >= sig.requires.len() {
             return Err(CheckError::UnknownVar {
@@ -243,7 +213,6 @@ fn check_tool_call(
         filled[i] = true;
     }
 
-    // 2. Keyword args fill by name.
     for (k, v) in args {
         let (idx, param_expected) = sig
             .requires
@@ -258,7 +227,6 @@ fn check_tool_call(
         filled[idx] = true;
     }
 
-    // 3. If exactly one param is unfilled and we have flowed_in, bind it.
     let unfilled: Vec<usize> = filled
         .iter()
         .enumerate()
@@ -287,13 +255,5 @@ fn check_tool_call(
         }
     }
 
-    // Provides must be concrete (Named) for MVP flow — unions block dispatch.
-    match sig.provides {
-        TypeExpr::Named(n) => Ok(n),
-        TypeExpr::Union(_) => Err(CheckError::UnknownVar {
-            name: format!(
-                "tool `{tool_name}` provides a Union type; MVP requires concrete provides"
-            ),
-        }),
-    }
+    Ok(sig.provides.clone())
 }

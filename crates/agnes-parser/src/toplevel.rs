@@ -228,7 +228,10 @@ pub(crate) fn parse_type_expr(v: &lexpr::Value, span: Span) -> Result<TypeExprAs
     if members.len() == 1 {
         Ok(members.into_iter().next().unwrap())
     } else {
-        Ok(TypeExprAst::Union(members))
+        Ok(TypeExprAst::App {
+            head: "|".into(),
+            args: members,
+        })
     }
 }
 

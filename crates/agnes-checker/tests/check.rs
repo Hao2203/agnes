@@ -1,7 +1,7 @@
 use agnes_checker::check;
 use agnes_parser::parse;
 use agnes_registry::Registry;
-use agnes_types::{ToolSignature, TypeExpr, TypeName};
+use agnes_types::{ToolSignature, TypeExpr, canonicalize_union};
 
 fn seed_registry() -> Registry {
     let mut r = Registry::new();
@@ -17,21 +17,20 @@ fn seed_registry() -> Registry {
     r.register_tool(
         "read-file",
         ToolSignature {
-            requires: vec![("path".into(), TypeExpr::Named(TypeName("Path".into())))],
-            provides: TypeExpr::Named(TypeName("PlainText".into())),
+            requires: vec![("path".into(), TypeExpr::named("Path"))],
+            provides: TypeExpr::named("PlainText"),
         },
     )
     .unwrap();
-    let text_like = TypeExpr::Union(
-        [TypeName("PlainText".into()), TypeName("Markdown".into())]
-            .into_iter()
-            .collect(),
-    );
+    let text_like = canonicalize_union([
+        TypeExpr::named("PlainText"),
+        TypeExpr::named("Markdown"),
+    ]);
     r.register_tool(
         "summarize",
         ToolSignature {
             requires: vec![("input".into(), text_like.clone())],
-            provides: TypeExpr::Named(TypeName("Summary".into())),
+            provides: TypeExpr::named("Summary"),
         },
     )
     .unwrap();
@@ -40,13 +39,9 @@ fn seed_registry() -> Registry {
         ToolSignature {
             requires: vec![(
                 "source".into(),
-                TypeExpr::Union(
-                    [TypeName("PDF".into()), TypeName("Image".into())]
-                        .into_iter()
-                        .collect(),
-                ),
+                canonicalize_union([TypeExpr::named("PDF"), TypeExpr::named("Image")]),
             )],
-            provides: TypeExpr::Named(TypeName("PlainText".into())),
+            provides: TypeExpr::named("PlainText"),
         },
     )
     .unwrap();

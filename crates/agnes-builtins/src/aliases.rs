@@ -1,21 +1,13 @@
-use agnes_types::{TypeExpr, TypeName};
+use agnes_types::{TypeExpr, canonicalize_union};
 
 pub fn text_like() -> TypeExpr {
-    TypeExpr::Union(
-        [
-            TypeName("PlainText".into()),
-            TypeName("Markdown".into()),
-            TypeName("HTML".into()),
-        ]
-        .into_iter()
-        .collect(),
-    )
+    canonicalize_union([
+        TypeExpr::named("PlainText"),
+        TypeExpr::named("Markdown"),
+        TypeExpr::named("HTML"),
+    ])
 }
 
 pub fn visual_doc() -> TypeExpr {
-    TypeExpr::Union(
-        [TypeName("PDF".into()), TypeName("Image".into())]
-            .into_iter()
-            .collect(),
-    )
+    canonicalize_union([TypeExpr::named("PDF"), TypeExpr::named("Image")])
 }

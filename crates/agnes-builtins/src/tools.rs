@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use agnes_types::{TypeName, Value};
+use agnes_types::Value;
 use serde_json::Value as JsonValue;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -21,10 +21,7 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
                 let s = path.data.as_str().ok_or("path not string")?;
                 let bytes = tokio::fs::read(s).await.map_err(|e| format!("read: {e}"))?;
                 let text = String::from_utf8(bytes).map_err(|e| format!("utf8: {e}"))?;
-                Ok(Value {
-                    data: JsonValue::String(text),
-                    declared_type: TypeName("PlainText".into()),
-                })
+                Ok(Value::typed(JsonValue::String(text), "PlainText"))
             })
         }),
     );
@@ -50,10 +47,7 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
                 tokio::fs::write(&path, content)
                     .await
                     .map_err(|e| format!("write: {e}"))?;
-                Ok(Value {
-                    data: JsonValue::Null,
-                    declared_type: TypeName("Unit".into()),
-                })
+                Ok(Value::typed(JsonValue::Null, "Unit"))
             })
         }),
     );
@@ -64,10 +58,7 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
             Box::pin(async move {
                 let input = extract_input(&args)?;
                 let summary = format!("[SUMMARY of {} chars]", input.len());
-                Ok(Value {
-                    data: JsonValue::String(summary),
-                    declared_type: TypeName("Summary".into()),
-                })
+                Ok(Value::typed(JsonValue::String(summary), "Summary"))
             })
         }),
     );
@@ -85,10 +76,7 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
                     .ok_or("lang not string")?
                     .to_string();
                 let out = format!("[TRANSLATED to {lang}]\n{input}");
-                Ok(Value {
-                    data: JsonValue::String(out),
-                    declared_type: TypeName("PlainText".into()),
-                })
+                Ok(Value::typed(JsonValue::String(out), "PlainText"))
             })
         }),
     );
@@ -98,10 +86,10 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
         Arc::new(|args| {
             Box::pin(async move {
                 let _ = args.get("source").ok_or("missing :source")?;
-                Ok(Value {
-                    data: JsonValue::String("[OCR-EXTRACTED-TEXT]".into()),
-                    declared_type: TypeName("PlainText".into()),
-                })
+                Ok(Value::typed(
+                    JsonValue::String("[OCR-EXTRACTED-TEXT]".into()),
+                    "PlainText",
+                ))
             })
         }),
     );
@@ -122,10 +110,7 @@ pub fn native_dispatch() -> HashMap<String, ToolImpl> {
                     .map(|v| v.data.as_str().unwrap_or(""))
                     .unwrap_or("");
                 let out = format!("[LLM prompt={prompt} input_len={}]", input.len());
-                Ok(Value {
-                    data: JsonValue::String(out),
-                    declared_type: TypeName("PlainText".into()),
-                })
+                Ok(Value::typed(JsonValue::String(out), "PlainText"))
             })
         }),
     );

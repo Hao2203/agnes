@@ -37,11 +37,11 @@ pub struct Param {
 }
 
 /// Type expression as it appears syntactically. `agnes-types` will
-/// resolve aliases and flatten unions.
+/// resolve aliases, expand `Option`, and canonicalize `(| ...)` unions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExprAst {
     Named(String),
-    Union(Vec<TypeExprAst>),
+    App { head: String, args: Vec<TypeExprAst> },
 }
 
 /// Keyword arguments: (:key value ...)
@@ -178,9 +178,12 @@ impl fmt::Display for TypeExprAst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeExprAst::Named(n) => write!(f, "{n}"),
-            TypeExprAst::Union(members) => {
-                let rendered: Vec<String> = members.iter().map(|m| m.to_string()).collect();
-                write!(f, "({})", rendered.join(" | "))
+            TypeExprAst::App { head, args } => {
+                write!(f, "({head}")?;
+                for a in args {
+                    write!(f, " {a}")?;
+                }
+                write!(f, ")")
             }
         }
     }

@@ -1,9 +1,7 @@
-use agnes_types::{TypeExpr, TypeName};
+use agnes_types::TypeExpr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckError {
-    /// A `tool` call passed an argument whose type does not satisfy the
-    /// tool's declared requires.
     #[error(
         "Type error at (tool {tool} :{param} <arg>):
   parameter `{param}` requires one of: {expected}
@@ -12,17 +10,15 @@ pub enum CheckError {
 Fix suggestion (one of):
   A) Change the argument's source to produce one of the accepted types
   B) Extend {tool} to accept {actual}:
-     (declare tool {tool} :requires [({param}: ({expected} | {actual})) ...] ...)"
+     (declare tool {tool} :requires [({param} (| {expected} {actual})) ...] ...)"
     )]
     ParamMismatch {
         tool: String,
         param: String,
         expected: TypeExpr,
-        actual: TypeName,
+        actual: TypeExpr,
     },
 
-    /// A `pipe` stream cannot feed the next step because the upstream's
-    /// provides doesn't satisfy the downstream's sole positional requires.
     #[error(
         "Type error at (pipe ... (tool {downstream_tool}) ...):
   step `{downstream_tool}` requires one of: {expected}
@@ -36,7 +32,7 @@ Fix suggestion (one of):
         upstream: String,
         downstream_tool: String,
         expected: TypeExpr,
-        actual: TypeName,
+        actual: TypeExpr,
     },
 
     #[error(
@@ -59,7 +55,7 @@ Fix suggestion (paste at top of file):
     DefineSignatureMismatch {
         name: String,
         declared: TypeExpr,
-        body_type: TypeName,
+        body_type: TypeExpr,
     },
 
     #[error(transparent)]
