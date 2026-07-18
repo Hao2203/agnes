@@ -1,0 +1,21 @@
+[package]
+name = "agnes-runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agnes-ast.workspace = true
+agnes-types.workspace = true
+agnes-registry.workspace = true
+agnes-compiler.workspace = true
+agnes-builtins.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+agnes-parser.workspace = true
+agnes-checker.workspace = true

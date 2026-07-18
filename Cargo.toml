@@ -8,9 +8,9 @@ members = [
     "crates/agnes-checker",
     "crates/agnes-compiler",
     "crates/agnes-builtins",
+    "crates/agnes-runtime",
 ]
 # members = [
-#     "crates/agnes-runtime",
 #     "crates/agnes-cli",
 # ]
 
