@@ -20,3 +20,12 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+agnes-parser.workspace = true
+agnes-registry.workspace = true
+agnes-checker.workspace = true
+agnes-compiler.workspace = true
+agnes-runtime.workspace = true
+agnes-builtins.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }

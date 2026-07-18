@@ -16,14 +16,20 @@ pub fn parse_toplevel(form: &lexpr::Value, span: Span) -> Result<TopLevel, Parse
 }
 
 fn parse_declare(rest: &[lexpr::Value], span: Span) -> Result<TopLevel, ParseError> {
-    let kind = rest.first().and_then(|v| v.as_symbol()).ok_or_else(|| ParseError {
-        span,
-        message: "declare needs a kind: type | type-alias | tool".into(),
-    })?;
+    let kind = rest
+        .first()
+        .and_then(|v| v.as_symbol())
+        .ok_or_else(|| ParseError {
+            span,
+            message: "declare needs a kind: type | type-alias | tool".into(),
+        })?;
     match kind {
         "type" => {
             let name = expect_symbol(rest.get(1), span, "type name")?;
-            Ok(TopLevel::DeclareType { span, name: name.to_string() })
+            Ok(TopLevel::DeclareType {
+                span,
+                name: name.to_string(),
+            })
         }
         "type-alias" => {
             let name = expect_symbol(rest.get(1), span, "alias name")?;

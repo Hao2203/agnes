@@ -5,7 +5,7 @@ pub enum CheckError {
     /// A `tool` call passed an argument whose type does not satisfy the
     /// tool's declared requires.
     #[error(
-"Type error at (tool {tool} :{param} <arg>):
+        "Type error at (tool {tool} :{param} <arg>):
   parameter `{param}` requires one of: {expected}
   but got type: {actual}
 
@@ -24,7 +24,7 @@ Fix suggestion (one of):
     /// A `pipe` stream cannot feed the next step because the upstream's
     /// provides doesn't satisfy the downstream's sole positional requires.
     #[error(
-"Type error at (pipe ... (tool {downstream_tool}) ...):
+        "Type error at (pipe ... (tool {downstream_tool}) ...):
   step `{downstream_tool}` requires one of: {expected}
   but upstream step `{upstream}` provides: {actual}
 
@@ -40,7 +40,7 @@ Fix suggestion (one of):
     },
 
     #[error(
-"Unknown tool `{name}` at call site.
+        "Unknown tool `{name}` at call site.
 
 Fix suggestion (paste at top of file):
   (declare tool {name} :requires [...] :provides <TypeExpr>)"
@@ -48,13 +48,13 @@ Fix suggestion (paste at top of file):
     UnknownTool { name: String },
 
     #[error(
-"Unknown variable `{name}` in expression.
+        "Unknown variable `{name}` in expression.
   Was it introduced with (let {name} ...) earlier in scope?"
     )]
     UnknownVar { name: String },
 
     #[error(
-"Define `{name}` body provides type {body_type} which does not satisfy declared :provides {declared}"
+        "Define `{name}` body provides type {body_type} which does not satisfy declared :provides {declared}"
     )]
     DefineSignatureMismatch {
         name: String,

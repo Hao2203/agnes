@@ -1,7 +1,7 @@
 //! AST -> DAG compilation, including recursive-define detection.
 
-pub mod dag;
 mod cycle;
+pub mod dag;
 mod lower;
 
 pub use dag::{Dag, Input, Node, NodeId, NodeKind};

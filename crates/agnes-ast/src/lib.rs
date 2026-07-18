@@ -52,10 +52,7 @@ pub type KwArgs = Vec<(String, Expr)>;
 pub enum TopLevel {
     /// `(declare type <Name>)` — validator is attached at registry-load time
     /// for native types; MVP does not support user-authored validator DSL.
-    DeclareType {
-        span: Span,
-        name: String,
-    },
+    DeclareType { span: Span, name: String },
     /// `(declare type-alias <Name> <TypeExpr>)`
     DeclareTypeAlias {
         span: Span,
@@ -205,10 +202,13 @@ mod tests {
                         span: Span { start: 0, end: 0 },
                         name: "read-file".into(),
                         positional: vec![],
-                        args: vec![("path".into(), Expr::Literal {
-                            span: Span { start: 0, end: 0 },
-                            lit: Literal::String("x".into()),
-                        })],
+                        args: vec![(
+                            "path".into(),
+                            Expr::Literal {
+                                span: Span { start: 0, end: 0 },
+                                lit: Literal::String("x".into()),
+                            },
+                        )],
                     },
                     Expr::Tool {
                         span: Span { start: 0, end: 0 },

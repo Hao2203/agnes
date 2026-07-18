@@ -1,4 +1,4 @@
-use agnes_builtins::{register_builtins, native_dispatch};
+use agnes_builtins::{native_dispatch, register_builtins};
 use agnes_registry::Registry;
 
 #[test]
@@ -16,7 +16,14 @@ fn registers_all_builtins() {
 #[test]
 fn native_dispatch_has_all_impls() {
     let d = native_dispatch();
-    for name in ["read-file","write-file","summarize","translate","ocr","llm"] {
+    for name in [
+        "read-file",
+        "write-file",
+        "summarize",
+        "translate",
+        "ocr",
+        "llm",
+    ] {
         assert!(d.contains_key(name), "missing impl for {name}");
     }
 }

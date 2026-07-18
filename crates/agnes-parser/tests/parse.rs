@@ -64,7 +64,12 @@ fn parses_declare_tool() {
     "#;
     let p = parse(src).expect("parse ok");
     match &p.toplevels[0] {
-        TopLevel::DeclareTool { name, requires, provides, .. } => {
+        TopLevel::DeclareTool {
+            name,
+            requires,
+            provides,
+            ..
+        } => {
             assert_eq!(name, "ocr");
             assert_eq!(requires.len(), 1);
             assert_eq!(requires[0].name, "source");
@@ -119,7 +124,10 @@ fn parses_source_with_non_ascii_content() {
     let main = p.main.expect("has main");
     // Verify the string literal came through intact.
     let matches = format!("{:?}", main).contains("你好 world");
-    assert!(matches, "expected non-ASCII string preserved, got: {main:?}");
+    assert!(
+        matches,
+        "expected non-ASCII string preserved, got: {main:?}"
+    );
 }
 
 #[test]
@@ -127,7 +135,12 @@ fn positional_tool_arg_uses_positional_vec() {
     let src = r#"(tool summarize doc)"#;
     let p = agnes_parser::parse(src).unwrap();
     match p.main.unwrap() {
-        agnes_ast::Expr::Tool { name, positional, args, .. } => {
+        agnes_ast::Expr::Tool {
+            name,
+            positional,
+            args,
+            ..
+        } => {
             assert_eq!(name, "summarize");
             assert_eq!(positional.len(), 1);
             assert!(args.is_empty(), "no synthetic kwargs");

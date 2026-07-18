@@ -19,7 +19,10 @@ fn seed() -> Registry {
     r.register_tool(
         "summarize",
         ToolSignature {
-            requires: vec![("input".into(), TypeExpr::Named(TypeName("PlainText".into())))],
+            requires: vec![(
+                "input".into(),
+                TypeExpr::Named(TypeName("PlainText".into())),
+            )],
             provides: TypeExpr::Named(TypeName("Summary".into())),
         },
     )

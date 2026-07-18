@@ -103,7 +103,7 @@ mod tests {
     fn utf8_validator_accepts_valid_string() {
         let v = |json: &serde_json::Value| -> Result<(), String> {
             match json.as_str() {
-                Some(s) if !s.as_bytes().is_empty() && std::str::from_utf8(s.as_bytes()).is_ok() => Ok(()),
+                Some(s) if !s.is_empty() && std::str::from_utf8(s.as_bytes()).is_ok() => Ok(()),
                 Some(_) => Err("empty".into()),
                 None => Err("not a string".into()),
             }

@@ -17,7 +17,14 @@ pub use error::CheckError;
 pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
     // First, check every `define`'s body in isolation.
     for tl in &program.toplevels {
-        if let TopLevel::Define { name, params, provides, body, .. } = tl {
+        if let TopLevel::Define {
+            name,
+            params,
+            provides,
+            body,
+            ..
+        } = tl
+        {
             let mut env = env::Env::default();
             for p in params {
                 let ty_expr = reg.resolve(&p.ty)?;
@@ -54,9 +61,12 @@ fn check_expr(
     flowed_in: Option<TypeName>,
 ) -> Result<TypeName, CheckError> {
     match e {
-        Expr::Tool { name, positional, args, .. } => {
-            check_tool_call(name, positional, args, reg, env, flowed_in)
-        }
+        Expr::Tool {
+            name,
+            positional,
+            args,
+            ..
+        } => check_tool_call(name, positional, args, reg, env, flowed_in),
         Expr::Pipe { steps, .. } => {
             let mut upstream: Option<TypeName> = None;
             let mut last: Option<TypeName> = None;
@@ -65,14 +75,18 @@ fn check_expr(
                 upstream = Some(ty.clone());
                 last = Some(ty);
             }
-            last.ok_or_else(|| CheckError::UnknownVar { name: "(empty pipe)".into() })
+            last.ok_or_else(|| CheckError::UnknownVar {
+                name: "(empty pipe)".into(),
+            })
         }
         Expr::Par { branches, .. } => {
             let mut last = None;
             for b in branches {
                 last = Some(check_expr(b, reg, env, None)?);
             }
-            last.ok_or_else(|| CheckError::UnknownVar { name: "(empty par)".into() })
+            last.ok_or_else(|| CheckError::UnknownVar {
+                name: "(empty par)".into(),
+            })
         }
         Expr::Let { name, value, .. } => {
             let bound = match value {
@@ -84,21 +98,32 @@ fn check_expr(
             env.set(name.clone(), bound.clone());
             Ok(bound)
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             let _ = check_expr(cond, reg, env, None)?;
             let t = check_expr(then_branch, reg, env, None)?;
             let _ = check_expr(else_branch, reg, env, None)?;
             Ok(t)
         }
-        Expr::Match { scrutinee, arms, .. } => {
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
             let _ = check_expr(scrutinee, reg, env, None)?;
             let mut last = None;
             for (_, arm) in arms {
                 last = Some(check_expr(arm, reg, env, None)?);
             }
-            last.ok_or_else(|| CheckError::UnknownVar { name: "(empty match)".into() })
+            last.ok_or_else(|| CheckError::UnknownVar {
+                name: "(empty match)".into(),
+            })
         }
-        Expr::Foreach { body, collection, .. } => {
+        Expr::Foreach {
+            body, collection, ..
+        } => {
             let _ = check_expr(collection, reg, env, None)?;
             check_expr(body, reg, env, None)
         }
@@ -108,7 +133,9 @@ fn check_expr(
             let _ = check_expr(fallback, reg, env, flowed_in)?;
             Ok(t)
         }
-        Expr::Llm { positional, args, .. } => {
+        Expr::Llm {
+            positional, args, ..
+        } => {
             // Walk sub-expressions so unknown vars / bad refs inside an llm call
             // are still surfaced. MVP: llm always provides PlainText.
             for pv in positional {
@@ -121,18 +148,19 @@ fn check_expr(
         }
         Expr::Return { value, .. } => check_expr(value, reg, env, None),
         Expr::Literal { lit, .. } => Ok(literal_type(lit)),
-        Expr::Var { name, .. } => env.get(name).cloned().ok_or_else(|| CheckError::UnknownVar {
-            name: name.clone(),
-        }),
+        Expr::Var { name, .. } => env
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CheckError::UnknownVar { name: name.clone() }),
     }
 }
 
 fn literal_type(lit: &agnes_ast::Literal) -> TypeName {
     match lit {
         agnes_ast::Literal::String(_) => TypeName("String".into()),
-        agnes_ast::Literal::Int(_)    => TypeName("Int".into()),
-        agnes_ast::Literal::Bool(_)   => TypeName("Bool".into()),
-        agnes_ast::Literal::Nil       => TypeName("Unit".into()),
+        agnes_ast::Literal::Int(_) => TypeName("Int".into()),
+        agnes_ast::Literal::Bool(_) => TypeName("Bool".into()),
+        agnes_ast::Literal::Nil => TypeName("Unit".into()),
     }
 }
 
@@ -190,10 +218,12 @@ fn check_tool_call(
     env: &mut env::Env,
     flowed_in: Option<TypeName>,
 ) -> Result<TypeName, CheckError> {
-    let sig: ToolSignature = reg
-        .tool_signature(tool_name)
-        .cloned()
-        .ok_or_else(|| CheckError::UnknownTool { name: tool_name.to_string() })?;
+    let sig: ToolSignature =
+        reg.tool_signature(tool_name)
+            .cloned()
+            .ok_or_else(|| CheckError::UnknownTool {
+                name: tool_name.to_string(),
+            })?;
 
     // Track which sig params were filled.
     let mut filled: Vec<bool> = vec![false; sig.requires.len()];

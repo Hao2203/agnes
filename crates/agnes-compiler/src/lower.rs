@@ -122,10 +122,7 @@ impl<'a> Lowering<'a> {
                 ))
             }
             Expr::Catch {
-                on,
-                fallback,
-                body,
-                ..
+                on, fallback, body, ..
             } => {
                 let b = self.lower_expr(body, upstream)?;
                 let f = self.lower_expr(fallback, None)?;
@@ -279,9 +276,11 @@ impl<'a> Lowering<'a> {
             ids.push(n);
             prev = Some(n);
         }
-        let last = *ids.last().ok_or_else(|| crate::CompileError::UnknownDefine {
-            name: "<empty pipe>".into(),
-        })?;
+        let last = *ids
+            .last()
+            .ok_or_else(|| crate::CompileError::UnknownDefine {
+                name: "<empty pipe>".into(),
+            })?;
         let provides = self.nodes[last.0].provides.clone();
         let inputs: Vec<Input> = ids.into_iter().map(Input::FromNode).collect();
         Ok(self.add(NodeKind::Pipe, inputs, provides))

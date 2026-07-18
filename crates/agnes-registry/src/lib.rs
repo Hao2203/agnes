@@ -18,9 +18,9 @@ pub enum EntryKind {
 impl fmt::Display for EntryKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EntryKind::Type  => write!(f, "type"),
+            EntryKind::Type => write!(f, "type"),
             EntryKind::Alias => write!(f, "type alias"),
-            EntryKind::Tool  => write!(f, "tool"),
+            EntryKind::Tool => write!(f, "tool"),
         }
     }
 }
@@ -50,7 +50,9 @@ pub struct Registry {
 }
 
 impl Default for Registry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Registry {
@@ -81,14 +83,14 @@ impl Registry {
         // Tools live in a separate namespace from types/aliases (tool names
         // and type names cannot collide in practice — types are PascalCase,
         // tools are kebab-case — but we still forbid duplicate tool names).
-        if let EntryKind::Tool = attempted {
-            if self.tools.contains_key(name) {
-                return Err(RegistryError::NameConflict {
-                    name: name.into(),
-                    existing_kind: EntryKind::Tool,
-                    attempted_kind: attempted,
-                });
-            }
+        if let EntryKind::Tool = attempted
+            && self.tools.contains_key(name)
+        {
+            return Err(RegistryError::NameConflict {
+                name: name.into(),
+                existing_kind: EntryKind::Tool,
+                attempted_kind: attempted,
+            });
         }
         Ok(())
     }
@@ -157,7 +159,9 @@ impl Registry {
                 let mut set: HashSet<TypeName> = HashSet::new();
                 for m in members {
                     let resolved = self.resolve(m)?;
-                    for t in resolved.as_set() { set.insert(t); }
+                    for t in resolved.as_set() {
+                        set.insert(t);
+                    }
                 }
                 if set.len() == 1 {
                     Ok(TypeExpr::Named(set.into_iter().next().unwrap()))
@@ -179,5 +183,9 @@ impl Registry {
 
 /// Iterator helper for the compiler: yield only the `Define` top-levels.
 pub fn defines_of(program: &Program) -> Vec<&TopLevel> {
-    program.toplevels.iter().filter(|t| matches!(t, TopLevel::Define { .. })).collect()
+    program
+        .toplevels
+        .iter()
+        .filter(|t| matches!(t, TopLevel::Define { .. }))
+        .collect()
 }

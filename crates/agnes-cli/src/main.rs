@@ -6,7 +6,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let path = std::env::args().nth(1).ok_or_else(|| anyhow::anyhow!("usage: agnes <file.agnes>"))?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("usage: agnes <file.agnes>"))?;
     let src = tokio::fs::read_to_string(PathBuf::from(&path)).await?;
 
     let mut reg = agnes_registry::Registry::new();
@@ -18,7 +20,8 @@ async fn main() -> anyhow::Result<()> {
     let dag = agnes_compiler::compile(&program, &reg).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let dispatch = agnes_builtins::native_dispatch();
-    let result = agnes_runtime::execute(&dag, &reg, &dispatch).await
+    let result = agnes_runtime::execute(&dag, &reg, &dispatch)
+        .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("{}", result.data);

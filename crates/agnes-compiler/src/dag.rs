@@ -6,15 +6,29 @@ pub struct NodeId(pub usize);
 
 #[derive(Debug, Clone)]
 pub enum NodeKind {
-    Tool { name: String },
+    Tool {
+        name: String,
+    },
     Pipe,
     Par,
-    Let { name: String },
+    Let {
+        name: String,
+    },
     If,
-    Match { arms: Vec<Literal> },
-    Foreach { item: String },
-    Retry { times: u32, backoff: Option<String> },
-    Catch { on: Option<String>, fallback: NodeId },
+    Match {
+        arms: Vec<Literal>,
+    },
+    Foreach {
+        item: String,
+    },
+    Retry {
+        times: u32,
+        backoff: Option<String>,
+    },
+    Catch {
+        on: Option<String>,
+        fallback: NodeId,
+    },
     /// Inputs are all `Input::Kw` entries with keys matching the llm builtin's
     /// parameter names (`prompt`, `input`). No positional inputs.
     Llm,
@@ -36,7 +50,10 @@ pub enum Input {
     Var(String),
     /// Keyword-bound edge: same as FromNode but tagged with the parameter
     /// name so the runtime knows which slot to fill.
-    Kw { key: String, source: Box<Input> },
+    Kw {
+        key: String,
+        source: Box<Input>,
+    },
 }
 
 #[derive(Debug, Clone)]

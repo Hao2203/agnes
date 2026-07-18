@@ -13,7 +13,12 @@ pub fn load(reg: &mut Registry, program: &Program) -> Result<(), RegistryError> 
                 let resolved = reg.resolve(expr)?;
                 reg.register_alias(name, resolved)?;
             }
-            TopLevel::DeclareTool { name, requires, provides, .. } => {
+            TopLevel::DeclareTool {
+                name,
+                requires,
+                provides,
+                ..
+            } => {
                 let sig = resolve_tool_sig(reg, requires, provides)?;
                 // Allow override for user re-declares; but forbid initial dup.
                 if reg.tool_signature(name).is_some() {
@@ -22,7 +27,13 @@ pub fn load(reg: &mut Registry, program: &Program) -> Result<(), RegistryError> 
                     reg.register_tool(name, sig)?;
                 }
             }
-            TopLevel::Define { name, params, provides, body, .. } => {
+            TopLevel::Define {
+                name,
+                params,
+                provides,
+                body,
+                ..
+            } => {
                 // Register the tool signature so the checker sees this define
                 // as a callable tool.
                 let sig = resolve_tool_sig(reg, params, provides)?;
@@ -50,5 +61,8 @@ pub fn resolve_tool_sig(
         req.push((p.name.clone(), reg.resolve(&p.ty)?));
     }
     let prov: TypeExpr = reg.resolve(provides)?;
-    Ok(ToolSignature { requires: req, provides: prov })
+    Ok(ToolSignature {
+        requires: req,
+        provides: prov,
+    })
 }

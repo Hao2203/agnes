@@ -6,7 +6,7 @@ pub enum RuntimeError {
     ToolFailed { tool: String, cause: String },
 
     #[error(
-"Runtime type error at (tool {tool} {direction}):
+        "Runtime type error at (tool {tool} {direction}):
   step `{tool}` declared: {direction} {ty}
   but value fails {ty} validator: {cause}
 

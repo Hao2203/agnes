@@ -14,25 +14,42 @@ fn seed_registry() -> Registry {
     r.register_type("Unit", None).unwrap();
     r.register_type("String", None).unwrap();
     // Tools
-    r.register_tool("read-file", ToolSignature {
-        requires: vec![("path".into(), TypeExpr::Named(TypeName("Path".into())))],
-        provides: TypeExpr::Named(TypeName("PlainText".into())),
-    }).unwrap();
-    let text_like = TypeExpr::Union([
-        TypeName("PlainText".into()),
-        TypeName("Markdown".into()),
-    ].into_iter().collect());
-    r.register_tool("summarize", ToolSignature {
-        requires: vec![("input".into(), text_like.clone())],
-        provides: TypeExpr::Named(TypeName("Summary".into())),
-    }).unwrap();
-    r.register_tool("ocr", ToolSignature {
-        requires: vec![("source".into(), TypeExpr::Union([
-            TypeName("PDF".into()),
-            TypeName("Image".into()),
-        ].into_iter().collect()))],
-        provides: TypeExpr::Named(TypeName("PlainText".into())),
-    }).unwrap();
+    r.register_tool(
+        "read-file",
+        ToolSignature {
+            requires: vec![("path".into(), TypeExpr::Named(TypeName("Path".into())))],
+            provides: TypeExpr::Named(TypeName("PlainText".into())),
+        },
+    )
+    .unwrap();
+    let text_like = TypeExpr::Union(
+        [TypeName("PlainText".into()), TypeName("Markdown".into())]
+            .into_iter()
+            .collect(),
+    );
+    r.register_tool(
+        "summarize",
+        ToolSignature {
+            requires: vec![("input".into(), text_like.clone())],
+            provides: TypeExpr::Named(TypeName("Summary".into())),
+        },
+    )
+    .unwrap();
+    r.register_tool(
+        "ocr",
+        ToolSignature {
+            requires: vec![(
+                "source".into(),
+                TypeExpr::Union(
+                    [TypeName("PDF".into()), TypeName("Image".into())]
+                        .into_iter()
+                        .collect(),
+                ),
+            )],
+            provides: TypeExpr::Named(TypeName("PlainText".into())),
+        },
+    )
+    .unwrap();
     r
 }
 

@@ -30,10 +30,16 @@ fn resolve_alias_flattens_nested_union() {
     r.register_alias(
         "TextLike",
         agnes_types::TypeExpr::Union(
-            [TypeName("PlainText".into()), TypeName("Markdown".into()), TypeName("HTML".into())]
-                .into_iter().collect()
+            [
+                TypeName("PlainText".into()),
+                TypeName("Markdown".into()),
+                TypeName("HTML".into()),
+            ]
+            .into_iter()
+            .collect(),
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     // (TextLike | PDF) should resolve to a flat 4-member set.
     r.register_type("PDF", None).unwrap();

@@ -40,12 +40,14 @@ fn eval_node<'a>(
                 data: lit_to_json(lit),
                 declared_type: lit_type(lit),
             },
-            NodeKind::Var(name) => env.get(name).cloned().ok_or_else(|| {
-                RuntimeError::ToolFailed {
-                    tool: format!("<var>{name}"),
-                    cause: "unbound variable".into(),
-                }
-            })?,
+            NodeKind::Var(name) => {
+                env.get(name)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::ToolFailed {
+                        tool: format!("<var>{name}"),
+                        cause: "unbound variable".into(),
+                    })?
+            }
             NodeKind::Let { name } => {
                 let src = eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?;
                 env.insert(name.clone(), src.clone());
@@ -76,7 +78,11 @@ fn eval_node<'a>(
             }
             NodeKind::If => {
                 let cond = eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?;
-                let picked = if cond.data.as_bool().unwrap_or(false) { 1 } else { 2 };
+                let picked = if cond.data.as_bool().unwrap_or(false) {
+                    1
+                } else {
+                    2
+                };
                 eval_input(dag, &node.inputs[picked], reg, dispatch, cache, env).await?
             }
             NodeKind::Match { arms } => {
@@ -119,9 +125,7 @@ fn eval_node<'a>(
                 let args = collect_kwargs(dag, &node.inputs, reg, dispatch, cache, env).await?;
                 call_native("llm", args, dispatch, reg, &node.provides).await?
             }
-            NodeKind::Return => {
-                eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?
-            }
+            NodeKind::Return => eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?,
             NodeKind::Tool { name } => {
                 let args = collect_kwargs(dag, &node.inputs, reg, dispatch, cache, env).await?;
                 call_native(name, args, dispatch, reg, &node.provides).await?
@@ -147,15 +151,14 @@ fn eval_input<'a>(
                 data: lit_to_json(lit),
                 declared_type: lit_type(lit),
             }),
-            Input::Var(name) => env.get(name).cloned().ok_or_else(|| {
-                RuntimeError::ToolFailed {
+            Input::Var(name) => env
+                .get(name)
+                .cloned()
+                .ok_or_else(|| RuntimeError::ToolFailed {
                     tool: format!("<var>{name}"),
                     cause: "unbound variable".into(),
-                }
-            }),
-            Input::Kw { source, .. } => {
-                eval_input(dag, source, reg, dispatch, cache, env).await
-            }
+                }),
+            Input::Kw { source, .. } => eval_input(dag, source, reg, dispatch, cache, env).await,
         }
     })
 }
@@ -246,14 +249,20 @@ fn dispatch_define<'a>(
                 }
                 None => {
                     if let Some(default) = &p.default {
-                        sub_env.insert(p.name.clone(), Value {
-                            data: lit_to_json(default),
-                            declared_type: lit_type(default),
-                        });
+                        sub_env.insert(
+                            p.name.clone(),
+                            Value {
+                                data: lit_to_json(default),
+                                declared_type: lit_type(default),
+                            },
+                        );
                     } else {
                         return Err(RuntimeError::ToolFailed {
                             tool: tool.to_string(),
-                            cause: format!("missing required param `{}` to define `{tool}`", p.name),
+                            cause: format!(
+                                "missing required param `{}` to define `{tool}`",
+                                p.name
+                            ),
                         });
                     }
                 }
@@ -275,8 +284,14 @@ fn eval_expr<'a>(
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
         match e {
-            Expr::Tool { name, positional, args, .. } => {
-                let kwargs = bind_tool_args(name, positional, args, flowed_in, reg, dispatch, env).await?;
+            Expr::Tool {
+                name,
+                positional,
+                args,
+                ..
+            } => {
+                let kwargs =
+                    bind_tool_args(name, positional, args, flowed_in, reg, dispatch, env).await?;
                 let provides = tool_provides(reg, name);
                 call_native(name, kwargs, dispatch, reg, &provides).await
             }
@@ -311,7 +326,12 @@ fn eval_expr<'a>(
                 env.insert(name.clone(), bound.clone());
                 Ok(bound)
             }
-            Expr::If { cond, then_branch, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 let c = eval_expr(cond, None, reg, dispatch, env).await?;
                 if c.data.as_bool().unwrap_or(false) {
                     eval_expr(then_branch, None, reg, dispatch, env).await
@@ -319,7 +339,9 @@ fn eval_expr<'a>(
                     eval_expr(else_branch, None, reg, dispatch, env).await
                 }
             }
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 let s = eval_expr(scrutinee, None, reg, dispatch, env).await?;
                 for (pat, arm) in arms {
                     if lit_matches(pat, &s.data) {
@@ -328,7 +350,9 @@ fn eval_expr<'a>(
                 }
                 Ok(s)
             }
-            Expr::Foreach { collection, body, .. } => {
+            Expr::Foreach {
+                collection, body, ..
+            } => {
                 let _ = eval_expr(collection, None, reg, dispatch, env).await?;
                 eval_expr(body, None, reg, dispatch, env).await
             }
@@ -348,7 +372,11 @@ fn eval_expr<'a>(
                     Err(_) => eval_expr(fallback, None, reg, dispatch, env).await,
                 }
             }
-            Expr::Llm { positional: _, args, .. } => {
+            Expr::Llm {
+                positional: _,
+                args,
+                ..
+            } => {
                 let mut kwargs: HashMap<String, Value> = HashMap::new();
                 for (k, v) in args {
                     let val = eval_expr(v, None, reg, dispatch, env).await?;
@@ -367,12 +395,14 @@ fn eval_expr<'a>(
                 data: lit_to_json(lit),
                 declared_type: lit_type(lit),
             }),
-            Expr::Var { name, .. } => env.get(name).cloned().ok_or_else(|| {
-                RuntimeError::ToolFailed {
-                    tool: format!("<var>{name}"),
-                    cause: "unbound variable".into(),
-                }
-            }),
+            Expr::Var { name, .. } => {
+                env.get(name)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::ToolFailed {
+                        tool: format!("<var>{name}"),
+                        cause: "unbound variable".into(),
+                    })
+            }
         }
     })
 }
@@ -388,21 +418,24 @@ async fn bind_tool_args(
     dispatch: &HashMap<String, ToolImpl>,
     env: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, RuntimeError> {
-    let sig: ToolSignature = reg
-        .tool_signature(tool_name)
-        .cloned()
-        .ok_or_else(|| RuntimeError::MissingImpl {
-            tool: tool_name.to_string(),
-        })?;
+    let sig: ToolSignature =
+        reg.tool_signature(tool_name)
+            .cloned()
+            .ok_or_else(|| RuntimeError::MissingImpl {
+                tool: tool_name.to_string(),
+            })?;
 
     let mut out: HashMap<String, Value> = HashMap::new();
     let mut filled: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (i, pv) in positional.iter().enumerate() {
-        let (pname, _) = sig.requires.get(i).ok_or_else(|| RuntimeError::ToolFailed {
-            tool: tool_name.into(),
-            cause: format!("extra positional arg at index {i}"),
-        })?;
+        let (pname, _) = sig
+            .requires
+            .get(i)
+            .ok_or_else(|| RuntimeError::ToolFailed {
+                tool: tool_name.into(),
+                cause: format!("extra positional arg at index {i}"),
+            })?;
         let v = eval_expr(pv, None, reg, dispatch, env).await?;
         out.insert(pname.clone(), v);
         filled.insert(pname.clone());
