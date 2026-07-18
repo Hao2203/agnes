@@ -1,0 +1,19 @@
+;; Full demo: declares a compound `read-and-translate` for type-checking
+;; (per spec §VII), then runs the equivalent inline workflow. The MVP
+;; runtime does not yet inline defines; `par` runs branches sequentially
+;; and does not propagate `let` bindings across siblings, so the LLM
+;; downstream reads its input from a fresh inline pipe.
+(define read-and-translate
+  :params  [(path: Path) (target: String)]
+  :provides PlainText
+  (pipe
+    (tool read-file :path path)
+    (tool translate :lang target)))
+
+(pipe
+  (par
+    (pipe (tool read-file :path "README.md") (tool summarize))
+    (pipe (tool read-file :path "README.md") (tool translate :lang "ja")))
+  (tool llm :prompt "combine summary and translation"
+             :input (pipe (tool read-file :path "README.md")
+                           (tool translate :lang "ja"))))

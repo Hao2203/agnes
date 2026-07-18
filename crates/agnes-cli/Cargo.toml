@@ -1,0 +1,22 @@
+[package]
+name = "agnes-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "agnes"
+path = "src/main.rs"
+
+[dependencies]
+agnes-parser.workspace = true
+agnes-registry.workspace = true
+agnes-checker.workspace = true
+agnes-compiler.workspace = true
+agnes-runtime.workspace = true
+agnes-builtins.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

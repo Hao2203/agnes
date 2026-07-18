@@ -7,3 +7,5 @@ Task 6: complete (commits 448f4e4..b397f0c, review clean; 4 minor concerns defer
 Task 7: complete (commits b397f0c..e1e7351 incl. fix, review + fix clean)
 Task 8: complete (builtins registered + 6 tool impls)
 Task 8: complete (commits e1e7351..50f4cc8, review clean)
+Task 9: complete (commit 81d5a9d2, runtime execute() + boundary validation, 1 integration test pass)
+Task 9: complete (commits 50f4cc8..81d5a9d, review clean)

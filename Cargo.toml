@@ -9,10 +9,8 @@ members = [
     "crates/agnes-compiler",
     "crates/agnes-builtins",
     "crates/agnes-runtime",
+    "crates/agnes-cli",
 ]
-# members = [
-#     "crates/agnes-cli",
-# ]
 
 [workspace.package]
 edition = "2024"
