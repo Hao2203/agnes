@@ -2,10 +2,10 @@
 resolver = "3"
 members = [
     "crates/agnes-ast",
+    "crates/agnes-types",
 ]
 # members = [
 #     "crates/agnes-parser",
-#     "crates/agnes-types",
 #     "crates/agnes-registry",
 #     "crates/agnes-checker",
 #     "crates/agnes-compiler",
