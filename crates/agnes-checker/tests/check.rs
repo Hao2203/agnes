@@ -66,6 +66,61 @@ fn flow_mismatch_produces_llm_friendly_error() {
 }
 
 #[test]
+fn list_of_string_typed_correctly() {
+    // Register a tool that takes (List String).
+    let mut r = Registry::new();
+    r.register_type("String", None).unwrap();
+    r.register_type("PlainText", None).unwrap();
+    r.register_tool(
+        "consume-strings",
+        ToolSignature {
+            requires: vec![(
+                "items".into(),
+                TypeExpr::App {
+                    head: agnes_types::TypeName("List".into()),
+                    args: vec![TypeExpr::named("String")],
+                },
+            )],
+            provides: TypeExpr::named("PlainText"),
+        },
+    )
+    .unwrap();
+
+    let src = r#"(tool consume-strings :items ["a" "b" "c"])"#;
+    let p = parse(src).unwrap();
+    check(&p, &r).expect("must type-check");
+}
+
+#[test]
+fn list_of_mixed_types_rejected_where_list_of_string_expected() {
+    let mut r = Registry::new();
+    r.register_type("String", None).unwrap();
+    r.register_type("Int", None).unwrap();
+    r.register_type("PlainText", None).unwrap();
+    r.register_tool(
+        "consume-strings",
+        ToolSignature {
+            requires: vec![(
+                "items".into(),
+                TypeExpr::App {
+                    head: agnes_types::TypeName("List".into()),
+                    args: vec![TypeExpr::named("String")],
+                },
+            )],
+            provides: TypeExpr::named("PlainText"),
+        },
+    )
+    .unwrap();
+
+    let src = r#"(tool consume-strings :items ["a" 1])"#;
+    let p = parse(src).unwrap();
+    let err = check(&p, &r).expect_err("must reject");
+    let msg = format!("{err}");
+    assert!(msg.contains("List"), "got: {msg}");
+    assert!(msg.contains("String") || msg.contains("Int"), "got: {msg}");
+}
+
+#[test]
 fn unknown_tool_reports() {
     let src = r#"(tool no-such-tool)"#;
     let p = parse(src).unwrap();

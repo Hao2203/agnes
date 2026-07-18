@@ -183,6 +183,64 @@ fn parses_source_with_non_ascii_content() {
 }
 
 #[test]
+fn parses_list_form() {
+    let src = r#"(list "a" "b" "c")"#;
+    let p = parse(src).expect("parse ok");
+    match p.main.expect("has main") {
+        Expr::List { items, .. } => {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(&items[0], Expr::Literal { lit: Literal::String(s), .. } if s == "a"));
+        }
+        other => panic!("expected Expr::List, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_bracket_list() {
+    let src = r#"["a" "b"]"#;
+    let p = parse(src).expect("parse ok");
+    match p.main.expect("has main") {
+        Expr::List { items, .. } => assert_eq!(items.len(), 2),
+        other => panic!("expected Expr::List, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_empty_bracket_list() {
+    let src = r#"[]"#;
+    let p = parse(src).expect("parse ok");
+    match p.main.expect("has main") {
+        Expr::List { items, .. } => assert!(items.is_empty()),
+        other => panic!("expected Expr::List, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_comma_in_bracket_list() {
+    let src = r#"["a", "b"]"#;
+    let err = parse(src).expect_err("must reject commas");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("comma") || msg.to_lowercase().contains("whitespace"),
+        "expected comma hint, got: {msg}"
+    );
+}
+
+#[test]
+fn parses_nested_bracket_list() {
+    let src = r#"[["a"] ["b" "c"]]"#;
+    let p = parse(src).expect("parse ok");
+    match p.main.expect("has main") {
+        Expr::List { items, .. } => {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(&items[0], Expr::List { items, .. } if items.len() == 1));
+            assert!(matches!(&items[1], Expr::List { items, .. } if items.len() == 2));
+        }
+        other => panic!("expected outer Expr::List, got {other:?}"),
+    }
+}
+
+#[test]
 fn positional_tool_arg_uses_positional_vec() {
     let src = r#"(tool summarize doc)"#;
     let p = agnes_parser::parse(src).unwrap();

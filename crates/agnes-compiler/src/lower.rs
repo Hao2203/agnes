@@ -193,6 +193,25 @@ impl<'a> Lowering<'a> {
                 vec![],
                 TypeExpr::Named(agnes_types::TypeName("Unknown".into())),
             )),
+            Expr::List { items, .. } => {
+                let mut inputs: Vec<Input> = Vec::with_capacity(items.len());
+                let mut elem_types: Vec<TypeExpr> = Vec::with_capacity(items.len());
+                for it in items {
+                    let id = self.lower_expr(it, None)?;
+                    elem_types.push(self.nodes[id.0].provides.clone());
+                    inputs.push(Input::FromNode(id));
+                }
+                let elem_ty = if elem_types.is_empty() {
+                    TypeExpr::named("Unknown")
+                } else {
+                    agnes_types::canonicalize_union(elem_types.clone())
+                };
+                let provides = TypeExpr::App {
+                    head: agnes_types::TypeName("List".into()),
+                    args: vec![elem_ty],
+                };
+                Ok(self.add(NodeKind::List, inputs, provides))
+            }
         }
     }
 

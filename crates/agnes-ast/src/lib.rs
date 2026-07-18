@@ -143,6 +143,9 @@ pub enum Expr {
     Literal { span: Span, lit: Literal },
     /// A reference to a bound name (from `let` or a `define` param).
     Var { span: Span, name: String },
+    /// `(list e1 e2 ...)` or `[e1 e2 ...]` — a list literal.
+    /// Elements are arbitrary Exprs, not just literals.
+    List { span: Span, items: Vec<Expr> },
 }
 
 impl Expr {
@@ -160,7 +163,8 @@ impl Expr {
             | Expr::Llm { span, .. }
             | Expr::Return { span, .. }
             | Expr::Literal { span, .. }
-            | Expr::Var { span, .. } => *span,
+            | Expr::Var { span, .. }
+            | Expr::List { span, .. } => *span,
         }
     }
 }

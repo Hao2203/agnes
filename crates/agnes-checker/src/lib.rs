@@ -12,7 +12,7 @@ pub mod error;
 
 use agnes_ast::{Expr, Program, TopLevel};
 use agnes_registry::Registry;
-use agnes_types::{ToolSignature, TypeExpr, TypeName, type_expr_matches};
+use agnes_types::{ToolSignature, TypeExpr, TypeName, canonicalize_union, type_expr_matches};
 
 pub use error::CheckError;
 
@@ -146,6 +146,23 @@ fn check_expr(
             .get(name)
             .cloned()
             .ok_or_else(|| CheckError::UnknownVar { name: name.clone() }),
+        Expr::List { items, .. } => {
+            if items.is_empty() {
+                return Ok(TypeExpr::App {
+                    head: TypeName("List".into()),
+                    args: vec![TypeExpr::Named(TypeName("Unknown".into()))],
+                });
+            }
+            let mut elem_types: Vec<TypeExpr> = Vec::with_capacity(items.len());
+            for it in items {
+                elem_types.push(check_expr(it, reg, env, None)?);
+            }
+            let inner = canonicalize_union(elem_types);
+            Ok(TypeExpr::App {
+                head: TypeName("List".into()),
+                args: vec![inner],
+            })
+        }
     }
 }
 

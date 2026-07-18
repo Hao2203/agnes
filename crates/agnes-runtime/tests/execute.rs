@@ -55,6 +55,22 @@ async fn runs_a_defined_compound_tool() {
     let _ = tokio::fs::remove_file(&tmp).await;
 }
 
+#[tokio::test]
+async fn evaluates_list_literal() {
+    let src = r#"(list "a" "b" "c")"#;
+    let mut r = agnes_registry::Registry::new();
+    agnes_builtins::register_builtins(&mut r).unwrap();
+    let p = agnes_parser::parse(src).unwrap();
+    r.load(&p).unwrap();
+    agnes_checker::check(&p, &r).unwrap();
+    let dag = agnes_compiler::compile(&p, &r).unwrap();
+    let dispatch = agnes_builtins::native_dispatch();
+    let out = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
+    let arr = out.data.as_array().expect("array result");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0], serde_json::json!("a"));
+}
+
 fn tempfile_path() -> String {
     let dir = std::env::temp_dir();
     let stamp = std::process::id();

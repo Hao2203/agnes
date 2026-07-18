@@ -4,7 +4,7 @@ use agnes_ast::{Expr, KwArgs, Literal};
 use agnes_builtins::ToolImpl;
 use agnes_compiler::{Dag, Input, NodeId, NodeKind};
 use agnes_registry::Registry;
-use agnes_types::{ToolSignature, TypeExpr, TypeName, Value};
+use agnes_types::{ToolSignature, TypeExpr, TypeName, Value, canonicalize_union};
 use serde_json::Value as JsonValue;
 
 use crate::boundary::validate;
@@ -129,6 +129,19 @@ fn eval_node<'a>(
             NodeKind::Tool { name } => {
                 let args = collect_kwargs(dag, &node.inputs, reg, dispatch, cache, env).await?;
                 call_native(name, args, dispatch, reg, &node.provides).await?
+            }
+            NodeKind::List => {
+                let mut elems: Vec<Value> = Vec::with_capacity(node.inputs.len());
+                for input in &node.inputs {
+                    elems.push(eval_input(dag, input, reg, dispatch, cache, env).await?);
+                }
+                let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
+                // Use the checker-derived provides for declared_type; scheduler
+                // does not re-derive.
+                Value {
+                    data,
+                    declared_type: node.provides.clone(),
+                }
             }
         };
         cache.insert(id, value.clone());
@@ -397,6 +410,28 @@ fn eval_expr<'a>(
                         tool: format!("<var>{name}"),
                         cause: "unbound variable".into(),
                     })
+            }
+            Expr::List { items, .. } => {
+                let mut elems: Vec<Value> = Vec::with_capacity(items.len());
+                let mut elem_types: Vec<TypeExpr> = Vec::with_capacity(items.len());
+                for it in items {
+                    let v = eval_expr(it, None, reg, dispatch, env).await?;
+                    elem_types.push(v.declared_type.clone());
+                    elems.push(v);
+                }
+                let elem_ty = if elem_types.is_empty() {
+                    TypeExpr::named("Unknown")
+                } else {
+                    canonicalize_union(elem_types)
+                };
+                let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
+                Ok(Value {
+                    data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("List".into()),
+                        args: vec![elem_ty],
+                    },
+                })
             }
         }
     })

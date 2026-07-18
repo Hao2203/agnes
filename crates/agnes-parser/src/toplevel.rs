@@ -127,7 +127,19 @@ fn parse_define(rest: &[lexpr::Value], span: Span) -> Result<TopLevel, ParseErro
 }
 
 pub(crate) fn parse_params_vector(v: &lexpr::Value, span: Span) -> Result<Vec<Param>, ParseError> {
-    let items = as_list(v, span)?;
+    let mut items = as_list(v, span)?;
+    // The parser preprocessor rewrites `[...]` to `(list ...)`. When users
+    // write `:requires [...]` / `:params [...]`, the value we see here is a
+    // `(list <param> <param> ...)` form — strip the leading `list` symbol
+    // so the remainder is a naked param sequence.
+    if items
+        .first()
+        .and_then(|v| v.as_symbol())
+        .map(|s| s == "list")
+        .unwrap_or(false)
+    {
+        items.remove(0);
+    }
     let mut out = Vec::new();
     for it in items {
         out.push(parse_single_param(&it, span)?);

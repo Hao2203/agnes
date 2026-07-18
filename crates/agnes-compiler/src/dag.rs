@@ -35,6 +35,10 @@ pub enum NodeKind {
     Return,
     Literal(Literal),
     Var(String),
+    /// `(list e1 e2 ...)` — inputs are one `Input::FromNode` per element.
+    /// Provides is `(List T)` where T comes from checker-determined types
+    /// baked into `Node.provides`.
+    List,
 }
 
 #[derive(Debug, Clone)]

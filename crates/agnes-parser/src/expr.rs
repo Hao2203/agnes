@@ -56,6 +56,13 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
             span,
             branches: parse_exprs(rest, span)?,
         }),
+        "list" => {
+            let mut items = Vec::with_capacity(rest.len());
+            for it in rest {
+                items.push(parse_expr(it, span)?);
+            }
+            Ok(Expr::List { span, items })
+        }
         "let" => parse_let(rest, span),
         "if" => parse_if(rest, span),
         "match" => parse_match(rest, span),

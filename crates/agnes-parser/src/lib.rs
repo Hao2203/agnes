@@ -40,7 +40,7 @@ pub(crate) const UNION_BAR_SENTINEL: &str = "__agnes_union_bar__";
 /// treated as the `main` expression (only the last such expression
 /// wins, and a parse error is returned if more than one appears).
 pub fn parse(source: &str) -> Result<Program, ParseError> {
-    let prepared = preprocess_union_bars(source);
+    let prepared = preprocess_source(source)?;
     let forms = read_forms(&prepared)?;
     let mut toplevels = Vec::new();
     let mut main: Option<Expr> = None;
@@ -85,21 +85,21 @@ fn read_forms(source: &str) -> Result<Vec<lexpr::Value>, ParseError> {
     Ok(out)
 }
 
-/// Replace every `|` character outside of string literals with a
-/// whitespace-padded sentinel symbol so that lexpr accepts the union operator
-/// as a plain symbol.
+/// Preprocess the source before feeding it to lexpr:
+///   1. `|` outside strings → whitespace-padded sentinel symbol so lexpr
+///      can tokenize it (lexpr 0.2 rejects bare `|` in symbols).
+///   2. `[` outside strings → `(list ` — bracket lists are reader-macro'd
+///      into `(list ...)` calls. `]` → `)`.
+///   3. Inside a bracket-list, `,` is rejected with a ParseError.
 ///
-/// String literals (`"..."`) preserve `|` untouched. Backslash escapes inside
-/// strings are honored so `"a\|b"` (an escaped bar in an R6RS string) is left
-/// alone as well.
-///
-/// Walks `char_indices()` and matches on `char` (not raw bytes) so multi-byte
-/// UTF-8 sequences pass through intact.
-fn preprocess_union_bars(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+/// String literals preserve all characters. Backslash escapes inside strings
+/// are honored so `"a\|b"` and `"a,b"` are left alone.
+fn preprocess_source(source: &str) -> Result<String, ParseError> {
+    let mut out = String::with_capacity(source.len() + 8);
     let mut in_str = false;
     let mut escape = false;
-    for (_, c) in source.char_indices() {
+    let mut bracket_depth: u32 = 0;
+    for (byte_ix, c) in source.char_indices() {
         if in_str {
             out.push(c);
             if escape {
@@ -121,10 +121,42 @@ fn preprocess_union_bars(source: &str) -> String {
                 out.push_str(UNION_BAR_SENTINEL);
                 out.push(' ');
             }
+            '[' => {
+                bracket_depth += 1;
+                out.push_str("(list ");
+            }
+            ']' => {
+                if bracket_depth == 0 {
+                    return Err(ParseError {
+                        span: Span {
+                            start: byte_ix,
+                            end: byte_ix + 1,
+                        },
+                        message: "unmatched `]` at bracket-list end".into(),
+                    });
+                }
+                bracket_depth -= 1;
+                out.push(')');
+            }
+            ',' if bracket_depth > 0 => {
+                return Err(ParseError {
+                    span: Span {
+                        start: byte_ix,
+                        end: byte_ix + 1,
+                    },
+                    message: "list literals use whitespace separation; remove the comma".into(),
+                });
+            }
             _ => out.push(c),
         }
     }
-    out
+    if bracket_depth > 0 {
+        return Err(ParseError {
+            span: Span::DUMMY,
+            message: "unclosed bracket-list `[`".into(),
+        });
+    }
+    Ok(out)
 }
 
 fn is_toplevel(form: &lexpr::Value) -> bool {

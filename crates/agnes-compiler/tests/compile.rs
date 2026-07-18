@@ -59,6 +59,22 @@ fn compiles_a_pipe() {
 }
 
 #[test]
+fn compiles_list_literal() {
+    let src = r#"(list "a" "b")"#;
+    let mut r = seed();
+    r.register_type("String", None).unwrap();
+    let p = parse(src).unwrap();
+    let dag = compile(&p, &r).expect("compile ok");
+    // Expect a NodeKind::List with 2 element inputs.
+    let list_node = dag
+        .nodes
+        .iter()
+        .find(|n| matches!(n.kind, agnes_compiler::NodeKind::List))
+        .expect("List node must exist");
+    assert_eq!(list_node.inputs.len(), 2);
+}
+
+#[test]
 fn detects_recursive_define() {
     let src = r#"
         (define loopy :params [] :provides Unit (tool loopy))
