@@ -110,3 +110,29 @@ fn rejects_unclosed_paren() {
     let src = r#"(pipe (tool read-file :path "x")"#;
     assert!(parse(src).is_err());
 }
+
+#[test]
+fn parses_source_with_non_ascii_content() {
+    // Ensure non-ASCII bytes in string literals survive preprocessing.
+    let src = r#"(tool llm :prompt "你好 world" :input "test")"#;
+    let p = agnes_parser::parse(src).expect("parse ok");
+    let main = p.main.expect("has main");
+    // Verify the string literal came through intact.
+    let matches = format!("{:?}", main).contains("你好 world");
+    assert!(matches, "expected non-ASCII string preserved, got: {main:?}");
+}
+
+#[test]
+fn positional_tool_arg_uses_positional_vec() {
+    let src = r#"(tool summarize doc)"#;
+    let p = agnes_parser::parse(src).unwrap();
+    match p.main.unwrap() {
+        agnes_ast::Expr::Tool { name, positional, args, .. } => {
+            assert_eq!(name, "summarize");
+            assert_eq!(positional.len(), 1);
+            assert!(args.is_empty(), "no synthetic kwargs");
+            assert!(matches!(&positional[0], agnes_ast::Expr::Var { name, .. } if name == "doc"));
+        }
+        other => panic!("expected Tool, got {other:?}"),
+    }
+}

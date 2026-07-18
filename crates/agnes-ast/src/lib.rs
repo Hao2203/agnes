@@ -82,10 +82,11 @@ pub enum TopLevel {
 /// Workflow expression forms.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// `(tool <name> :key value ... [:retry N] [:on-error <expr>])`
+    /// `(tool <name> arg1 arg2 ... :key value ... [:retry N] [:on-error <expr>])`
     Tool {
         span: Span,
         name: String,
+        positional: Vec<Expr>,
         args: KwArgs,
     },
     /// `(pipe e1 e2 ...)`
@@ -133,8 +134,12 @@ pub enum Expr {
         fallback: Box<Expr>,
         body: Box<Expr>,
     },
-    /// `(llm :prompt "..." :input <expr>)` — a builtin form for the LLM tool.
-    Llm { span: Span, args: KwArgs },
+    /// `(llm arg1 arg2 ... :key value ...)` — a builtin form for the LLM tool.
+    Llm {
+        span: Span,
+        positional: Vec<Expr>,
+        args: KwArgs,
+    },
     /// `(return expr)`
     Return { span: Span, value: Box<Expr> },
     /// A literal in expression position.
@@ -199,6 +204,7 @@ mod tests {
                     Expr::Tool {
                         span: Span { start: 0, end: 0 },
                         name: "read-file".into(),
+                        positional: vec![],
                         args: vec![("path".into(), Expr::Literal {
                             span: Span { start: 0, end: 0 },
                             lit: Literal::String("x".into()),
@@ -207,6 +213,7 @@ mod tests {
                     Expr::Tool {
                         span: Span { start: 0, end: 0 },
                         name: "summarize".into(),
+                        positional: vec![],
                         args: vec![],
                     },
                 ],

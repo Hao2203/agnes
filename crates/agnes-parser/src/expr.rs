@@ -62,10 +62,14 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
         "foreach" => parse_foreach(rest, span),
         "retry" => parse_retry(rest, span),
         "catch" => parse_catch(rest, span),
-        "llm" => Ok(Expr::Llm {
-            span,
-            args: parse_expr_kwargs(rest, span)?,
-        }),
+        "llm" => {
+            let (positional, args) = parse_positional_and_kwargs(rest, span)?;
+            Ok(Expr::Llm {
+                span,
+                positional,
+                args,
+            })
+        }
         "return" => {
             let inner = rest.first().ok_or_else(|| ParseError {
                 span,
@@ -109,41 +113,40 @@ fn parse_tool(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {
             message: "tool name expected".into(),
         })?
         .to_string();
-    // The rest may be either keyword args (:key value ...) or a mix where the
-    // first positional expressions supply an implicit input. For MVP we accept
-    // only :key value pairs plus optional trailing positional expressions
-    // consumed as unnamed args. To keep the AST simple we only capture the
-    // keyword form here.
-    let args = parse_expr_kwargs(&rest[1..], span)?;
-    Ok(Expr::Tool { span, name, args })
+    let (positional, args) = parse_positional_and_kwargs(&rest[1..], span)?;
+    Ok(Expr::Tool {
+        span,
+        name,
+        positional,
+        args,
+    })
 }
 
-fn parse_expr_kwargs(items: &[lexpr::Value], span: Span) -> Result<KwArgs, ParseError> {
-    // Split into kw-args prefix and positional tail. In MVP we permit an
-    // arbitrary interleaving where positional args (before any keyword) are
-    // ignored — this matches how (let sum (tool summarize doc)) is written.
-    // Kw parsing stops at first non-keyword.
-    let mut positional_end = 0usize;
+/// Split incoming items into a leading positional prefix (everything before the
+/// first `Value::Keyword(_)`) and a trailing keyword-args tail. Positional
+/// items are parsed as `Expr` and returned as a `Vec<Expr>`; keyword items are
+/// parsed pairwise and returned as `KwArgs`.
+fn parse_positional_and_kwargs(
+    items: &[lexpr::Value],
+    span: Span,
+) -> Result<(Vec<Expr>, KwArgs), ParseError> {
+    let mut split = items.len();
     for (i, it) in items.iter().enumerate() {
         if it.as_keyword().is_some() {
-            positional_end = i;
+            split = i;
             break;
         }
-        positional_end = i + 1;
     }
-    // Emit positional args as anonymous "$<idx>" keys so their expressions still
-    // reach the AST for downstream stages that care.
-    let mut out: KwArgs = Vec::new();
-    for (idx, it) in items[..positional_end].iter().enumerate() {
-        let e = parse_expr(it, span)?;
-        out.push((format!("${idx}"), e));
+    let mut positional = Vec::with_capacity(split);
+    for it in &items[..split] {
+        positional.push(parse_expr(it, span)?);
     }
-    let raw = parse_kwargs(&items[positional_end..], span)?;
+    let raw = parse_kwargs(&items[split..], span)?;
+    let mut args: KwArgs = Vec::with_capacity(raw.len());
     for (k, v) in raw {
-        let e = parse_expr(&v, span)?;
-        out.push((k, e));
+        args.push((k, parse_expr(&v, span)?));
     }
-    Ok(out)
+    Ok((positional, args))
 }
 
 fn parse_let(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {

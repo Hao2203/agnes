@@ -82,40 +82,43 @@ fn read_forms(source: &str) -> Result<Vec<lexpr::Value>, ParseError> {
     Ok(out)
 }
 
-/// Replace every `|` byte outside of string literals with a whitespace-padded
-/// sentinel symbol so that lexpr accepts the union operator as a plain symbol.
+/// Replace every `|` character outside of string literals with a
+/// whitespace-padded sentinel symbol so that lexpr accepts the union operator
+/// as a plain symbol.
 ///
 /// String literals (`"..."`) preserve `|` untouched. Backslash escapes inside
 /// strings are honored so `"a\|b"` (an escaped bar in an R6RS string) is left
 /// alone as well.
+///
+/// Walks `char_indices()` and matches on `char` (not raw bytes) so multi-byte
+/// UTF-8 sequences pass through intact.
 fn preprocess_union_bars(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
-    let bytes = source.as_bytes();
     let mut in_str = false;
     let mut escape = false;
-    for &b in bytes {
+    for (_, c) in source.char_indices() {
         if in_str {
-            out.push(b as char);
+            out.push(c);
             if escape {
                 escape = false;
-            } else if b == b'\\' {
+            } else if c == '\\' {
                 escape = true;
-            } else if b == b'"' {
+            } else if c == '"' {
                 in_str = false;
             }
             continue;
         }
-        match b {
-            b'"' => {
+        match c {
+            '"' => {
                 in_str = true;
                 out.push('"');
             }
-            b'|' => {
+            '|' => {
                 out.push(' ');
                 out.push_str(UNION_BAR_SENTINEL);
                 out.push(' ');
             }
-            _ => out.push(b as char),
+            _ => out.push(c),
         }
     }
     out
