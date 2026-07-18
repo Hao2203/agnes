@@ -136,7 +136,7 @@ pub(crate) fn parse_params_vector(v: &lexpr::Value, span: Span) -> Result<Vec<Pa
 }
 
 fn parse_single_param(v: &lexpr::Value, span: Span) -> Result<Param, ParseError> {
-    // Syntax: (name: TypeExpr [:default Literal])
+    // Syntax: (name Type [:default Literal])
     let items = as_list(v, span)?;
     let raw_name = items
         .first()
@@ -145,13 +145,15 @@ fn parse_single_param(v: &lexpr::Value, span: Span) -> Result<Param, ParseError>
             span,
             message: "param name symbol expected".into(),
         })?;
-    if !raw_name.ends_with(':') {
+    if raw_name.ends_with(':') {
         return Err(ParseError {
             span,
-            message: format!("param name `{raw_name}` must end with ':'"),
+            message: format!(
+                "param name `{raw_name}` no longer ends with `:` — use position-based form `(name Type ...)` instead of `(name: Type ...)`"
+            ),
         });
     }
-    let name = raw_name.trim_end_matches(':').to_string();
+    let name = raw_name.to_string();
     let ty_val = items.get(1).ok_or_else(|| ParseError {
         span,
         message: "param type expected after name".into(),

@@ -7,7 +7,7 @@
 ;; (PlainText). That's actually a type error — we feed `ja` (PlainText)
 ;; instead.
 (define read-and-translate
-  :params  [(path: Path) (target: String)]
+  :params  [(path Path) (target String)]
   :provides PlainText
   (pipe
     (tool read-file :path path)

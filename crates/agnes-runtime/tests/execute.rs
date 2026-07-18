@@ -32,7 +32,7 @@ async fn runs_a_defined_compound_tool() {
     let src = format!(
         r#"
         (define read-and-summarize
-          :params [(path: Path)]
+          :params [(path Path)]
           :provides Summary
           (pipe
             (tool read-file :path path)

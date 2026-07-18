@@ -39,7 +39,7 @@ async fn positive_full_demo_runs() {
     let src = format!(
         r#"
 (define read-and-translate
-  :params  [(path: Path) (target: String)]
+  :params  [(path Path) (target String)]
   :provides PlainText
   (pipe
     (tool read-file :path path)
@@ -87,7 +87,7 @@ async fn negative_recursive_define() {
 
 #[tokio::test]
 async fn negative_unknown_type() {
-    let src = r#"(declare tool weird :requires [(x: MysteryType)] :provides PlainText)"#;
+    let src = r#"(declare tool weird :requires [(x MysteryType)] :provides PlainText)"#;
     let err = run(src).await.expect_err("must fail registry load");
     assert!(
         err.contains("Unknown name"),

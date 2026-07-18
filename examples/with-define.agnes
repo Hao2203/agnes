@@ -2,7 +2,7 @@
 ;; by evaluating the define's body in a fresh env with `path` and `target`
 ;; bound from the incoming kwargs.
 (define read-and-translate
-  :params  [(path: Path) (target: String)]
+  :params  [(path Path) (target String)]
   :provides PlainText
   (pipe
     (tool read-file :path path)

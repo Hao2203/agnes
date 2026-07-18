@@ -28,7 +28,7 @@ pub enum Literal {
 }
 
 /// A named formal parameter in `define` or `declare tool`.
-/// Example: `(source: (PDF | Image) :default nil)`
+/// Example: `(source (PDF | Image) :default nil)`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,

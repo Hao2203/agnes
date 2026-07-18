@@ -59,45 +59,64 @@ fn parses_declare_type_alias() {
 }
 
 #[test]
-fn parses_declare_tool() {
+fn parses_declare_tool_position_based_param() {
+    // (source (| PDF Image)) — no trailing colon on the name.
     let src = r#"
         (declare tool ocr
-          :requires [(source: (PDF | Image))]
+          :requires [(source (PDF | Image))]
           :provides PlainText)
     "#;
     let p = parse(src).expect("parse ok");
     match &p.toplevels[0] {
-        TopLevel::DeclareTool {
-            name,
-            requires,
-            provides,
-            ..
-        } => {
-            assert_eq!(name, "ocr");
+        TopLevel::DeclareTool { requires, .. } => {
             assert_eq!(requires.len(), 1);
             assert_eq!(requires[0].name, "source");
-            assert!(matches!(provides, TypeExprAst::Named(s) if s == "PlainText"));
+            // Type is (App { head: "|", args }) with 2 members.
+            match &requires[0].ty {
+                TypeExprAst::App { head, args } => {
+                    assert_eq!(head, "|");
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected App union, got {other:?}"),
+            }
         }
         other => panic!("expected DeclareTool, got {other:?}"),
     }
 }
 
 #[test]
-fn parses_define_with_body() {
+fn parses_define_position_based_params() {
     let src = r#"
         (define greet
-          :params [(who: PlainText)]
+          :params [(who PlainText) (times Int :default 1)]
           :provides PlainText
           (tool llm :prompt "hello" :input who))
     "#;
     let p = parse(src).expect("parse ok");
     match &p.toplevels[0] {
-        TopLevel::Define { name, params, .. } => {
-            assert_eq!(name, "greet");
-            assert_eq!(params.len(), 1);
+        TopLevel::Define { params, .. } => {
+            assert_eq!(params.len(), 2);
+            assert_eq!(params[0].name, "who");
+            assert_eq!(params[1].name, "times");
+            assert_eq!(params[1].default, Some(agnes_ast::Literal::Int(1)));
         }
         other => panic!("expected Define, got {other:?}"),
     }
+}
+
+#[test]
+fn rejects_old_colon_suffix_param_syntax() {
+    let src = r#"
+        (declare tool foo
+          :requires [(x: PlainText)]
+          :provides PlainText)
+    "#;
+    let err = parse(src).expect_err("must reject legacy param syntax");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("param name") && msg.contains("no longer ends with"),
+        "expected migration hint, got: {msg}"
+    );
 }
 
 #[test]
