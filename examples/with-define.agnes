@@ -1,6 +1,6 @@
-;; Declare a compound tool. Its body is type-checked against its signature,
-;; but the MVP runtime does not yet inline defines, so we execute the
-;; equivalent inline pipeline below.
+;; Declare a compound tool and invoke it. The runtime dispatches the call
+;; by evaluating the define's body in a fresh env with `path` and `target`
+;; bound from the incoming kwargs.
 (define read-and-translate
   :params  [(path: Path) (target: String)]
   :provides PlainText
@@ -8,6 +8,4 @@
     (tool read-file :path path)
     (tool translate :lang target)))
 
-(pipe
-  (tool read-file :path "README.md")
-  (tool translate :lang "ja"))
+(tool read-and-translate :path "README.md" :target "ja")

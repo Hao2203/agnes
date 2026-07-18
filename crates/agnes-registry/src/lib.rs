@@ -5,7 +5,7 @@ pub mod loader;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use agnes_ast::{Program, TopLevel, TypeExprAst};
+use agnes_ast::{Expr, Param, Program, TopLevel, TypeExprAst};
 use agnes_types::{ToolSignature, TypeExpr, TypeName, Validator};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +43,10 @@ pub struct Registry {
     types: HashMap<String, Option<Validator>>,
     aliases: HashMap<String, TypeExpr>,
     tools: HashMap<String, ToolSignature>,
+    /// Bodies of `(define ...)` compound tools, keyed by name. The runtime
+    /// dispatches to these when a tool call misses in the builtin native
+    /// dispatch table.
+    defines: HashMap<String, (Vec<Param>, Expr)>,
 }
 
 impl Default for Registry {
@@ -55,6 +59,7 @@ impl Registry {
             types: HashMap::new(),
             aliases: HashMap::new(),
             tools: HashMap::new(),
+            defines: HashMap::new(),
         }
     }
 
@@ -114,6 +119,18 @@ impl Registry {
 
     pub fn tool_signature(&self, name: &str) -> Option<&ToolSignature> {
         self.tools.get(name)
+    }
+
+    /// Store the body of a `(define ...)` compound tool. Called by the loader
+    /// alongside `override_tool` so both the checker (which needs the tool
+    /// signature) and the runtime (which needs the body) can see it.
+    pub fn register_define(&mut self, name: &str, params: Vec<Param>, body: Expr) {
+        self.defines.insert(name.to_string(), (params, body));
+    }
+
+    /// Look up the body of a `(define ...)` compound tool for runtime dispatch.
+    pub fn define_body(&self, name: &str) -> Option<&(Vec<Param>, Expr)> {
+        self.defines.get(name)
     }
 
     pub fn validator_of(&self, ty: &TypeName) -> Option<Validator> {

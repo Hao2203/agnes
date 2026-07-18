@@ -267,16 +267,24 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower_pipe(&mut self, steps: &[Expr]) -> Result<NodeId, crate::CompileError> {
+        // Lower each step in order, threading `prev` so unfilled requires can
+        // pick up the previous step's provides. Every step is reified in the
+        // Pipe node's inputs so the scheduler evaluates them in order — this
+        // is how `let` bindings placed earlier in a pipe become visible to
+        // later steps at runtime.
+        let mut ids: Vec<NodeId> = Vec::new();
         let mut prev: Option<NodeId> = None;
         for step in steps {
             let n = self.lower_expr(step, prev)?;
+            ids.push(n);
             prev = Some(n);
         }
-        let last = prev.ok_or_else(|| crate::CompileError::UnknownDefine {
+        let last = *ids.last().ok_or_else(|| crate::CompileError::UnknownDefine {
             name: "<empty pipe>".into(),
         })?;
         let provides = self.nodes[last.0].provides.clone();
-        Ok(self.add(NodeKind::Pipe, vec![Input::FromNode(last)], provides))
+        let inputs: Vec<Input> = ids.into_iter().map(Input::FromNode).collect();
+        Ok(self.add(NodeKind::Pipe, inputs, provides))
     }
 
     fn lower_par(&mut self, branches: &[Expr]) -> Result<NodeId, crate::CompileError> {

@@ -25,6 +25,36 @@ async fn runs_read_then_summarize() {
     let _ = tokio::fs::remove_file(&tmp).await;
 }
 
+#[tokio::test]
+async fn runs_a_defined_compound_tool() {
+    let tmp = std::env::temp_dir().join(format!("agnes-define-test-{}.txt", std::process::id()));
+    tokio::fs::write(&tmp, "content").await.unwrap();
+    let src = format!(
+        r#"
+        (define read-and-summarize
+          :params [(path: Path)]
+          :provides Summary
+          (pipe
+            (tool read-file :path path)
+            (tool summarize)))
+        (tool read-and-summarize :path "{}")
+    "#,
+        tmp.display()
+    );
+
+    let mut r = agnes_registry::Registry::new();
+    agnes_builtins::register_builtins(&mut r).unwrap();
+    let p = agnes_parser::parse(&src).unwrap();
+    r.load(&p).unwrap();
+    agnes_checker::check(&p, &r).unwrap();
+    let dag = agnes_compiler::compile(&p, &r).unwrap();
+    let dispatch = agnes_builtins::native_dispatch();
+    let out = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
+    let s = out.data.as_str().unwrap();
+    assert!(s.starts_with("[SUMMARY of"), "got: {s}");
+    let _ = tokio::fs::remove_file(&tmp).await;
+}
+
 fn tempfile_path() -> String {
     let dir = std::env::temp_dir();
     let stamp = std::process::id();

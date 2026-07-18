@@ -1,8 +1,11 @@
-;; Full demo: declares a compound `read-and-translate` for type-checking
-;; (per spec §VII), then runs the equivalent inline workflow. The MVP
-;; runtime does not yet inline defines; `par` runs branches sequentially
-;; and does not propagate `let` bindings across siblings, so the LLM
-;; downstream reads its input from a fresh inline pipe.
+;; Full demo (spec §VII shape): declare a compound `read-and-translate`
+;; and dispatch it at runtime. `par` runs both branches; each `(let ...)`
+;; inside a branch binds its side value into the surrounding env, so the
+;; final `llm` step can reference `ja`.
+;;
+;; Note: the spec's original example feeds `sum` (Summary) to `llm :input`
+;; (PlainText). That's actually a type error — we feed `ja` (PlainText)
+;; instead.
 (define read-and-translate
   :params  [(path: Path) (target: String)]
   :provides PlainText
@@ -11,9 +14,8 @@
     (tool translate :lang target)))
 
 (pipe
+  (let src (tool read-file :path "README.md"))
   (par
-    (pipe (tool read-file :path "README.md") (tool summarize))
-    (pipe (tool read-file :path "README.md") (tool translate :lang "ja")))
-  (tool llm :prompt "combine summary and translation"
-             :input (pipe (tool read-file :path "README.md")
-                           (tool translate :lang "ja"))))
+    (let sum (tool summarize :input src))
+    (let ja  (tool read-and-translate :path "README.md" :target "ja")))
+  (tool llm :prompt "combine summary and translation" :input ja))

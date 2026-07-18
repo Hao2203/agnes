@@ -22,8 +22,18 @@ pub fn load(reg: &mut Registry, program: &Program) -> Result<(), RegistryError> 
                     reg.register_tool(name, sig)?;
                 }
             }
-            TopLevel::Define { .. } => {
-                // Compiler handles these; loader skips.
+            TopLevel::Define { name, params, provides, body, .. } => {
+                // Register the tool signature so the checker sees this define
+                // as a callable tool.
+                let sig = resolve_tool_sig(reg, params, provides)?;
+                if reg.tool_signature(name).is_some() {
+                    reg.override_tool(name, sig);
+                } else {
+                    reg.register_tool(name, sig)?;
+                }
+                // Also store the body so the runtime can dispatch to it when
+                // the builtin native-dispatch table misses.
+                reg.register_define(name, params.clone(), (**body).clone());
             }
         }
     }
