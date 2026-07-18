@@ -1,5 +1,13 @@
 # agnes DSL MVP — 设计规格
 
+> **Status (2026-07-18 update):** the type-system portions of this spec
+> (§II, §III.5, §VI's alias/param forms) have been superseded by
+> `2026-07-18-agnes-type-system-upgrade-design.md`. Refer to the
+> upgrade spec for current union syntax `(| A B)`, param form
+> `(name Type)`, and parameterized types `(List T)` / `(Option T)`.
+> This document is preserved as historical reference for the MVP
+> milestone.
+
 > 日期：2026-07-18
 > 项目：agnes（Rust edition 2024，Cargo workspace）
 > 类型：新语言 + Runtime 设计

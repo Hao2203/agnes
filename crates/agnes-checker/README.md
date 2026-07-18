@@ -1,16 +1,19 @@
 # agnes-checker
 
-Static type checker for the agnes DSL. Enforces exactly the two rules from
-the spec, and nothing else:
+Static type checker for the agnes DSL. Enforces exactly the three rules
+from the spec, and nothing else:
 
-1. **Parameter satisfaction** — every keyword arg's type is a member of
-   the corresponding require's `TypeExpr`.
-2. **Flow satisfaction** — in a `pipe`, if the downstream tool has exactly
-   one unfilled required parameter, the upstream's provides must be a
-   member of that parameter's `TypeExpr`.
+1. **Parameter satisfaction** — every keyword arg's type satisfies the
+   corresponding require's `TypeExpr`.
+2. **Flow satisfaction** — in a `pipe`, if the downstream tool has
+   exactly one unfilled required parameter, the upstream's provides
+   must satisfy that parameter's `TypeExpr`.
+3. **Empty-list literal adaptation** — an empty list literal `[]` in a
+   context that expects `(List T)` adopts `T` from the hint; otherwise
+   it defaults to `(List Unknown)`.
 
-Both rules bottom out at `agnes_types::type_expr_matches`, i.e. a single
-`HashSet::contains` after canonicalization.
+Rules 1 and 2 bottom out at `agnes_types::type_expr_matches` (recursive
+structural match with union membership at every `|` node).
 
 ## Public API
 
@@ -40,9 +43,12 @@ message per the spec template. Error text is snapshot-tested (see
    satisfies the declared `:provides`.
 2. If a main expression exists, walk it with an empty `Env`.
 
-`check_expr(e, reg, env, flowed_in)` returns the `TypeName` the expression
-produces. `flowed_in` is `Some(...)` only inside a `pipe` where the current
-step is not the first, letting the flow rule fire.
+`check_expr(e, reg, env, flowed_in, hint)` returns the `TypeExpr` the
+expression produces. `flowed_in` is `Some(...)` only inside a `pipe` where
+the current step is not the first, letting the flow rule fire. `hint` is
+`Some(&expected)` only when checking a tool arg (or the like), so that a
+bare `[]` literal can adopt the container element type from context per
+rule 3.
 
 ## Pipeline position
 

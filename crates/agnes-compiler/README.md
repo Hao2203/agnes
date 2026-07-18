@@ -22,6 +22,7 @@ pub enum NodeKind {
     Retry  { times, backoff },
     Catch  { on, fallback: NodeId },
     Llm, Return,
+    List,
     Literal(Literal), Var(String),
 }
 
@@ -47,6 +48,11 @@ pub enum CompileError {
 - Every branch of `if` / `match` / `catch` / `retry` / `foreach` is
   lowered to its own node; the parent node references them by id.
 - `Llm` and `Return` are just distinguished node kinds with typed inputs.
+- List literals `[e1 e2 ...]` lower to a `NodeKind::List` node whose
+  inputs are the element nodes and whose `provides` is
+  `(List T)` where `T` is the canonical join of the element types (via
+  `canonicalize_union`). An empty `[]` picks up its element type from
+  the surrounding context or falls back to `(List Unknown)`.
 - Literals and vars become `Literal(...)` / `Var(...)` node kinds.
 
 ## Cycle detection

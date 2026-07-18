@@ -37,19 +37,20 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 **Aliases (2):**
 
-- `TextLike = PlainText | Markdown | HTML`
-- `VisualDoc = PDF | Image`
+- `TextLike = (| PlainText Markdown HTML)`
+- `VisualDoc = (| PDF Image)`
 
-**Tools (6):**
+**Tools (7):**
 
 | Tool         | Requires                                              | Provides    |
 |--------------|-------------------------------------------------------|-------------|
-| `read-file`  | `path: Path`                                          | `PlainText` |
-| `write-file` | `path: Path`, `content: TextLike`                     | `Unit`      |
-| `summarize`  | `input: TextLike | PDF`                               | `Summary`   |
-| `translate`  | `input: TextLike`, `lang: String`                     | `PlainText` |
-| `ocr`        | `source: VisualDoc`                                   | `PlainText` |
-| `llm`        | `prompt: String`, `input: PlainText`                  | `PlainText` |
+| `read-file`  | `(path Path)`                                         | `PlainText` |
+| `write-file` | `(path Path)`, `(content TextLike)`                   | `Unit`      |
+| `summarize`  | `(input (\| TextLike PDF))`                           | `Summary`   |
+| `translate`  | `(input TextLike)`, `(lang String)`                   | `PlainText` |
+| `ocr`        | `(source VisualDoc)`                                  | `PlainText` |
+| `llm`        | `(prompt String)`, `(input PlainText)`                | `PlainText` |
+| `join-lines` | `(lines (List PlainText))`                            | `PlainText` |
 
 ## What `native_dispatch` returns
 
@@ -60,6 +61,9 @@ An `Arc`-shared async closure per tool name.
 - `summarize`, `translate`, `ocr`, `llm` are **mock implementations** that
   return placeholder strings (`[SUMMARY of N chars]`, `[TRANSLATED to <lang>]\n...`,
   etc.). They are sufficient to exercise every language construct end-to-end.
+- `join-lines` is a pure combinator: it joins a `(List PlainText)` into a
+  single `PlainText` separated by newlines. Included primarily to
+  exercise `(List T)` at both check and runtime boundaries.
 
 To wire real models or real OCR, replace the corresponding closure in
 `src/tools.rs`.

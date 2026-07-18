@@ -29,15 +29,26 @@ validator.
 
 At every tool call site:
 
-1. For each provided arg, look up its declared type's validator via
-   `Registry::validator_of` and run it. Failure → `RuntimeTypeError` with
-   `direction = "requires"`.
+1. For each provided arg, recursively validate its `Value` against the
+   parameter's canonical `TypeExpr` via `boundary::validate`. Failure →
+   `RuntimeTypeError` with `direction = "requires"`.
 2. Call the native implementation.
-3. Run the provides validator on the returned `Value`. Failure →
-   `RuntimeTypeError` with `direction = "provides"`.
+3. Recursively validate the returned `Value` against the tool's
+   `provides` `TypeExpr`. Failure → `RuntimeTypeError` with
+   `direction = "provides"`.
+
+`boundary::validate` walks the `TypeExpr` recursively:
+
+- `Named(T)` runs `T`'s registered validator (if any).
+- `(| A B ...)` picks the union member matching the value's declared
+  type and recurses into it; if nothing matches, it's a runtime type
+  error.
+- `(List T)` requires a JSON array, then recurses into each element
+  against `T` (element index is preserved in the error message for
+  locatability).
 
 Types with no validator (e.g. `String`, `Int`, `Bool`, `Unknown`) skip
-validation but still participate in the checker's set-membership rules.
+the leaf check but still participate in the checker's structural rules.
 
 ## Node kind → behaviour
 

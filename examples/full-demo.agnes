@@ -10,8 +10,7 @@
     (tool translate :lang target)))
 
 (pipe
-  (let src (tool read-file :path "README.md"))
   (par
-    (let sum (tool summarize :input src))
-    (let ja  (tool read-and-translate :path "README.md" :target "ja")))
-  (tool join-lines :lines [sum ja]))
+    (let ja (tool read-and-translate :path "README.md" :target "ja"))
+    (let en (tool read-and-translate :path "README.md" :target "en")))
+  (tool join-lines :lines [ja en]))

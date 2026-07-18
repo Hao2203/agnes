@@ -1,7 +1,12 @@
 //! End-to-end acceptance tests locking in spec §VII behavior.
 //!
-//! One positive workflow (full-demo shape with `define` + `pipe` + `par` +
-//! `let` + `llm`) plus four negative cases that exercise each error surface.
+//! Three positive workflows (full-demo shape with `define` + `pipe` + `par` +
+//! `let` + `llm`; `join-lines` over a list literal of tool calls; a compound
+//! tool with an `(Option String)` param) plus ten negative cases that
+//! exercise each error surface: `(List ...)` and `(Option ...)` arity
+//! mismatches, unknown constructor heads, infix-union rejection,
+//! comma-in-list rejection, mixed-list element-type rejection, flow
+//! mismatch, recursive define, unknown type name, and name conflict.
 
 use agnes_builtins::{native_dispatch, register_builtins};
 use agnes_checker::check;

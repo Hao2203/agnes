@@ -23,18 +23,15 @@ for the implementation plan.
 
 ```lisp
 (define read-and-translate
-  :params  [(path: Path) (target: String)]
+  :params  [(path Path) (target String)]
   :provides PlainText
   (pipe
     (tool read-file :path path)
     (tool translate :lang target)))
 
 (pipe
-  (let src (tool read-file :path "README.md"))
-  (par
-    (let sum (tool summarize :input src))
-    (let ja  (tool read-and-translate :path "README.md" :target "ja")))
-  (tool llm :prompt "combine summary and translation" :input sum))
+  (let ja (tool read-and-translate :path "README.md" :target "ja"))
+  (tool join-lines :lines [ja ja]))
 ```
 
 ## License

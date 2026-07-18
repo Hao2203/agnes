@@ -34,11 +34,11 @@ agnes examples/full-demo.agnes
 let src = tokio::fs::read_to_string(path).await?;
 
 let mut reg = Registry::new();
-agnes_builtins::register_builtins(&mut reg)?;  // 13 types + 2 aliases + 6 tools
+agnes_builtins::register_builtins(&mut reg)?;  // 13 types + 2 aliases + 7 tools
 
 let program = agnes_parser::parse(&src)?;
 reg.load(&program)?;                            // user declares merge in
-agnes_checker::check(&program, &reg)?;          // two spec rules
+agnes_checker::check(&program, &reg)?;          // three spec rules (param, flow, empty-list adapt)
 let dag = agnes_compiler::compile(&program, &reg)?;
 
 let dispatch = agnes_builtins::native_dispatch();
@@ -68,9 +68,14 @@ Ship in `examples/` at the workspace root:
 
 ## Acceptance tests
 
-`tests/acceptance.rs` runs the positive full-demo workflow plus four
-negative cases from spec §VII (flow mismatch, recursive define, unknown
-type, name conflict). Every error message is asserted to carry the
+`tests/acceptance.rs` runs three positive workflows (the full-demo
+`define + pipe + par + let + join-lines` shape, `join-lines` over a
+list literal of tool calls, and a compound tool with an
+`(Option String)` param) plus ten negative cases: `(List ...)` /
+`(Option ...)` arity mismatches, unknown constructor head, infix-union
+rejection, comma-in-list rejection, mixed-element-type list, flow
+mismatch, recursive define, unknown type name, and name conflict.
+Every error message is asserted to carry the
 `What / Why / Fix suggestion` markers.
 
 Run: `cargo test -p agnes-cli --test acceptance`.

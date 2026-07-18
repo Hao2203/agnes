@@ -32,9 +32,13 @@ pub fn defines_of(program: &Program) -> Vec<&TopLevel>;
 - `NameConflict { name, existing_kind, attempted_kind }` — a name is
   already registered under a different `EntryKind`.
 - `UnknownName { name }` — a `TypeExprAst::Named` referenced a name that
-  wasn't declared.
+  wasn't declared, or a `TypeExprAst::App` used a head other than the
+  built-in constructors (`|`, `List`, `Option`).
+- `ArityMismatch { head, expected, actual, plural }` — a container
+  constructor was applied with the wrong number of type arguments
+  (`List` and `Option` both expect exactly 1).
 
-Both render as What / Why / Fix suggestion messages.
+All variants render as What / Why / Fix suggestion messages.
 
 ## What `resolve` does
 
@@ -42,11 +46,21 @@ Both render as What / Why / Fix suggestion messages.
 - `Named` referring to an alias → the alias's stored `TypeExpr` (already
   canonical).
 - `Named` referring to nothing → `UnknownName`.
-- `Union` → recursively resolves every member, unions their sets. If the
-  result collapses to a single member, it's returned as `Named`.
+- `App { head: "|", args }` → recursively resolves every member, unions
+  their sets. If the result collapses to a single member, it's returned
+  as `Named`.
+- `App { head: "List", args: [T] }` → resolves `T` and wraps it in
+  `TypeExpr::App { head: "List", args: [T'] }`. Arity ≠ 1 is an
+  `ArityMismatch`.
+- `App { head: "Option", args: [T] }` → expands to `(| T Unit)` at
+  resolve time; the canonical form never contains `Option`. Arity ≠ 1
+  is an `ArityMismatch`.
+- Any other `App` head → `UnknownName` (points at the built-in
+  constructors).
 
 This is where "TypeScript-style union" becomes "flat `HashSet` for
-membership tests".
+membership tests", and where `(Option T)` is desugared into the
+canonical union form.
 
 ## `Registry::load` semantics
 
