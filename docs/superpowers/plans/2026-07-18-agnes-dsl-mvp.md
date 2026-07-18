@@ -182,6 +182,7 @@ Overwrite `/home/hao/code/agnes/.gitignore`:
 Cargo.lock.new
 **/*.rs.bk
 .direnv/
+/.superpowers/
 ```
 
 - [ ] **Step 4: Verify workspace parses (no crates yet, expect empty-workspace warning is fine)**
