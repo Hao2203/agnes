@@ -15,8 +15,8 @@ Fix suggestion (one of):
     ParamMismatch {
         tool: String,
         param: String,
-        expected: TypeExpr,
-        actual: TypeExpr,
+        expected: Box<TypeExpr>,
+        actual: Box<TypeExpr>,
     },
 
     #[error(
@@ -31,8 +31,8 @@ Fix suggestion (one of):
     FlowMismatch {
         upstream: String,
         downstream_tool: String,
-        expected: TypeExpr,
-        actual: TypeExpr,
+        expected: Box<TypeExpr>,
+        actual: Box<TypeExpr>,
     },
 
     #[error(
@@ -54,8 +54,8 @@ Fix suggestion (paste at top of file):
     )]
     DefineSignatureMismatch {
         name: String,
-        declared: TypeExpr,
-        body_type: TypeExpr,
+        declared: Box<TypeExpr>,
+        body_type: Box<TypeExpr>,
     },
 
     #[error(transparent)]

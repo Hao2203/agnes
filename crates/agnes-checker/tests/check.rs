@@ -22,10 +22,7 @@ fn seed_registry() -> Registry {
         },
     )
     .unwrap();
-    let text_like = canonicalize_union([
-        TypeExpr::named("PlainText"),
-        TypeExpr::named("Markdown"),
-    ]);
+    let text_like = canonicalize_union([TypeExpr::named("PlainText"), TypeExpr::named("Markdown")]);
     r.register_tool(
         "summarize",
         ToolSignature {
@@ -178,7 +175,10 @@ fn unbound_empty_list_via_let_is_still_list_unknown() {
     let err = check(&p, &r).expect_err("must fail");
     let msg = format!("{err}");
     assert!(msg.contains("List"), "got: {msg}");
-    assert!(msg.contains("Unknown") || msg.contains("String"), "got: {msg}");
+    assert!(
+        msg.contains("Unknown") || msg.contains("String"),
+        "got: {msg}"
+    );
 }
 
 #[test]

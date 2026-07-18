@@ -115,7 +115,10 @@ fn arity_mismatch_list_zero_args() {
     };
     let err = r.resolve(&ast).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("List") && msg.contains("expects 1"), "got: {msg}");
+    assert!(
+        msg.contains("List") && msg.contains("expects 1"),
+        "got: {msg}"
+    );
 }
 
 #[test]
@@ -133,7 +136,10 @@ fn arity_mismatch_option_two_args() {
     };
     let err = r.resolve(&ast).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("Option") && msg.contains("expects 1"), "got: {msg}");
+    assert!(
+        msg.contains("Option") && msg.contains("expects 1"),
+        "got: {msg}"
+    );
 }
 
 #[test]

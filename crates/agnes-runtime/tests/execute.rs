@@ -94,7 +94,9 @@ async fn boundary_validates_list_of_string_at_runtime() {
     // that runtime boundary validation doesn't panic before reaching dispatch.
     let dag = agnes_compiler::compile(&p, &r).unwrap();
     let dispatch = agnes_builtins::native_dispatch();
-    let err = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap_err();
+    let err = agnes_runtime::execute(&dag, &r, &dispatch)
+        .await
+        .unwrap_err();
     let msg = format!("{err}");
     // Under Task 6 the boundary walker recurses into (List T) — array
     // elements pass validation, and the runtime reaches dispatch, which

@@ -37,8 +37,8 @@ pub fn check(program: &Program, reg: &Registry) -> Result<(), CheckError> {
             if !type_expr_matches(&body_ty, &declared) {
                 return Err(CheckError::DefineSignatureMismatch {
                     name: name.clone(),
-                    declared,
-                    body_type: body_ty,
+                    declared: Box::new(declared),
+                    body_type: Box::new(body_ty),
                 });
             }
         }
@@ -151,13 +151,14 @@ fn check_expr(
             if items.is_empty() {
                 // Rule 3 (literal adaptation): if the caller passed a
                 // structurally compatible hint `(List T)`, adopt it.
-                if let Some(TypeExpr::App { head, args }) = hint {
-                    if head.0 == "List" && args.len() == 1 {
-                        return Ok(TypeExpr::App {
-                            head: head.clone(),
-                            args: args.clone(),
-                        });
-                    }
+                if let Some(TypeExpr::App { head, args }) = hint
+                    && head.0 == "List"
+                    && args.len() == 1
+                {
+                    return Ok(TypeExpr::App {
+                        head: head.clone(),
+                        args: args.clone(),
+                    });
                 }
                 return Ok(TypeExpr::App {
                     head: TypeName("List".into()),
@@ -203,8 +204,8 @@ fn check_arg(
         return Err(CheckError::ParamMismatch {
             tool: tool_name.to_string(),
             param: param.to_string(),
-            expected: expected.clone(),
-            actual,
+            expected: Box::new(expected.clone()),
+            actual: Box::new(actual),
         });
     }
     Ok(())
@@ -269,8 +270,8 @@ fn check_tool_call(
                 return Err(CheckError::FlowMismatch {
                     upstream: format!("<upstream (provides {up})>"),
                     downstream_tool: tool_name.to_string(),
-                    expected: expected.clone(),
-                    actual: up,
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(up),
                 });
             }
         }

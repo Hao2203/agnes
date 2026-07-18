@@ -48,12 +48,15 @@ pub fn validate(
                     cause: format!("List type has arity {}; expected 1", args.len()),
                 });
             }
-            let arr = val.data.as_array().ok_or_else(|| RuntimeError::RuntimeTypeError {
-                tool: tool.to_string(),
-                direction,
-                ty: TypeName(expected.to_string()),
-                cause: format!("expected JSON array for List type, got {:?}", val.data),
-            })?;
+            let arr = val
+                .data
+                .as_array()
+                .ok_or_else(|| RuntimeError::RuntimeTypeError {
+                    tool: tool.to_string(),
+                    direction,
+                    ty: TypeName(expected.to_string()),
+                    cause: format!("expected JSON array for List type, got {:?}", val.data),
+                })?;
             let inner = &args[0];
             // The list value's own declared_type is `(List T_actual)` where
             // T_actual was derived from the element producers. Use T_actual as
@@ -61,11 +64,10 @@ pub fn validate(
             // resolved by matching a concrete member. If the list was produced
             // outside this convention, fall back to the expected inner.
             let actual_inner = match &val.declared_type {
-                TypeExpr::App { head, args: outer_args }
-                    if head.0 == "List" && outer_args.len() == 1 =>
-                {
-                    outer_args[0].clone()
-                }
+                TypeExpr::App {
+                    head,
+                    args: outer_args,
+                } if head.0 == "List" && outer_args.len() == 1 => outer_args[0].clone(),
                 _ => inner.clone(),
             };
             for (i, elem_data) in arr.iter().enumerate() {
@@ -76,28 +78,29 @@ pub fn validate(
                 validate(reg, tool, direction, inner, &elem_value).map_err(|e| {
                     // Wrap error to add element index for locatability.
                     match e {
-                        RuntimeError::RuntimeTypeError { tool, direction, ty, cause } => {
-                            RuntimeError::RuntimeTypeError {
-                                tool,
-                                direction,
-                                ty,
-                                cause: format!("element [{i}]: {cause}"),
-                            }
-                        }
+                        RuntimeError::RuntimeTypeError {
+                            tool,
+                            direction,
+                            ty,
+                            cause,
+                        } => RuntimeError::RuntimeTypeError {
+                            tool,
+                            direction,
+                            ty,
+                            cause: format!("element [{i}]: {cause}"),
+                        },
                         other => other,
                     }
                 })?;
             }
             Ok(())
         }
-        TypeExpr::App { head, .. } => {
-            Err(RuntimeError::RuntimeTypeError {
-                tool: tool.to_string(),
-                direction,
-                ty: TypeName(head.0.clone()),
-                cause: format!("unknown type constructor `{}` in canonical form", head.0),
-            })
-        }
+        TypeExpr::App { head, .. } => Err(RuntimeError::RuntimeTypeError {
+            tool: tool.to_string(),
+            direction,
+            ty: TypeName(head.0.clone()),
+            cause: format!("unknown type constructor `{}` in canonical form", head.0),
+        }),
     }
 }
 

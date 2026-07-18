@@ -86,7 +86,7 @@ pub fn canonicalize_union(members: impl IntoIterator<Item = TypeExpr>) -> TypeEx
     }
     let mut vec: Vec<TypeExpr> = set.into_iter().collect();
     // Sort by Display for a stable canonical order.
-    vec.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    vec.sort_by_key(|a| a.to_string());
     if vec.len() == 1 {
         vec.into_iter().next().unwrap()
     } else {
@@ -147,17 +147,12 @@ pub fn type_expr_matches(actual: &TypeExpr, expected: &TypeExpr) -> bool {
         (_, TypeExpr::App { head, args }) if head.0 == "|" => {
             args.iter().any(|u| type_expr_matches(actual, u))
         }
-        (
-            TypeExpr::App {
-                head: h1,
-                args: a1,
-            },
-            TypeExpr::App {
-                head: h2,
-                args: a2,
-            },
-        ) if h1 == h2 && a1.len() == a2.len() => {
-            a1.iter().zip(a2.iter()).all(|(x, y)| type_expr_matches(x, y))
+        (TypeExpr::App { head: h1, args: a1 }, TypeExpr::App { head: h2, args: a2 })
+            if h1 == h2 && a1.len() == a2.len() =>
+        {
+            a1.iter()
+                .zip(a2.iter())
+                .all(|(x, y)| type_expr_matches(x, y))
         }
         _ => false,
     }
@@ -176,10 +171,8 @@ mod tests {
 
     #[test]
     fn union_contains_member() {
-        let expected = canonicalize_union([
-            TypeExpr::named("PlainText"),
-            TypeExpr::named("Markdown"),
-        ]);
+        let expected =
+            canonicalize_union([TypeExpr::named("PlainText"), TypeExpr::named("Markdown")]);
         assert!(type_expr_matches(&TypeExpr::named("Markdown"), &expected));
         assert!(!type_expr_matches(&TypeExpr::named("PDF"), &expected));
     }

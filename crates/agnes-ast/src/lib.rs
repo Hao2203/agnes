@@ -41,7 +41,10 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExprAst {
     Named(String),
-    App { head: String, args: Vec<TypeExprAst> },
+    App {
+        head: String,
+        args: Vec<TypeExprAst>,
+    },
 }
 
 /// Keyword arguments: (:key value ...)

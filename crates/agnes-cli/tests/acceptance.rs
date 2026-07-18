@@ -98,23 +98,29 @@ async fn positive_option_string_declares_param() {
 async fn negative_list_arity_mismatch() {
     let src = r#"(declare tool bad :requires [(x (List))] :provides PlainText)"#;
     let err = run(src).await.expect_err("must fail");
-    let msg = format!("{err}");
-    assert!(msg.contains("List") && msg.contains("expects 1"), "got: {msg}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("List") && msg.contains("expects 1"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
 async fn negative_option_arity_mismatch() {
     let src = r#"(declare tool bad :requires [(x (Option A B))] :provides PlainText)"#;
     let err = run(src).await.expect_err("must fail");
-    let msg = format!("{err}");
-    assert!(msg.contains("Option") && msg.contains("expects 1"), "got: {msg}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Option") && msg.contains("expects 1"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
 async fn negative_unknown_head_suggests_builtins() {
     let src = r#"(declare tool bad :requires [(x (Foo Bar))] :provides PlainText)"#;
     let err = run(src).await.expect_err("must fail");
-    let msg = format!("{err}");
+    let msg = err.to_string();
     assert!(msg.contains("Foo"), "got: {msg}");
     assert!(msg.contains("List") || msg.contains("Option"), "got: {msg}");
 }
@@ -123,15 +129,18 @@ async fn negative_unknown_head_suggests_builtins() {
 async fn negative_infix_union_rejected() {
     let src = r#"(declare type-alias T (A | B))"#;
     let err = run(src).await.expect_err("must fail");
-    let msg = format!("{err}");
-    assert!(msg.contains("union") && msg.contains("prefix"), "got: {msg}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("union") && msg.contains("prefix"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
 async fn negative_comma_in_bracket_list() {
     let src = r#"(tool llm :prompt "x" :input ["a", "b"])"#;
     let err = run(src).await.expect_err("must fail");
-    let msg = format!("{err}");
+    let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("comma") || msg.to_lowercase().contains("whitespace"),
         "got: {msg}"
@@ -144,7 +153,7 @@ async fn negative_mixed_list_where_string_list_expected() {
     // via a mixed literal fails.
     let src = r#"(tool join-lines :lines ["a" 1])"#;
     let err = run(src).await.expect_err("must fail");
-    let msg = format!("{err}");
+    let msg = err.to_string();
     assert!(msg.contains("List"), "got: {msg}");
 }
 

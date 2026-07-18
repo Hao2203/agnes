@@ -200,9 +200,7 @@ impl Registry {
                     args: vec![inner],
                 })
             }
-            TypeExprAst::App { head, .. } => {
-                Err(RegistryError::UnknownName { name: head.clone() })
-            }
+            TypeExprAst::App { head, .. } => Err(RegistryError::UnknownName { name: head.clone() }),
         }
     }
 

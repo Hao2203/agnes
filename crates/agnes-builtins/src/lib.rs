@@ -96,10 +96,8 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
             provides: plaintext.clone(),
         },
     )?;
-    let text_or_md = canonicalize_union([
-        TypeExpr::named("PlainText"),
-        TypeExpr::named("Markdown"),
-    ]);
+    let text_or_md =
+        canonicalize_union([TypeExpr::named("PlainText"), TypeExpr::named("Markdown")]);
     reg.register_tool(
         "join-lines",
         ToolSignature {
