@@ -252,6 +252,11 @@ async fn call_native(
     Ok(result)
 }
 
+// Tracing wrapper around `call_native`: bundles the identity/args/deps needed
+// to invoke a native tool with the identity/duration needed to emit a trace
+// pair. Splitting the args into a struct just to satisfy the linter would
+// obscure the call sites, so we accept the extra parameter here.
+#[allow(clippy::too_many_arguments)]
 async fn call_native_traced(
     id: NodeId,
     kind: &NodeKind,

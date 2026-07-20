@@ -88,10 +88,10 @@ impl Provider for AnthropicProvider {
             .ok_or_else(|| LlmError::Deserialize("no `content` array in response".into()))?;
         let mut out = String::new();
         for part in content {
-            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
-                    out.push_str(s);
-                }
+            if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(s) = part.get("text").and_then(|t| t.as_str())
+            {
+                out.push_str(s);
             }
         }
         Ok(out)

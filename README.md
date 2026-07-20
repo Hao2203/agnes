@@ -13,6 +13,17 @@ a workspace of 9 focused crates.
 cargo run -p agnes-cli -- examples/full-demo.agnes
 ```
 
+## Interactive chat
+
+Set an API key and:
+
+    ANTHROPIC_API_KEY=... cargo run -p agnes-cli -- chat --llm-provider anthropic
+
+Each natural-language turn is planned into an agnes DSL program by the
+LLM, executed by the runtime, and printed with a plan tree and per-tool
+trace. `/run <dsl>` lets you inject a hand-written program. See
+[examples/chat-demo.md](examples/chat-demo.md).
+
 ## Spec + design
 
 See `docs/superpowers/specs/2026-07-18-agnes-dsl-mvp-design.md` for the
