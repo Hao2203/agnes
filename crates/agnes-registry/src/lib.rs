@@ -256,8 +256,8 @@ impl Registry {
     }
 
     /// Resolve a syntactic TypeExprAst into a canonical TypeExpr.
-    /// Recognizes `Named`, `App { head: "|", ... }`, `App { head: "List", ... }`,
-    /// and `App { head: "Option", ... }`. Any other App head fails with
+    /// Recognizes `Named`, `App { head: "|" | "List" | "Option" | "Finish" | "Observation", ... }`.
+    /// Any other App head fails with
     /// `UnknownName` (the message points at the built-in constructors).
     pub fn resolve(&self, ast: &TypeExprAst) -> Result<TypeExpr, RegistryError> {
         match ast {
@@ -300,6 +300,34 @@ impl Registry {
                 let inner = self.resolve(&args[0])?;
                 Ok(TypeExpr::App {
                     head: TypeName("List".into()),
+                    args: vec![inner],
+                })
+            }
+            TypeExprAst::App { head, args } if head == "Finish" => {
+                if args.len() != 1 {
+                    return Err(RegistryError::ArityMismatch {
+                        head: "Finish".into(),
+                        expected: 1,
+                        actual: args.len(),
+                    });
+                }
+                let inner = self.resolve(&args[0])?;
+                Ok(TypeExpr::App {
+                    head: TypeName("Finish".into()),
+                    args: vec![inner],
+                })
+            }
+            TypeExprAst::App { head, args } if head == "Observation" => {
+                if args.len() != 1 {
+                    return Err(RegistryError::ArityMismatch {
+                        head: "Observation".into(),
+                        expected: 1,
+                        actual: args.len(),
+                    });
+                }
+                let inner = self.resolve(&args[0])?;
+                Ok(TypeExpr::App {
+                    head: TypeName("Observation".into()),
                     args: vec![inner],
                 })
             }
