@@ -4,6 +4,7 @@
 //! Tasks 2 and 3). `MockProvider` is available at all times for tests.
 
 mod anthropic;
+mod dsl_extract;
 mod error;
 mod mock;
 mod openai;
@@ -11,6 +12,7 @@ mod provider;
 mod resolve;
 
 pub use anthropic::AnthropicProvider;
+pub use dsl_extract::extract_dsl;
 pub use error::LlmError;
 pub use mock::MockProvider;
 pub use openai::OpenAiCompatProvider;
