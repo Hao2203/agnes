@@ -194,8 +194,7 @@ impl Registry {
                 if let Some(f) = self.show_of(name) {
                     f(data)
                 } else {
-                    serde_json::to_string_pretty(data)
-                        .unwrap_or_else(|_| data.to_string())
+                    serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
                 }
             }
             TypeExpr::App { head, args } => match head.0.as_str() {
@@ -222,13 +221,17 @@ impl Registry {
                     // member and render with that. This is a best-effort fallback:
                     // unions with heterogeneous shapes may render imperfectly.
                     if data.is_null()
-                        && args.iter().any(|a| matches!(a, TypeExpr::Named(n) if n.0 == "Unit"))
+                        && args
+                            .iter()
+                            .any(|a| matches!(a, TypeExpr::Named(n) if n.0 == "Unit"))
                     {
                         return String::new();
                     }
                     // Pick the first non-Unit member.
                     for a in args {
-                        if let TypeExpr::Named(n) = a && n.0 != "Unit" {
+                        if let TypeExpr::Named(n) = a
+                            && n.0 != "Unit"
+                        {
                             return self.show_data(data, a);
                         }
                     }
@@ -240,8 +243,7 @@ impl Registry {
                     if let Some(f) = self.show_of(head) {
                         f(data)
                     } else {
-                        serde_json::to_string_pretty(data)
-                            .unwrap_or_else(|_| data.to_string())
+                        serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
                     }
                 }
             },

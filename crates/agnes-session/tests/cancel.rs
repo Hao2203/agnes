@@ -28,11 +28,7 @@ async fn cancel_before_first_iteration_returns_cancelled_with_zero() {
     // Pre-notify: the loop should see it on the very first check.
     cancel.notify_one();
     let err = s
-        .run_turn_cancellable(
-            TurnInput::NaturalLanguage("go".into()),
-            &mut sink,
-            cancel,
-        )
+        .run_turn_cancellable(TurnInput::NaturalLanguage("go".into()), &mut sink, cancel)
         .await
         .expect_err("expected cancelled");
     match err {
@@ -60,7 +56,16 @@ async fn cancel_between_iterations_stops_after_current_iteration() {
             let is_obs = matches!(ev, SessionEvent::ObservationEmitted { .. });
             self.0.lock().unwrap().push(ev);
             // Fire cancel immediately after the FIRST observation.
-            if is_obs && self.0.lock().unwrap().iter().filter(|e| matches!(e, SessionEvent::ObservationEmitted {..})).count() == 1 {
+            if is_obs
+                && self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| matches!(e, SessionEvent::ObservationEmitted { .. }))
+                    .count()
+                    == 1
+            {
                 self.1.notify_one();
             }
         }
@@ -69,11 +74,7 @@ async fn cancel_between_iterations_stops_after_current_iteration() {
     let cancel = Arc::new(Notify::new());
     let mut sink = Sink(ev_log.clone(), cancel.clone());
     let err = s
-        .run_turn_cancellable(
-            TurnInput::NaturalLanguage("go".into()),
-            &mut sink,
-            cancel,
-        )
+        .run_turn_cancellable(TurnInput::NaturalLanguage("go".into()), &mut sink, cancel)
         .await
         .expect_err("expected cancelled");
     match err {

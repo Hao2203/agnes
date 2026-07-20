@@ -38,8 +38,7 @@ impl Provider for MockProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<String, LlmError> {
         let mut g = self.inner.lock().unwrap();
         g.seen.push(req);
-        Ok(g
-            .responses
+        Ok(g.responses
             .pop_front()
             .expect("MockProvider: response queue exhausted; queue more responses"))
     }

@@ -45,12 +45,8 @@ fn stub_dispatch() -> std::collections::HashMap<String, agnes_builtins::ToolImpl
     m.insert(
         "read-file".to_string(),
         Arc::new(|_args| {
-            Box::pin(async {
-                Ok(Value::typed(
-                    JsonValue::String("hello".into()),
-                    "PlainText",
-                ))
-            }) as BoxFuture<'static, Result<Value, String>>
+            Box::pin(async { Ok(Value::typed(JsonValue::String("hello".into()), "PlainText")) })
+                as BoxFuture<'static, Result<Value, String>>
         }) as agnes_builtins::ToolImpl,
     );
     m.insert(

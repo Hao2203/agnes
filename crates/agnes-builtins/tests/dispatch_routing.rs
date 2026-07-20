@@ -7,7 +7,12 @@ use std::sync::Arc;
 
 fn args(kvs: &[(&str, &str)]) -> HashMap<String, Value> {
     kvs.iter()
-        .map(|(k, v)| ((*k).into(), Value::typed(JsonValue::String((*v).into()), "PlainText")))
+        .map(|(k, v)| {
+            (
+                (*k).into(),
+                Value::typed(JsonValue::String((*v).into()), "PlainText"),
+            )
+        })
         .collect()
 }
 
@@ -68,7 +73,9 @@ async fn llm_routes_through_provider() {
 async fn read_file_returns_mock_content_for_known_and_placeholder_for_unknown() {
     let mock = Arc::new(MockProvider::new(vec![]));
     let d = native_dispatch(mock);
-    let known = (d["read-file"])(args(&[("path", "README.md")])).await.unwrap();
+    let known = (d["read-file"])(args(&[("path", "README.md")]))
+        .await
+        .unwrap();
     assert!(
         known.data.as_str().unwrap().contains("agnes"),
         "seeded README should mention agnes"

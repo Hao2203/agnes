@@ -3,9 +3,7 @@
 //! real network.
 
 use agnes_builtins::register_builtins;
-use agnes_llm::{
-    MockProvider, Planner, Provider, Role,
-};
+use agnes_llm::{MockProvider, Planner, Provider, Role};
 use agnes_registry::Registry;
 use agnes_types::TypeName;
 use std::sync::Arc;
@@ -203,7 +201,10 @@ async fn old_turns_beyond_six_collapse_into_prior_context() {
         sys8.contains("<prior context:"),
         "system prompt missing prior-context prefix on 8th turn: {sys8}"
     );
-    assert!(sys8.contains("nl 0"), "prior context should reference turn 0");
+    assert!(
+        sys8.contains("nl 0"),
+        "prior context should reference turn 0"
+    );
     // But turn 1 (the second one) should NOT be summarized — it should
     // still be verbatim in messages.
     let msgs8 = &seen[7].messages;

@@ -53,11 +53,7 @@ impl EventSink for StderrEventSink {
                 let _ = crate::plan_view::render_plan(&tree, e);
                 self.printed_plan_header = true;
             }
-            SessionEvent::NodeStart {
-                id: _,
-                kind,
-                args,
-            } => {
+            SessionEvent::NodeStart { id: _, kind, args } => {
                 if !self.printed_trace_header {
                     let _ = writeln!(e, "━━━ Trace ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     self.printed_trace_header = true;
@@ -97,11 +93,7 @@ impl EventSink for StderrEventSink {
                 let t = self.t();
                 let _ = writeln!(e, "writes:");
                 // Right-pad the path column so the byte counts line up.
-                let width = entries
-                    .iter()
-                    .map(|(p, _)| p.len())
-                    .max()
-                    .unwrap_or(0);
+                let width = entries.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
                 for (path, bytes) in entries {
                     let _ = writeln!(
                         e,
@@ -112,10 +104,7 @@ impl EventSink for StderrEventSink {
                 }
             }
             SessionEvent::IterationStart { iter } => {
-                let _ = writeln!(
-                    e,
-                    "\n─── iteration {iter} ───────────────────────────────"
-                );
+                let _ = writeln!(e, "\n─── iteration {iter} ───────────────────────────────");
                 self.start = Instant::now();
                 self.printed_plan_header = false;
                 self.printed_trace_header = false;
@@ -126,7 +115,11 @@ impl EventSink for StderrEventSink {
                 is_error,
             } => {
                 let t = self.t();
-                let tag = if is_error { "✗ error" } else { "↓ observed" };
+                let tag = if is_error {
+                    "✗ error"
+                } else {
+                    "↓ observed"
+                };
                 let char_count = text.chars().count();
                 let preview: String = text.chars().take(120).collect();
                 let ellipsis = if char_count > 120 { "…" } else { "" };

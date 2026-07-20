@@ -48,7 +48,8 @@ fn eval_node<'a>(
                     })?
             }
             NodeKind::Let { name } => {
-                let src = eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
+                let src =
+                    eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
                 env.insert(name.clone(), src.clone());
                 src
             }
@@ -73,7 +74,8 @@ fn eval_node<'a>(
                 Value::typed(JsonValue::Null, "Unit")
             }
             NodeKind::If => {
-                let cond = eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
+                let cond =
+                    eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
                 let picked = if cond.data.as_bool().unwrap_or(false) {
                     1
                 } else {
@@ -101,7 +103,8 @@ fn eval_node<'a>(
             NodeKind::Retry { times, .. } => {
                 let mut last_err: Option<RuntimeError> = None;
                 for _ in 0..(*times + 1) {
-                    match eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await {
+                    match eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await
+                    {
                         Ok(v) => {
                             cache.insert(id, v.clone());
                             return Ok(v);
@@ -118,15 +121,37 @@ fn eval_node<'a>(
                 }
             }
             NodeKind::Llm => {
-                let args = collect_kwargs(dag, &node.inputs, reg, dispatch, tracer, cache, env).await?;
-                call_native_traced(id, &node.kind, "llm", args, dispatch, reg, &node.provides, tracer).await?
+                let args =
+                    collect_kwargs(dag, &node.inputs, reg, dispatch, tracer, cache, env).await?;
+                call_native_traced(
+                    id,
+                    &node.kind,
+                    "llm",
+                    args,
+                    dispatch,
+                    reg,
+                    &node.provides,
+                    tracer,
+                )
+                .await?
             }
             NodeKind::Return => {
                 eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?
             }
             NodeKind::Tool { name } => {
-                let args = collect_kwargs(dag, &node.inputs, reg, dispatch, tracer, cache, env).await?;
-                call_native_traced(id, &node.kind, name, args, dispatch, reg, &node.provides, tracer).await?
+                let args =
+                    collect_kwargs(dag, &node.inputs, reg, dispatch, tracer, cache, env).await?;
+                call_native_traced(
+                    id,
+                    &node.kind,
+                    name,
+                    args,
+                    dispatch,
+                    reg,
+                    &node.provides,
+                    tracer,
+                )
+                .await?
             }
             NodeKind::List => {
                 let mut elems: Vec<Value> = Vec::with_capacity(node.inputs.len());

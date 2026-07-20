@@ -21,6 +21,7 @@ agnes-compiler.workspace = true
 agnes-runtime.workspace = true
 agnes-builtins.workspace = true
 agnes-llm.workspace = true
+agnes-types.workspace = true
 agnes-session.workspace = true
 async-trait.workspace = true
 clap = { workspace = true }
@@ -40,4 +41,5 @@ agnes-runtime.workspace = true
 agnes-builtins.workspace = true
 agnes-llm.workspace = true
 agnes-session.workspace = true
+agnes-types.workspace = true
 async-trait.workspace = true

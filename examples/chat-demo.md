@@ -1,86 +1,107 @@
-# agnes chat — end-to-end demo
+# Interactive `agnes chat` demo
 
-`agnes chat` is an interactive REPL that turns natural language into an
-agnes DSL program per turn. The LLM plans; the runtime executes; the
-CLI prints a plan tree and per-node trace as tools fire.
+`agnes chat` runs a multi-turn agent loop. Each user turn drives an LLM
+that emits agnes DSL; the runtime executes the DSL; if the result is
+wrapped in `Observation _`, the observation is fed back and the LLM
+continues; if the result is `Finish _` or any other unwrapped type, the
+turn ends.
 
-## Quick start
-
-Missing-key path (no provider selected):
-
-```bash
-env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u AGNES_LLM_PROVIDER \
-    cargo run -p agnes-cli -- chat
-```
-
-Expected stderr (exit code non-zero):
+## Quick start (missing key)
 
 ```
-Missing provider selection.
+$ env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u AGNES_LLM_PROVIDER \
+  cargo run -p agnes-cli -- chat
+```
+
+Expected stderr (anyhow prepends `Error: ` to the first line):
+
+```
+Error: Missing provider selection.
   Why: neither the CLI flag `--llm-provider` nor the env var `AGNES_LLM_PROVIDER` is set.
   Fix: pass --llm-provider, set AGNES_LLM_PROVIDER, or add it to .env.
 ```
 
-Real-key path:
+Exit status: non-zero.
 
-```bash
-ANTHROPIC_API_KEY=... cargo run -p agnes-cli -- chat \
-    --llm-provider anthropic --llm-model claude-haiku-4-5
+## Quick start (real key)
+
+```
+$ ANTHROPIC_API_KEY=... cargo run -p agnes-cli -- \
+    --llm-provider anthropic --llm-model claude-haiku-4-5 chat
 ```
 
-## About the "tools"
+Then in the REPL:
 
-Only `llm` reaches out to a network model. Every other built-in tool —
-`read-file`, `translate`, `summarize`, `join-lines`, `write-file` — is
-an **in-memory mock** that returns pre-baked strings
-so the demo is deterministic and offline-friendly for tools other than
-the planner itself. See
+```
+agnes chat — type your goal, or /run <dsl>, /history, /reset, /quit
+
+> read the README and summarize it in one sentence
+
+─── iteration 0 ─────────────────────────────
+━━━ Planning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ Generated DSL ━━━━━━━━━━━━━━━━━━━━━━━━
+(pipe (tool read-file :path "README.md") (tool summarize) finish)
+━━━ Plan ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+├── read-file → PlainText
+├── summarize → Summary
+└── finish   → Unknown
+━━━ Trace ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[+0.043s] ▶ read-file :path=README.md
+[+0.081s] ✔ read-file (38ms) → PlainText: <content>…
+[+0.083s] ▶ summarize :input=<from read-file>
+[+1.410s] ✔ summarize (1327ms) → Summary: agnes is a…
+[+1.412s] ▶ finish :input=<from summarize>
+[+1.413s] ✔ finish (1ms) → (Finish Summary): agnes is a…
+agnes is a Rust runtime for a small typed workflow DSL.
+```
+
+## `observe` example (agent decides to look before speaking)
+
+```
+> summarize the README, but only if it's less than 4000 chars
+
+─── iteration 0 ─────────────────────────────
+━━━ Generated DSL ━━━━━━━━━━━━━━━━━━━━━━━━
+(pipe (tool read-file :path "README.md") observe)
+[+0.081s] ↓ observed (iter 0, 3200 chars): # agnes …
+
+─── iteration 1 ─────────────────────────────
+━━━ Generated DSL ━━━━━━━━━━━━━━━━━━━━━━━━
+(pipe (tool summarize :input "…") finish)
+[+1.410s] ✔ summarize (1327ms) → Summary: agnes is a…
+agnes is a Rust runtime for a small typed workflow DSL.
+```
+
+## `--max-turns`
+
+```
+$ cargo run -p agnes-cli -- chat --max-turns 5
+```
+
+Cap the loop at 5 iterations per turn. On exhaustion:
+
+```
+━━━ Turn Failed ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Agent loop hit the iteration limit.
+  Why: `MAX_TURNS = 5` reached without a terminating iteration (finish or unlabeled result).
+  Fix: rephrase the request more narrowly, or pass `--max-turns <N>` to raise the ceiling.
+```
+
+## Mocked built-in tools
+
+Note: this build ships in-memory mocks for the I/O-adjacent tools. See
 [`crates/agnes-builtins/src/tools.rs`](../crates/agnes-builtins/src/tools.rs)
-for the mock corpus (`MOCK_README`, `MOCK_NOTES`, `MOCK_DRAFT`).
-
-The takeaway is that the demo showcases the *planner + runtime + type
-system + trace* loop end-to-end. Swap the mock tool bodies for real I/O
-and the same DSL programs will run against real filesystems / HTTP
-endpoints.
+for `MOCK_README`, `MOCK_NOTES`, `MOCK_DRAFT` — the strings `read-file`
+returns for well-known paths. `write-file` records to a process-global
+`writes()` log, drained per turn as `WriteSummary`. `ocr` returns fixed
+placeholder text. `llm`, `summarize`, `translate` use the real Provider.
 
 ## Manual verification checklist (pending user verification)
 
-The subagent that generated this doc cannot run an interactive TTY with
-a real API key. To confirm end-to-end behaviour, a human runs:
-
-```bash
-ANTHROPIC_API_KEY=... cargo run -p agnes-cli -- chat \
-    --llm-provider anthropic --llm-model claude-haiku-4-5
-```
-
-At the `agnes>` prompt, enter each of the following in order:
-
-1. `Translate the readme into Japanese`
-2. `now do English too and join them`
-3. `/run (tool llm :prompt "haiku about types" :input "")`
-4. `/history`
-5. `/quit`
-
-Expected per turn:
-
-- The CLI prints a **plan tree** (indented `NodeKind` sketch of the DSL
-  the LLM produced) on stderr, then a **per-node trace** with
-  `node_start` / `node_end` lines and elapsed time.
-- The final result value prints on stdout.
-- Turn 2 should reuse or re-emit the `read-and-translate` define pattern
-  from turn 1 and produce a joined string.
-- Turn 3 (the `/run` slash-command) bypasses the planner and executes
-  the hand-written `(tool llm ...)` directly — expect a haiku.
-- `/history` dumps the prior user prompts and assistant DSL replies.
-- Two `translate` `node_end` lines across the session should show
-  elapsed >200ms — that is real API latency, since `translate` itself
-  calls into `llm` under the hood.
-- `/quit` exits the REPL cleanly (exit code 0).
-
-Cancel signals: `Ctrl-C` cancels the current input line but keeps the
-REPL alive; `Ctrl-D` on an empty line quits.
-
-## Example transcript
-
-*Placeholder — pending manual verification per the checklist above. Once
-a human runs the session, paste the plan tree + trace here.*
+- [ ] Missing-key path prints the What/Why/Fix block above and exits non-zero.
+- [ ] Real-key path executes translate/summarize with visible plan tree and per-node trace.
+- [ ] Two-iteration `observe → finish` path shows both iterations on stderr with the observation line in between.
+- [ ] Error-observation path (LLM emits a broken DSL) recovers in a subsequent iteration.
+- [ ] `--max-turns 2` for a "loop forever with observe" prompt correctly hits `TurnLimitExceeded`.
+- [ ] Ctrl-C during a long turn prints `(cancelled after N iteration(s))` and returns to the prompt.
+- [ ] `/history` shows nested iterations with the observation `type` labels.

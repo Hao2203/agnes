@@ -59,12 +59,9 @@ async fn positive_full_demo_runs() {
 "#
     );
     // One translate call per read-and-translate invocation.
-    let out = run_with(
-        &src,
-        vec!["[TRANSLATED to ja] agnes".into()],
-    )
-    .await
-    .expect("full-demo workflow must succeed");
+    let out = run_with(&src, vec!["[TRANSLATED to ja] agnes".into()])
+        .await
+        .expect("full-demo workflow must succeed");
     assert!(
         out.contains("[TRANSLATED"),
         "expected translated content in joined output, got: {out}"

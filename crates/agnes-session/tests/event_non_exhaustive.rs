@@ -4,7 +4,7 @@
 //! verify that a match with a catchall works AND that we can construct
 //! variants normally.
 
-use agnes_session::{SessionEvent, NodeKindTag};
+use agnes_session::{NodeKindTag, SessionEvent};
 
 #[test]
 fn match_with_catchall_compiles_and_runs() {

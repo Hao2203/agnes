@@ -42,6 +42,7 @@ dependencies = [
  "agnes-registry",
  "agnes-runtime",
  "agnes-session",
+ "agnes-types",
  "anyhow",
  "async-trait",
  "clap",

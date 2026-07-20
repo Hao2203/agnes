@@ -65,13 +65,12 @@ pub fn resolve_decision(cli: &LlmCliOpts) -> Result<(ResolvedKind, String), LlmE
                 .ok_or(LlmError::MissingApiKey {
                     env_var: "OPENAI_API_KEY",
                 })?;
-            let _base = pick(&cli.base_url, "AGNES_LLM_BASE_URL").ok_or(
-                LlmError::MissingConfig {
+            let _base =
+                pick(&cli.base_url, "AGNES_LLM_BASE_URL").ok_or(LlmError::MissingConfig {
                     what: "base_url",
                     env_var: "AGNES_LLM_BASE_URL",
                     flag: "--llm-base-url",
-                },
-            )?;
+                })?;
             let model = model.ok_or(LlmError::MissingConfig {
                 what: "model",
                 env_var: "AGNES_LLM_MODEL",
@@ -96,9 +95,11 @@ pub fn resolve_provider(cli: &LlmCliOpts) -> Result<Arc<dyn Provider>, LlmError>
         }
         ResolvedKind::OpenAiCompat => {
             let key = std::env::var("OPENAI_API_KEY").expect("checked by resolve_decision");
-            let base = pick(&cli.base_url, "AGNES_LLM_BASE_URL")
-                .expect("checked by resolve_decision");
-            Ok(Arc::new(OpenAiCompatProvider::new(model, key, base, client)))
+            let base =
+                pick(&cli.base_url, "AGNES_LLM_BASE_URL").expect("checked by resolve_decision");
+            Ok(Arc::new(OpenAiCompatProvider::new(
+                model, key, base, client,
+            )))
         }
     }
 }

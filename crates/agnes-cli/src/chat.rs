@@ -10,7 +10,7 @@
 use crate::input::is_balanced;
 use crate::sink_stderr::StderrEventSink;
 use agnes_llm::Provider;
-use agnes_session::{Session, TurnInput, SessionError};
+use agnes_session::{Session, SessionError, TurnInput};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result as RlResult};
 use std::sync::Arc;
@@ -52,13 +52,13 @@ pub async fn run(provider: Arc<dyn Provider>, max_turns: Option<u32>) -> anyhow:
                 // cancel that lets the loop return SessionError::Cancelled.
                 let ctrlc_task = tokio::spawn(async move {
                     if let Err(e) = tokio::signal::ctrl_c().await {
-                        eprintln!("warning: could not set up Ctrl-C handler: {e}; cancellation will not work for this turn");
+                        eprintln!(
+                            "warning: could not set up Ctrl-C handler: {e}; cancellation will not work for this turn"
+                        );
                     }
                     cancel_for_signal.notify_one();
                 });
-                let result = session
-                    .run_turn_cancellable(input, &mut sink, cancel)
-                    .await;
+                let result = session.run_turn_cancellable(input, &mut sink, cancel).await;
                 ctrlc_task.abort();
                 match result {
                     Ok(v) => println!("{}", v.data),
@@ -118,17 +118,8 @@ async fn dispatch_slash(cmd: &str, session: &mut Session) -> anyhow::Result<bool
         return Ok(true);
     }
     if cmd == "history" {
-        for (i, t) in session.history().iter().enumerate() {
-            println!("--- turn {i} ---");
-            println!("user: {}", t.user_nl);
-            for (j, iter) in t.iterations.iter().enumerate() {
-                println!("  iteration {j} dsl:\n{}", iter.assistant_dsl);
-                if let Some(obs) = &iter.observation {
-                    println!("  observation: {} (error: {})", obs.text, obs.is_error);
-                }
-            }
-            println!("outcome: {:?}", t.outcome);
-        }
+        let mut stdout = std::io::stdout().lock();
+        crate::history_view::render_history(session.history(), &mut stdout).ok();
         return Ok(true);
     }
     if let Some(dsl) = cmd.strip_prefix("run ") {

@@ -95,9 +95,7 @@ impl Provider for OpenAiCompatProvider {
             .and_then(|m| m.get("content"))
             .and_then(|s| s.as_str())
             .ok_or_else(|| {
-                LlmError::Deserialize(format!(
-                    "no choices[0].message.content in response: {text}"
-                ))
+                LlmError::Deserialize(format!("no choices[0].message.content in response: {text}"))
             })?;
         Ok(content.to_string())
     }

@@ -38,7 +38,13 @@ fn missing_provider_selection_errors() {
     };
     let err = expect_err(resolve_provider(&cli));
     assert!(
-        matches!(err, LlmError::MissingConfig { flag: "--llm-provider", .. }),
+        matches!(
+            err,
+            LlmError::MissingConfig {
+                flag: "--llm-provider",
+                ..
+            }
+        ),
         "got: {err}"
     );
 }

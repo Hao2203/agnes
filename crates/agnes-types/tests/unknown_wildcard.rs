@@ -26,10 +26,7 @@ fn unknown_expected_matches_apps() {
     };
     assert!(type_expr_matches(&finish_summary, &expected));
     // (| PlainText Markdown)
-    let union = canonicalize_union([
-        TypeExpr::named("PlainText"),
-        TypeExpr::named("Markdown"),
-    ]);
+    let union = canonicalize_union([TypeExpr::named("PlainText"), TypeExpr::named("Markdown")]);
     assert!(type_expr_matches(&union, &expected));
 }
 
@@ -48,10 +45,7 @@ fn unknown_actual_still_only_matches_unknown_expected() {
 fn union_containing_unknown_matches_anything() {
     // (| Unknown Unit) — pathological but confirms unions distribute the
     // wildcard correctly.
-    let expected = canonicalize_union([
-        TypeExpr::named("Unknown"),
-        TypeExpr::named("Unit"),
-    ]);
+    let expected = canonicalize_union([TypeExpr::named("Unknown"), TypeExpr::named("Unit")]);
     assert!(type_expr_matches(&TypeExpr::named("PlainText"), &expected));
     assert!(type_expr_matches(&TypeExpr::named("Summary"), &expected));
 }

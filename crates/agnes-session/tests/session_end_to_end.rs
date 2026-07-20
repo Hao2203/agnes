@@ -2,9 +2,7 @@
 //! against MockProvider. No real network.
 
 use agnes_llm::{MockProvider, Provider};
-use agnes_session::{
-    EventSink, Session, SessionError, SessionEvent, TurnInput,
-};
+use agnes_session::{EventSink, Session, SessionError, SessionEvent, TurnInput};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +33,9 @@ impl EventSink for RecordingSink {
 }
 
 fn provider(responses: Vec<&str>) -> Arc<dyn Provider> {
-    Arc::new(MockProvider::new(responses.into_iter().map(String::from).collect()))
+    Arc::new(MockProvider::new(
+        responses.into_iter().map(String::from).collect(),
+    ))
 }
 
 #[tokio::test]
@@ -114,7 +114,10 @@ async fn observation_feeds_back_and_second_iteration_finishes() {
             } if text == "first"
         )
     });
-    assert!(has_obs, "expected ObservationEmitted iter=0 text=first, got {evs:?}");
+    assert!(
+        has_obs,
+        "expected ObservationEmitted iter=0 text=first, got {evs:?}"
+    );
 }
 
 #[tokio::test]
@@ -153,10 +156,7 @@ async fn raw_dsl_seeds_iteration_zero_and_continues_on_observation() {
     let _g = test_lock().lock().unwrap();
     // /run (pipe "seed" observe) → iter 0 uses the raw DSL, produces
     // Observation, feeds back; planner fills iter 1.
-    let mut s = Session::new(provider(vec![
-        "```agnes\n(pipe \"planned\" finish)\n```",
-    ]))
-    .unwrap();
+    let mut s = Session::new(provider(vec!["```agnes\n(pipe \"planned\" finish)\n```"])).unwrap();
     let mut sink = RecordingSink::default();
     let v = s
         .run_turn(
@@ -206,11 +206,8 @@ async fn max_turns_ceiling_terminates_with_turn_limit_exceeded() {
     let responses: Vec<String> = (0..10)
         .map(|i| format!("```agnes\n(pipe \"iter {i}\" observe)\n```"))
         .collect();
-    let mut s = Session::new_with_max_turns(
-        Arc::new(MockProvider::new(responses.clone())),
-        3,
-    )
-    .unwrap();
+    let mut s =
+        Session::new_with_max_turns(Arc::new(MockProvider::new(responses.clone())), 3).unwrap();
     let mut sink = RecordingSink::default();
     let err = s
         .run_turn(TurnInput::NaturalLanguage("go".into()), &mut sink)

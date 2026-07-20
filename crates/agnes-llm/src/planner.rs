@@ -175,12 +175,18 @@ impl Planner {
             .inflight
             .take()
             .expect("record_finish called without begin_user_turn");
-        let last = inflight.iterations.last_mut()
+        let last = inflight
+            .iterations
+            .last_mut()
             .expect("record_finish called before any iteration was recorded");
-        assert_eq!(last.assistant_dsl, dsl,
-            "record_finish dsl must match the last iteration's assistant_dsl");
-        assert!(last.observation.is_none(),
-            "record_finish called on an iteration that already has an observation");
+        assert_eq!(
+            last.assistant_dsl, dsl,
+            "record_finish dsl must match the last iteration's assistant_dsl"
+        );
+        assert!(
+            last.observation.is_none(),
+            "record_finish called on an iteration that already has an observation"
+        );
         self.history.push(Turn {
             user_nl: inflight.user_nl,
             iterations: inflight.iterations,
@@ -275,10 +281,7 @@ impl Planner {
 
 fn wrap_observation(obs: &Observation) -> String {
     if obs.is_error {
-        format!(
-            "<observation error=\"true\">\n{}\n</observation>",
-            obs.text
-        )
+        format!("<observation error=\"true\">\n{}\n</observation>", obs.text)
     } else {
         match &obs.type_name {
             Some(t) => format!(
@@ -317,7 +320,8 @@ fn build_system_prompt(reg: &Registry) -> String {
         }
     }
 
-    format!(r#"You are the planning brain of an agnes agent. Each turn you produce
+    format!(
+        r#"You are the planning brain of an agnes agent. Each turn you produce
 one agnes DSL expression as an ```agnes fenced block. That expression will
 be parsed, type-checked, compiled, and executed by the runtime.
 
@@ -358,6 +362,6 @@ Examples (each is a complete turn):
 ```agnes
 (pipe "task complete" finish)
 ```
-"#)
+"#
+    )
 }
-

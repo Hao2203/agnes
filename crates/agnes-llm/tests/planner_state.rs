@@ -1,7 +1,5 @@
 use agnes_builtins::register_builtins;
-use agnes_llm::{
-    Iteration, MockProvider, Observation, Planner, Turn, TurnOutcome,
-};
+use agnes_llm::{Iteration, MockProvider, Observation, Planner, Turn, TurnOutcome};
 use agnes_registry::Registry;
 use agnes_types::TypeName;
 use std::sync::Arc;
@@ -73,7 +71,10 @@ async fn record_finish_commits_the_turn_with_finished_outcome() {
     assert_eq!(t.iterations.len(), 1);
     let it: &Iteration = &t.iterations[0];
     assert_eq!(it.assistant_dsl, dsl);
-    assert!(it.observation.is_none(), "final iteration has no observation");
+    assert!(
+        it.observation.is_none(),
+        "final iteration has no observation"
+    );
     match &t.outcome {
         TurnOutcome::Finished { result } => assert_eq!(result, "ok"),
         other => panic!("expected Finished, got {other:?}"),

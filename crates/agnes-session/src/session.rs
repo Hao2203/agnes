@@ -42,7 +42,9 @@ pub fn extract_inner_type(t: &agnes_types::TypeExpr) -> Option<agnes_types::Type
         TypeExpr::App { head, args } if args.len() == 1 => match head.0.as_str() {
             "Finish" | "Observation" => Some(match &args[0] {
                 TypeExpr::Named(n) => n.clone(),
-                TypeExpr::App { head: inner_head, .. } => inner_head.clone(),
+                TypeExpr::App {
+                    head: inner_head, ..
+                } => inner_head.clone(),
             }),
             _ => None,
         },
@@ -126,9 +128,18 @@ impl Session {
         let total_chars = text.chars().count();
         let keep = OBSERVATION_TRUNCATION_THRESHOLD / 2;
         let first: String = text.chars().take(keep).collect();
-        let last: String = text.chars().rev().take(keep).collect::<String>().chars().rev().collect();
+        let last: String = text
+            .chars()
+            .rev()
+            .take(keep)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         let dropped = total_chars - 2 * keep;
-        format!("{first}\n\n... [truncated {dropped} chars — full length: {total_chars}] ...\n\n{last}")
+        format!(
+            "{first}\n\n... [truncated {dropped} chars — full length: {total_chars}] ...\n\n{last}"
+        )
     }
 
     pub async fn run_turn(
@@ -230,12 +241,8 @@ impl Session {
                                 is_error: false,
                             })
                             .await;
-                            self.planner.push_observation(
-                                dsl.clone(),
-                                text,
-                                false,
-                                inner_type,
-                            );
+                            self.planner
+                                .push_observation(dsl.clone(), text, false, inner_type);
                             // Loop continues to next iteration
                             iter += 1;
                         }
@@ -293,8 +300,7 @@ impl Session {
         dsl: &str,
         sink: &mut dyn EventSink,
     ) -> Result<Value, SessionError> {
-        let program =
-            agnes_parser::parse(dsl).map_err(|e| SessionError::Parse(e.to_string()))?;
+        let program = agnes_parser::parse(dsl).map_err(|e| SessionError::Parse(e.to_string()))?;
         let mut turn_registry = Registry::new();
         register_builtins(&mut turn_registry).map_err(|e| SessionError::Check(e.to_string()))?;
         turn_registry

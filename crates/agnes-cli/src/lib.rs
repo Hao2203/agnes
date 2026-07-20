@@ -2,6 +2,7 @@
 //! integration tests can hit them.
 pub mod chat;
 pub mod cli;
+pub mod history_view;
 pub mod input;
 pub mod plan_view;
 pub mod run_cmd;

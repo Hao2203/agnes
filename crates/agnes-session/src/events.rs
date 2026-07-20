@@ -46,7 +46,9 @@ pub enum SessionEvent {
 
     /// Emitted at the start of each planner↔runtime iteration in a turn.
     /// `iter` is 0-indexed.
-    IterationStart { iter: u32 },
+    IterationStart {
+        iter: u32,
+    },
 
     /// Emitted when the current iteration's result is fed back to the
     /// planner as an observation (i.e. runtime returned Observation _
