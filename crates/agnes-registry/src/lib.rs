@@ -228,12 +228,9 @@ impl Registry {
                     }
                     // Pick the first non-Unit member.
                     for a in args {
-                        if let TypeExpr::Named(n) = a {
-                            if n.0 == "Unit" {
-                                continue;
-                            }
+                        if let TypeExpr::Named(n) = a && n.0 != "Unit" {
+                            return self.show_data(data, a);
                         }
-                        return self.show_data(data, a);
                     }
                     // Only Unit(s): empty.
                     String::new()

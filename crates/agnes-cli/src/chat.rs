@@ -10,15 +10,18 @@
 use crate::input::is_balanced;
 use crate::sink_stderr::StderrEventSink;
 use agnes_llm::Provider;
-use agnes_session::{Session, TurnInput};
+use agnes_session::{Session, TurnInput, SessionError};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result as RlResult};
 use std::sync::Arc;
 
 /// Prints the banner and enters the REPL. Ctrl-D exits cleanly.
-pub async fn run(provider: Arc<dyn Provider>) -> anyhow::Result<()> {
+pub async fn run(provider: Arc<dyn Provider>, max_turns: Option<u32>) -> anyhow::Result<()> {
     banner();
-    let mut session = Session::new(provider)?;
+    let mut session = match max_turns {
+        Some(n) => Session::new_with_max_turns(provider, n)?,
+        None => Session::new(provider)?,
+    };
     let mut rl: DefaultEditor = DefaultEditor::new()?;
     loop {
         match read_line_or_block(&mut rl) {
@@ -40,8 +43,28 @@ pub async fn run(provider: Arc<dyn Provider>) -> anyhow::Result<()> {
                 } else {
                     TurnInput::NaturalLanguage(line)
                 };
-                match session.run_turn(input, &mut sink).await {
+                let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+                let cancel_for_signal = cancel.clone();
+                // Set up a one-shot Ctrl-C handler for the duration of
+                // this turn only. rustyline is not active while we're
+                // awaiting run_turn, so a stray SIGINT would kill the
+                // process; the handler swaps that behavior for a soft
+                // cancel that lets the loop return SessionError::Cancelled.
+                let ctrlc_task = tokio::spawn(async move {
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        eprintln!("warning: could not set up Ctrl-C handler: {e}; cancellation will not work for this turn");
+                    }
+                    cancel_for_signal.notify_one();
+                });
+                let result = session
+                    .run_turn_cancellable(input, &mut sink, cancel)
+                    .await;
+                ctrlc_task.abort();
+                match result {
                     Ok(v) => println!("{}", v.data),
+                    Err(SessionError::Cancelled { after_iterations }) => {
+                        eprintln!("(cancelled after {after_iterations} iteration(s))");
+                    }
                     Err(e) => eprintln!("error: {e}"),
                 }
             }
@@ -98,8 +121,13 @@ async fn dispatch_slash(cmd: &str, session: &mut Session) -> anyhow::Result<bool
         for (i, t) in session.history().iter().enumerate() {
             println!("--- turn {i} ---");
             println!("user: {}", t.user_nl);
-            println!("dsl:  {}", t.assistant_dsl);
-            println!("out:  {}", t.result_preview);
+            for (j, iter) in t.iterations.iter().enumerate() {
+                println!("  iteration {j} dsl:\n{}", iter.assistant_dsl);
+                if let Some(obs) = &iter.observation {
+                    println!("  observation: {} (error: {})", obs.text, obs.is_error);
+                }
+            }
+            println!("outcome: {:?}", t.outcome);
         }
         return Ok(true);
     }

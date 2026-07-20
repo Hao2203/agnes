@@ -9,7 +9,6 @@ use agnes_runtime::execute_with;
 use agnes_types::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Notify;
 
 /// Which "root shape" a Value carries — the classification used by the
 /// agent loop to decide whether to terminate (Finish/Other) or feed
@@ -336,6 +335,6 @@ fn cancel_fired(n: &tokio::sync::Notify) -> bool {
     let mut fut = std::pin::pin!(n.notified());
     use std::task::{Context, Poll, Waker};
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
     matches!(fut.as_mut().poll(&mut cx), Poll::Ready(()))
 }

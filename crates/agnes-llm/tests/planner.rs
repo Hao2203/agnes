@@ -4,7 +4,7 @@
 
 use agnes_builtins::register_builtins;
 use agnes_llm::{
-    CompletionRequest, Message, MockProvider, Planner, Provider, Role,
+    MockProvider, Planner, Provider, Role,
 };
 use agnes_registry::Registry;
 use agnes_types::TypeName;

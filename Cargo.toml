@@ -34,7 +34,7 @@ agnes-llm      = { path = "crates/agnes-llm" }
 agnes-session  = { path = "crates/agnes-session" }
 
 # external
-tokio       = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+tokio       = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "sync", "signal"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 lexpr       = "0.2"

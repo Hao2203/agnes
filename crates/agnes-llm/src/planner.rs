@@ -1,8 +1,6 @@
-use crate::dsl_extract::extract_dsl;
 use crate::error::PlannerError;
 use crate::provider::{CompletionRequest, Message, Provider, Role};
 use agnes_registry::Registry;
-use agnes_types::{ToolSignature, TypeName};
 use std::sync::Arc;
 
 const MAX_TURNS_VERBATIM: usize = 6;
@@ -363,11 +361,3 @@ Examples (each is a complete turn):
 "#)
 }
 
-fn format_sig(sig: &ToolSignature) -> String {
-    let params: Vec<String> = sig
-        .requires
-        .iter()
-        .map(|(n, t)| format!("({n} {t})"))
-        .collect();
-    format!("{} -> {}", params.join(" "), sig.provides)
-}

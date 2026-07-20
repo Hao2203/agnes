@@ -111,10 +111,32 @@ impl EventSink for StderrEventSink {
                     );
                 }
             }
+            SessionEvent::IterationStart { iter } => {
+                let _ = writeln!(
+                    e,
+                    "\n─── iteration {iter} ───────────────────────────────"
+                );
+                self.start = Instant::now();
+                self.printed_plan_header = false;
+                self.printed_trace_header = false;
+            }
+            SessionEvent::ObservationEmitted {
+                iter,
+                text,
+                is_error,
+            } => {
+                let t = self.t();
+                let tag = if is_error { "✗ error" } else { "↓ observed" };
+                let char_count = text.chars().count();
+                let preview: String = text.chars().take(120).collect();
+                let ellipsis = if char_count > 120 { "…" } else { "" };
+                let _ = writeln!(
+                    e,
+                    "{t} {tag} (iter {iter}, {char_count} chars): {preview}{ellipsis}"
+                );
+            }
             _ => {
                 // Future SessionEvent variants render nothing by default.
-                // Task 12 will add specific handlers for IterationStart and
-                // ObservationEmitted; anything else stays silent.
             }
         }
     }

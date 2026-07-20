@@ -7,6 +7,10 @@ pub struct Args {
     #[command(flatten)]
     pub llm: LlmFlags,
 
+    /// Override the default per-turn iteration limit (default 20).
+    #[arg(long, global = true)]
+    pub max_turns: Option<u32>,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
