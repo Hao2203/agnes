@@ -152,27 +152,37 @@ impl Planner {
         });
     }
 
+    /// Inject a pre-computed assistant DSL (from RawDsl input) into the
+    /// in-flight turn as if `plan_next` had produced it. Does not call
+    /// the provider. Behaves identically to `plan_next` from the caller's
+    /// perspective: the next `push_observation` / `record_finish` will
+    /// attach to this synthetic iteration.
+    pub fn inject_assistant_dsl(&mut self, dsl: String) {
+        let inflight = self
+            .inflight
+            .as_mut()
+            .expect("inject_assistant_dsl with no in-flight turn");
+        inflight.iterations.push(Iteration {
+            assistant_dsl: dsl,
+            observation: None,
+        });
+    }
+
     /// Commit the in-flight turn as Finished. Consumes `inflight`.
-    /// The dsl arg must equal the last iteration's assistant_dsl (sanity
-    /// check); if not, we still commit but stamp a fresh iteration.
+    /// The dsl must match the last iteration's assistant_dsl (sanity
+    /// check). This invariant is maintained because of inject_assistant_dsl
+    /// is always called before record_finish for RawDsl paths.
     pub fn record_finish(&mut self, dsl: String, result: String) {
         let mut inflight = self
             .inflight
             .take()
-            .expect("record_finish with no in-flight turn");
-        // If the last iteration's DSL doesn't match, append a synthetic
-        // iteration for it. This handles the edge where RawDsl was used
-        // (planner never saw plan_next for this DSL).
-        let last_matches = inflight
-            .iterations
-            .last()
-            .is_some_and(|it| it.assistant_dsl == dsl);
-        if !last_matches {
-            inflight.iterations.push(Iteration {
-                assistant_dsl: dsl,
-                observation: None,
-            });
-        }
+            .expect("record_finish called without begin_user_turn");
+        let last = inflight.iterations.last_mut()
+            .expect("record_finish called before any iteration was recorded");
+        assert_eq!(last.assistant_dsl, dsl,
+            "record_finish dsl must match the last iteration's assistant_dsl");
+        assert!(last.observation.is_none(),
+            "record_finish called on an iteration that already has an observation");
         self.history.push(Turn {
             user_nl: inflight.user_nl,
             iterations: inflight.iterations,

@@ -6,7 +6,7 @@ use agnes_builtins::{ToolImpl, native_dispatch, register_builtins};
 use agnes_llm::{Planner, Provider, Turn};
 use agnes_registry::Registry;
 use agnes_runtime::execute_with;
-use agnes_types::{TypeExpr, TypeName, Value};
+use agnes_types::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,24 +55,48 @@ pub enum TurnInput {
     RawDsl(String),
 }
 
+/// Default upper bound on iterations per user turn. Rationale: Claude
+/// Code / LangGraph plan-and-execute defaults are 20-25. Each iteration
+/// can hold a full pipe/par expression so the effective tool-call
+/// budget is much higher.
+pub const DEFAULT_MAX_TURNS: u32 = 20;
+
+/// Observation text longer than this is truncated (middle-cut) before
+/// being fed back to the planner. Rationale: 2000-4000 tokens depending
+/// on language, matching Anthropic's tool_result guideline.
+pub const OBSERVATION_TRUNCATION_THRESHOLD: usize = 8000;
+
 pub struct Session {
     dispatch: HashMap<String, ToolImpl>,
     planner: Planner,
+    max_turns: u32,
 }
 
-const MAX_PLAN_RETRIES: u8 = 2;
+/// Helper to show a value using the builtins registry
+fn show_value(value: &Value) -> String {
+    let mut reg = Registry::new();
+    register_builtins(&mut reg).ok();
+    reg.show_value(value)
+}
 
 impl Session {
     pub fn new(provider: Arc<dyn Provider>) -> Result<Self, SessionError> {
-        // A template registry is used once, only to seed the planner's system
-        // prompt (Planner captures what it needs by reference at construction
-        // time). Each `run_turn` builds its own fresh per-turn Registry, so
-        // we deliberately drop this one at the end of `new`.
+        Self::new_with_max_turns(provider, DEFAULT_MAX_TURNS)
+    }
+
+    pub fn new_with_max_turns(
+        provider: Arc<dyn Provider>,
+        max_turns: u32,
+    ) -> Result<Self, SessionError> {
         let mut registry = Registry::new();
         register_builtins(&mut registry).map_err(|e| SessionError::Check(e.to_string()))?;
         let dispatch = native_dispatch(provider.clone());
         let planner = Planner::new(provider, &registry);
-        Ok(Self { dispatch, planner })
+        Ok(Self {
+            dispatch,
+            planner,
+            max_turns,
+        })
     }
 
     pub fn history(&self) -> &[Turn] {
@@ -93,6 +117,20 @@ impl Session {
         std::mem::take(&mut *w)
     }
 
+    /// Truncate an observation string to `OBSERVATION_TRUNCATION_THRESHOLD`
+    /// characters using a middle-cut, keeping the first and last quarters.
+    fn truncate_observation(text: String) -> String {
+        if text.chars().count() <= OBSERVATION_TRUNCATION_THRESHOLD {
+            return text;
+        }
+        let total_chars = text.chars().count();
+        let keep = OBSERVATION_TRUNCATION_THRESHOLD / 2;
+        let first: String = text.chars().take(keep).collect();
+        let last: String = text.chars().rev().take(keep).collect::<String>().chars().rev().collect();
+        let dropped = total_chars - 2 * keep;
+        format!("{first}\n\n... [truncated {dropped} chars — full length: {total_chars}] ...\n\n{last}")
+    }
+
     pub async fn run_turn(
         &mut self,
         input: TurnInput,
@@ -101,9 +139,6 @@ impl Session {
         match self.run_turn_inner(input, sink).await {
             Ok(v) => Ok(v),
             Err(e) => {
-                // Drain any pending write-file records so they don't leak
-                // into the next turn, and surface them alongside the
-                // failure event.
                 let recorded = Self::drain_writes();
                 if !recorded.is_empty() {
                     sink.emit(SessionEvent::WriteSummary { entries: recorded })
@@ -123,26 +158,123 @@ impl Session {
         input: TurnInput,
         sink: &mut dyn EventSink,
     ) -> Result<Value, SessionError> {
-        let dsl = match input {
-            TurnInput::RawDsl(s) => s,
-            TurnInput::NaturalLanguage(nl) => {
-                sink.emit(SessionEvent::PlannerStart).await;
-                self.plan_with_retries(&nl, sink).await?
-            }
+        // Seed: NL starts an in-flight planner turn; RawDsl provides
+        // iter=0's DSL directly and still opens a planner turn (so
+        // history is coherent for future turns).
+        let (user_nl, mut seeded_dsl) = match input {
+            TurnInput::NaturalLanguage(nl) => (nl, None),
+            TurnInput::RawDsl(s) => (format!("/run {s}"), Some(s)),
         };
-        sink.emit(SessionEvent::DslProduced {
-            source: dsl.clone(),
-        })
-        .await;
+        self.planner.begin_user_turn(user_nl);
 
-        // parse -> check -> compile
-        let program = agnes_parser::parse(&dsl).map_err(|e| SessionError::Parse(e.to_string()))?;
-        // A registry mutation-per-turn: apply top-levels of this program.
-        // For the MVP we do NOT persist `define`s across turns — each turn
-        // gets a fresh registry seeded with the builtins. This trades the
-        // "prior-turn defines visible to later turns" nicety for a much
-        // simpler correctness story (no duplicate-define NameConflict when
-        // the same DSL is re-run, no state that surprises the user).
+        let mut result = None;
+        let mut iter = 0;
+        while iter < self.max_turns && result.is_none() {
+            sink.emit(SessionEvent::IterationStart { iter }).await;
+
+            // Get the DSL for this iteration: either the seeded RawDsl
+            // (iter 0 only) or a fresh planner call.
+            let dsl = match seeded_dsl.take() {
+                Some(s) => {
+                    // We didn't go through plan_next, but the Planner still
+                    // needs to know about this assistant turn. Feed it in
+                    // synthetically: append an iteration whose assistant_dsl
+                    // is the raw source. push_observation / record_finish
+                    // in the branches below will operate on this iteration.
+                    self.planner.inject_assistant_dsl(s.clone());
+                    s
+                }
+                None => {
+                    sink.emit(SessionEvent::PlannerStart).await;
+                    self.planner.plan_next().await?
+                }
+            };
+            sink.emit(SessionEvent::DslProduced {
+                source: dsl.clone(),
+            })
+            .await;
+
+            // Try to execute this iteration.
+            let try_result = self.try_execute(&dsl, sink).await;
+
+            match try_result {
+                Ok(value) => {
+                    match classify_root(&value) {
+                        RootKind::Observation => {
+                            let inner_type = extract_inner_type(&value.declared_type);
+                            let raw = show_value(&value);
+                            let text = Self::truncate_observation(raw);
+                            sink.emit(SessionEvent::ObservationEmitted {
+                                iter,
+                                text: text.clone(),
+                                is_error: false,
+                            })
+                            .await;
+                            self.planner.push_observation(
+                                dsl.clone(),
+                                text,
+                                false,
+                                inner_type,
+                            );
+                            // Loop continues to next iteration
+                            iter += 1;
+                        }
+                        RootKind::Finish | RootKind::Other => {
+                            let s = show_value(&value);
+                            let recorded = Self::drain_writes();
+                            if !recorded.is_empty() {
+                                sink.emit(SessionEvent::WriteSummary { entries: recorded })
+                                    .await;
+                            }
+                            sink.emit(SessionEvent::TurnResult {
+                                value_preview: s.clone(),
+                                value_type: value.declared_type.to_string(),
+                            })
+                            .await;
+                            self.planner.record_finish(dsl, s);
+                            result = Some(Ok(value));
+                            // Loop terminates immediately
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let text = e.to_string();
+                    sink.emit(SessionEvent::ObservationEmitted {
+                        iter,
+                        text: text.clone(),
+                        is_error: true,
+                    })
+                    .await;
+                    self.planner.push_observation(dsl, text, true, None);
+                    // Loop continues; do NOT drain writes here — a failed
+                    // iteration should not leak writes into the next.
+                    let _ = Self::drain_writes();
+                    iter += 1;
+                }
+            }
+        }
+
+        if let Some(result) = result {
+            result
+        } else {
+            // Loop fell through — MAX_TURNS reached.
+            self.planner.abandon_pending_turn();
+            Err(SessionError::TurnLimitExceeded {
+                max_turns: self.max_turns,
+            })
+        }
+    }
+
+    /// One iteration: parse/check/compile/execute a DSL. Emits DslProduced
+    /// (already emitted by caller), PlanReady, NodeStart/NodeEnd via tracer.
+    async fn try_execute(
+        &mut self,
+        dsl: &str,
+        sink: &mut dyn EventSink,
+    ) -> Result<Value, SessionError> {
+        let program =
+            agnes_parser::parse(dsl).map_err(|e| SessionError::Parse(e.to_string()))?;
         let mut turn_registry = Registry::new();
         register_builtins(&mut turn_registry).map_err(|e| SessionError::Check(e.to_string()))?;
         turn_registry
@@ -152,14 +284,11 @@ impl Session {
             .map_err(|e| SessionError::Check(e.to_string()))?;
         let dag = agnes_compiler::compile(&program, &turn_registry)
             .map_err(|e| SessionError::Compile(e.to_string()))?;
-
         sink.emit(SessionEvent::PlanReady {
             tree: build_plan_tree(&dag),
         })
         .await;
-
         let (tracer, mut rx) = ChannelTracer::new();
-        // Poll the channel while the runtime executes.
         let exec = execute_with(&dag, &turn_registry, &self.dispatch, &tracer);
         tokio::pin!(exec);
         let result = loop {
@@ -170,72 +299,7 @@ impl Session {
                 }
             }
         };
-        // Final drain — pick up any events emitted after the last tick.
         drain(&mut rx, sink).await;
-
-        let v = result?;
-        let preview = if let Some(s) = v.data.as_str() {
-            let t: String = s.chars().take(120).collect();
-            format!("{t}{}", if s.len() > 120 { "…" } else { "" })
-        } else {
-            v.data.to_string()
-        };
-        // Drain the per-turn write-file recorder before the closing event
-        // so the sink sees `WriteSummary` immediately before `TurnResult`.
-        let recorded = Self::drain_writes();
-        if !recorded.is_empty() {
-            sink.emit(SessionEvent::WriteSummary { entries: recorded })
-                .await;
-        }
-        sink.emit(SessionEvent::TurnResult {
-            value_preview: preview.clone(),
-            value_type: v.declared_type.to_string(),
-        })
-        .await;
-        self.planner.record_result(dsl, preview);
-        Ok(v)
+        Ok(result?)
     }
-
-    async fn plan_with_retries(
-        &mut self,
-        nl: &str,
-        sink: &mut dyn EventSink,
-    ) -> Result<String, SessionError> {
-        let mut last_err = String::new();
-        for attempt in 0..=MAX_PLAN_RETRIES {
-            let dsl = self.planner.plan(nl).await?;
-            // Dry-run: parse/check/compile against a fresh registry so a
-            // planner attempt with a bad `define` cannot break anything.
-            let mut probe = Registry::new();
-            register_builtins(&mut probe).map_err(|e| SessionError::Check(e.to_string()))?;
-            match dry_run(&dsl, &mut probe) {
-                Ok(()) => return Ok(dsl),
-                Err(e) => {
-                    last_err = e.clone();
-                    if attempt < MAX_PLAN_RETRIES {
-                        sink.emit(SessionEvent::PlannerRetry {
-                            attempt: attempt + 1,
-                            error: e.clone(),
-                        })
-                        .await;
-                        self.planner.push_error_feedback(dsl, e);
-                    }
-                }
-            }
-        }
-        // The in-flight turn is unrecoverable — reset the planner's scratch
-        // buffer and pending NL so the next `plan()` call starts a fresh
-        // turn with a User-role-first message chain (F1 regression guard).
-        // Committed `history` is preserved.
-        self.planner.abandon_pending_turn();
-        Err(SessionError::TurnLimitExceeded { max_turns: (MAX_PLAN_RETRIES + 1) as u32 })
-    }
-}
-
-fn dry_run(dsl: &str, probe: &mut Registry) -> Result<(), String> {
-    let program = agnes_parser::parse(dsl).map_err(|e| e.to_string())?;
-    probe.load(&program).map_err(|e| e.to_string())?;
-    agnes_checker::check(&program, probe).map_err(|e| e.to_string())?;
-    let _ = agnes_compiler::compile(&program, probe).map_err(|e| e.to_string())?;
-    Ok(())
 }

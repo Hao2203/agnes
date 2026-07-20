@@ -16,9 +16,14 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
                 lit: Literal::Nil,
             });
         }
-        return Ok(Expr::Var {
+        // Any other bare symbol is treated as a tool call with zero arguments —
+        // this allows idiomatic pipe sequencing like (pipe input finish) where
+        // the last step just names the tool that needs the upstream input.
+        return Ok(Expr::Tool {
             span,
             name: sym.to_string(),
+            positional: vec![],
+            args: KwArgs::default(),
         });
     }
     if let Some(s) = v.as_str() {
