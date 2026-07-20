@@ -62,6 +62,9 @@ dependencies = [
 name = "agnes-llm"
 version = "0.1.0"
 dependencies = [
+ "agnes-builtins",
+ "agnes-registry",
+ "agnes-types",
  "async-trait",
  "dotenvy",
  "reqwest",

@@ -24,3 +24,12 @@ pub enum LlmError {
     #[error("Unknown provider `{name}`.\n  Fix: use one of: `anthropic`, `openai`.")]
     UnknownProvider { name: String },
 }
+
+#[derive(Debug, Error)]
+pub enum PlannerError {
+    #[error(transparent)]
+    Llm(#[from] LlmError),
+
+    #[error("planner produced empty response after DSL extraction")]
+    EmptyResponse,
+}

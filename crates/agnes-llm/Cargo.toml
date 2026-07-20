@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+agnes-registry.workspace = true
+agnes-types.workspace    = true
 async-trait.workspace = true
 dotenvy.workspace     = true
 reqwest.workspace     = true
@@ -16,3 +18,5 @@ tokio.workspace       = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+agnes-registry.workspace = true
+agnes-builtins.workspace = true
