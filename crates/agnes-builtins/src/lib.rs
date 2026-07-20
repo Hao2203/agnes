@@ -27,6 +27,10 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     reg.register_type("Int", None)?;
     reg.register_type("Bool", None)?;
 
+    // --- Wrapper types (used at runtime by finish/observe) ---
+    reg.register_type("Finish", None)?;
+    reg.register_type("Observation", None)?;
+
     // --- Show impls for built-in types ---
     for (name, f) in shows::BUILTIN_SHOWS {
         reg.register_show(name, *f)?;
@@ -117,5 +121,23 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
             provides: plaintext.clone(),
         },
     )?;
+
+    // --- Loop control tools ---
+    let unknown = TypeExpr::named("Unknown");
+    reg.register_tool(
+        "finish",
+        ToolSignature {
+            requires: vec![("input".into(), unknown.clone())],
+            provides: unknown.clone(),
+        },
+    )?;
+    reg.register_tool(
+        "observe",
+        ToolSignature {
+            requires: vec![("input".into(), unknown.clone())],
+            provides: unknown,
+        },
+    )?;
+
     Ok(())
 }

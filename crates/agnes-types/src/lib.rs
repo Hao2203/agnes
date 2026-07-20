@@ -148,6 +148,7 @@ impl Value {
 }
 
 /// Recursive matching. `actual` satisfies `expected` if:
+/// - `expected` is `Named(Unknown)` — wildcard (one-directional), OR
 /// - both are `Named` with the same name, OR
 /// - `expected` is a `|` union and any member matches `actual`, OR
 /// - both are same-head `App`s of equal arity and args match position-wise.
@@ -157,6 +158,11 @@ impl Value {
 /// `(| String Int)`.
 pub fn type_expr_matches(actual: &TypeExpr, expected: &TypeExpr) -> bool {
     match (actual, expected) {
+        // `Unknown` on the expected side is a wildcard: matches any actual
+        // type. Used by tool signatures like `finish :input Unknown -> Unknown`
+        // to accept arbitrary upstream data. One-directional: `Unknown` on
+        // the ACTUAL side still requires exact match on the expected side.
+        (_, TypeExpr::Named(n)) if n.0 == "Unknown" => true,
         (TypeExpr::Named(a), TypeExpr::Named(b)) => a == b,
         (_, TypeExpr::App { head, args }) if head.0 == "|" => {
             args.iter().any(|u| type_expr_matches(actual, u))

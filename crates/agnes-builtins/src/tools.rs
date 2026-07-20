@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use agnes_llm::{CompletionRequest, Message, Provider, Role};
-use agnes_types::Value;
+use agnes_types::{TypeExpr, TypeName, Value};
 use serde_json::Value as JsonValue;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -204,6 +204,44 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
             }),
         );
     }
+
+    // --- Loop control: finish / observe ---
+    // Both are identity on data but rewrite declared_type at the outer
+    // layer so Session::run_turn can classify the root shape.
+    m.insert(
+        "finish".to_string(),
+        Arc::new(|mut kw: HashMap<String, Value>| {
+            Box::pin(async move {
+                let inner = kw
+                    .remove("input")
+                    .ok_or_else(|| "finish requires :input".to_string())?;
+                Ok(Value {
+                    data: inner.data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("Finish".into()),
+                        args: vec![inner.declared_type],
+                    },
+                })
+            })
+        }),
+    );
+    m.insert(
+        "observe".to_string(),
+        Arc::new(|mut kw: HashMap<String, Value>| {
+            Box::pin(async move {
+                let inner = kw
+                    .remove("input")
+                    .ok_or_else(|| "observe requires :input".to_string())?;
+                Ok(Value {
+                    data: inner.data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("Observation".into()),
+                        args: vec![inner.declared_type],
+                    },
+                })
+            })
+        }),
+    );
 
     m
 }
