@@ -99,6 +99,15 @@ pub fn canonicalize_union(members: impl IntoIterator<Item = TypeExpr>) -> TypeEx
 /// Runtime type validator. Structural check only, no semantic guessing.
 pub type Validator = fn(&JsonValue) -> Result<(), String>;
 
+/// Function type for a `Show` implementation: takes a JSON value produced
+/// by some tool call and renders it into a human/LLM-readable string.
+///
+/// Registered in `agnes-registry` via `Registry::register_show`. Used by
+/// `Session::run_turn` at the end of each iteration to serialize the
+/// returned `Value` for either the user (Finish path) or the LLM
+/// (Observation path).
+pub type ShowFn = fn(&JsonValue) -> String;
+
 /// Tool signature after registry resolution.
 #[derive(Debug, Clone)]
 pub struct ToolSignature {
