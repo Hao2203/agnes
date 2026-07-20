@@ -14,13 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let provider = resolve_provider(&args.llm.to_opts()).map_err(|e| anyhow::anyhow!("{e}"))?;
     match args.cmd.unwrap_or(Command::Chat) {
-        Command::Chat => {
-            // Task 11 wires the REPL here.
-            eprintln!(
-                "chat REPL not implemented yet — Task 11 adds it. Use `agnes run <file>` for now."
-            );
-            Ok(())
-        }
+        Command::Chat => agnes_cli::chat::run(provider).await,
         Command::Run { file } => run_cmd::run_file(&file, provider).await,
     }
 }
