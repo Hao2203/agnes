@@ -74,10 +74,6 @@ LLM 使用这两个 tool 的**语义**：
 
 DSL 中的每个类型都需要能被序列化成"给人看/给 LLM 看"的字符串。为此在 `agnes-registry` 中新增 **Show typeclass** 机制：
 
-### 2.3 Show typeclass
-
-DSL 中的每个类型都需要能被序列化成"给人看/给 LLM 看"的字符串。为此在 `agnes-registry` 中新增 **Show typeclass** 机制：
-
 ```rust
 // agnes-types
 pub type ShowFn = fn(&JsonValue) -> String;
@@ -104,19 +100,25 @@ impl Registry {
 }
 ```
 
-builtins 提供内置类型的默认 show：
+builtins 提供内置类型的默认 show（对齐 `agnes-builtins::register_builtins` 现有注册表）：
 
 | 类型 | show 输出 |
 | --- | --- |
 | `PlainText` | `data.as_str()`（原样） |
 | `Summary` | `data.as_str()`（原样） |
-| `TranslatedText` | `data.as_str()` |
 | `Markdown` | `data.as_str()` |
-| `PDF` | `<PDF binary, N bytes>`（占位，因为 PDF 不该整体上下文化） |
+| `HTML` | `data.as_str()` |
+| `PDF` | `<PDF binary, N bytes>`（占位——不该整体上下文化） |
+| `Image` | `<Image binary, N bytes>`（占位） |
+| `JSON` | `serde_json::to_string_pretty(data)` |
+| `Path` | `data.as_str()` |
+| `String` | `data.as_str()` |
+| `Int` / `Bool` | `data.to_string()` |
 | `Unit` | `""`（空） |
-| `List T` | `"["` + `T.show(x)` 逗号连接 + `"]"` |
-| `Option T` | `T.show(x)` 或 `""` |
-| `Finish T` / `Observation T` | 递归到 `T.show` |
+| 内建组合 `List T` | `"["` + 内部元素 `show_value` 逗号连接 + `"]"`（在 `show_value` 里内建，不需要单独注册） |
+| 内建组合 `Option T`（即 `\| T Unit`） | `T.show(x)` 或 `""` |
+| 内建组合 `Finish T` / `Observation T` | 直接递归 `show_value` 到 T |
+| 内建组合 `\| ...`（union） | 按 runtime 数据形状挑一个成员的 show（fallback：按 union args 顺序尝试） |
 | 未注册的 `Named` | `serde_json::to_string_pretty(data)` 兜底 |
 
 未来自定义类型的作者应该注册自己的 show；不注册就用兜底。checker **不强制**要求每个类型有 show（避免过度约束），Session 层在需要序列化时才落地。
