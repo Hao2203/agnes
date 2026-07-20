@@ -1,35 +1,37 @@
+//! Planner tests: system prompt discipline + message construction with the
+//! new agent-loop state model. Round-trips go through MockProvider; no
+//! real network.
+
 use agnes_builtins::register_builtins;
-use agnes_llm::{MockProvider, Planner, Provider};
+use agnes_llm::{
+    CompletionRequest, Message, MockProvider, Planner, Provider, Role,
+};
 use agnes_registry::Registry;
+use agnes_types::TypeName;
 use std::sync::Arc;
 
-fn reg_with_builtins() -> Registry {
+fn reg() -> Registry {
     let mut r = Registry::new();
     register_builtins(&mut r).unwrap();
     r
 }
 
-#[tokio::test]
-async fn planner_returns_extracted_dsl() {
-    let raw = "Sure:\n\n```agnes\n(tool read-file :path \"README.md\")\n```";
-    let mock: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![raw.into()]));
-    let reg = reg_with_builtins();
-    let mut p = Planner::new(mock, &reg);
-    let dsl = p.plan("read the readme").await.unwrap();
-    assert_eq!(dsl, "(tool read-file :path \"README.md\")");
+fn planner_with(responses: Vec<String>) -> (Planner, Arc<MockProvider>) {
+    let r = reg();
+    let mock = Arc::new(MockProvider::new(responses));
+    let p = Planner::new(mock.clone() as Arc<dyn Provider>, &r);
+    (p, mock)
 }
 
 #[tokio::test]
-async fn planner_system_prompt_lists_every_tool() {
-    let mock = Arc::new(MockProvider::new(vec![
-        "```agnes\n(tool read-file :path \"a\")\n```".into(),
-    ]));
-    let reg = reg_with_builtins();
-    let mut p = Planner::new(mock.clone(), &reg);
-    let _ = p.plan("do stuff").await.unwrap();
+async fn system_prompt_lists_all_builtin_tools_including_finish_and_observe() {
+    let (mut p, mock) = planner_with(vec!["```agnes\n(pipe \"hi\" finish)\n```".into()]);
+    p.begin_user_turn("hi".into());
+    let _ = p.plan_next().await.unwrap();
     let seen = mock.seen();
-    let sys = seen[0].system.as_deref().unwrap();
-    for name in [
+    assert_eq!(seen.len(), 1);
+    let sys = seen[0].system.as_deref().unwrap_or("");
+    for name in &[
         "read-file",
         "write-file",
         "summarize",
@@ -37,153 +39,176 @@ async fn planner_system_prompt_lists_every_tool() {
         "ocr",
         "llm",
         "join-lines",
+        "finish",
+        "observe",
     ] {
-        assert!(sys.contains(name), "system prompt must list `{name}`; got: {sys}");
+        assert!(sys.contains(name), "system prompt missing tool `{name}`");
     }
 }
 
 #[tokio::test]
-async fn planner_feeds_error_back_on_retry() {
-    let mock = Arc::new(MockProvider::new(vec![
-        "```agnes\nBROKEN\n```".into(),
-        "```agnes\n(tool read-file :path \"README.md\")\n```".into(),
-    ]));
-    let reg = reg_with_builtins();
-    let mut p = Planner::new(mock.clone(), &reg);
-
-    let _ = p.plan("read readme").await.unwrap();
-    p.push_error_feedback("BROKEN".into(), "syntax error at 1:1".into());
-    let dsl2 = p.plan("read readme").await.unwrap();
-    assert_eq!(dsl2, "(tool read-file :path \"README.md\")");
-
-    let seen = mock.seen();
-    let second = &seen[1];
-    // The second call's message chain includes the previous bad DSL + the
-    // "That failed with:" user turn.
-    let chain: Vec<String> = second.messages.iter().map(|m| m.content.clone()).collect();
-    let joined = chain.join("\n---\n");
-    assert!(joined.contains("BROKEN"), "chain must carry the previous bad DSL; got: {joined}");
-    assert!(joined.contains("That failed with"), "chain must carry the error hint; got: {joined}");
-}
-
-#[tokio::test]
-async fn record_result_commits_a_turn_and_scratch_clears() {
-    let mock = Arc::new(MockProvider::new(vec![
-        "```agnes\n(tool ocr :source \"a.pdf\")\n```".into(),
-    ]));
-    let reg = reg_with_builtins();
-    let mut p = Planner::new(mock, &reg);
-    let _ = p.plan("ocr something").await.unwrap();
-    p.record_result(
-        "(tool ocr :source \"a.pdf\")".into(),
-        "Extracted text: ...".into(),
+async fn system_prompt_mentions_finish_and_observation_semantics() {
+    let (mut p, mock) = planner_with(vec!["```agnes\n(pipe \"hi\" finish)\n```".into()]);
+    p.begin_user_turn("hi".into());
+    let _ = p.plan_next().await.unwrap();
+    let sys = mock.seen()[0].system.clone().unwrap_or_default();
+    // The prompt must explain the loop.
+    assert!(
+        sys.contains("Finish") && sys.contains("Observation"),
+        "system prompt must reference Finish and Observation semantics"
     );
-    let hist = p.history();
-    assert_eq!(hist.len(), 1);
-    assert_eq!(hist[0].user_nl, "ocr something");
-    assert!(hist[0].assistant_dsl.contains("ocr"));
+    assert!(
+        sys.contains("<observation"),
+        "system prompt must show LLM the <observation> block format"
+    );
 }
 
 #[tokio::test]
-async fn retry_chain_has_no_consecutive_same_role_turns() {
-    // Regression guard: after `plan()` + `push_error_feedback()` + `plan()`,
-    // the second request's `messages` must strictly alternate roles.
-    // Anthropic's Messages API 400s on consecutive same-role turns.
-    use agnes_llm::Role;
-    let mock = Arc::new(MockProvider::new(vec![
-        "```agnes\nBROKEN\n```".into(),
-        "```agnes\n(tool read-file :path \"README.md\")\n```".into(),
-    ]));
-    let reg = reg_with_builtins();
-    let mut p = Planner::new(mock.clone(), &reg);
+async fn observation_message_uses_xml_wrapper_with_type_name() {
+    let (mut p, mock) = planner_with(vec![
+        "```agnes\n(pipe (tool summarize :input \"x\") observe)\n```".into(),
+        "```agnes\n(pipe \"done\" finish)\n```".into(),
+    ]);
+    p.begin_user_turn("do it".into());
+    let d1 = p.plan_next().await.unwrap();
+    p.push_observation(
+        d1,
+        "the summary".into(),
+        false,
+        Some(TypeName("Summary".into())),
+    );
+    let _d2 = p.plan_next().await.unwrap();
 
-    let _ = p.plan("read readme").await.unwrap();
-    p.push_error_feedback("BROKEN".into(), "syntax error at 1:1".into());
-    let _ = p.plan("read readme").await.unwrap();
+    // Second request's second-to-last message should be a user message
+    // wrapping the observation in XML with type="Summary".
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    let msgs2 = &seen[1].messages;
+    let obs_msg = msgs2
+        .iter()
+        .find(|m| matches!(m.role, Role::User) && m.content.contains("<observation"))
+        .expect("observation user message missing");
+    assert!(
+        obs_msg.content.contains("type=\"Summary\""),
+        "observation message missing type=\"Summary\": {}",
+        obs_msg.content
+    );
+    assert!(obs_msg.content.contains("the summary"));
+}
+
+#[tokio::test]
+async fn error_observation_uses_error_true_attribute() {
+    let (mut p, mock) = planner_with(vec![
+        "```agnes\n(pipe (tool bogus) observe)\n```".into(),
+        "```agnes\n(pipe \"ok\" finish)\n```".into(),
+    ]);
+    p.begin_user_turn("do it".into());
+    let d1 = p.plan_next().await.unwrap();
+    p.push_observation(d1, "parse: unknown tool 'bogus'".into(), true, None);
+    let _ = p.plan_next().await.unwrap();
 
     let seen = mock.seen();
-    let second = &seen[1];
-    let roles: Vec<Role> = second.messages.iter().map(|m| m.role).collect();
+    let msgs2 = &seen[1].messages;
+    let err_msg = msgs2
+        .iter()
+        .find(|m| matches!(m.role, Role::User) && m.content.contains("<observation"))
+        .expect("error observation message missing");
+    assert!(err_msg.content.contains("error=\"true\""));
+    // Error observations MUST NOT include a type attribute.
+    assert!(!err_msg.content.contains("type=\""));
+    assert!(err_msg.content.contains("unknown tool 'bogus'"));
+}
+
+#[tokio::test]
+async fn message_chain_alternates_roles_after_multiple_iterations() {
+    // Regression guard: consecutive same-role messages break Anthropic API.
+    // With observations interleaved, the chain must strictly alternate.
+    let (mut p, mock) = planner_with(vec![
+        "```agnes\n(pipe X observe)\n```".into(),
+        "```agnes\n(pipe Y observe)\n```".into(),
+        "```agnes\n(pipe \"done\" finish)\n```".into(),
+    ]);
+    p.begin_user_turn("try it".into());
+    let d1 = p.plan_next().await.unwrap();
+    p.push_observation(d1, "A".into(), false, None);
+    let d2 = p.plan_next().await.unwrap();
+    p.push_observation(d2, "B".into(), false, None);
+    let _ = p.plan_next().await.unwrap();
+
+    let seen = mock.seen();
+    let last = &seen[seen.len() - 1].messages;
+    // Roles must alternate: user, assistant, user, assistant, user, assistant, user.
+    let roles: Vec<_> = last.iter().map(|m| m.role).collect();
     for pair in roles.windows(2) {
         assert_ne!(
             pair[0], pair[1],
-            "messages must strictly alternate roles; got: {roles:?}"
+            "consecutive same-role messages: {roles:?}"
         );
     }
-    // Sanity: the retry still carries the bad DSL and the error hint.
-    let joined = second
-        .messages
-        .iter()
-        .map(|m| m.content.clone())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
-    assert!(joined.contains("BROKEN"), "chain must carry bad DSL");
-    assert!(
-        joined.contains("That failed with"),
-        "chain must carry error hint"
-    );
+    // And the last message before this LLM call must be a user (the observation).
+    assert_eq!(*roles.last().unwrap(), Role::User);
 }
 
 #[tokio::test]
-async fn abandon_pending_turn_resets_scratch_for_fresh_nl() {
-    // Regression guard (I2): after exhaustion of a plan retry loop the
-    // caller must be able to abandon the in-flight turn and start over
-    // with a new NL. The next `plan()`'s request messages must strictly
-    // alternate roles (Anthropic 400s otherwise), start with a User turn,
-    // and the message chain must NOT contain the previous NL text.
-    use agnes_llm::Role;
-    let mock = Arc::new(MockProvider::new(vec![
-        "```agnes\nBROKEN1\n```".into(),
-        "```agnes\nBROKEN2\n```".into(),
-        "```agnes\nBROKEN3\n```".into(),
-        "```agnes\n(tool read-file :path \"README.md\")\n```".into(),
-    ]));
-    let reg = reg_with_builtins();
-    let mut p = Planner::new(mock.clone(), &reg);
+async fn committed_history_replays_in_subsequent_turns() {
+    let (mut p, mock) = planner_with(vec![
+        "```agnes\n(pipe \"first\" finish)\n```".into(),
+        "```agnes\n(pipe \"second\" finish)\n```".into(),
+    ]);
+    p.begin_user_turn("turn 1".into());
+    let d1 = p.plan_next().await.unwrap();
+    p.record_finish(d1, "first".into());
 
-    // Three exhausted plan attempts on `nl1`.
-    let _ = p.plan("first goal").await.unwrap();
-    p.push_error_feedback("BROKEN1".into(), "err1".into());
-    let _ = p.plan("first goal").await.unwrap();
-    p.push_error_feedback("BROKEN2".into(), "err2".into());
-    let _ = p.plan("first goal").await.unwrap();
-    p.push_error_feedback("BROKEN3".into(), "err3".into());
+    p.begin_user_turn("turn 2".into());
+    let _ = p.plan_next().await.unwrap();
 
-    // Caller decides the turn cannot recover.
-    p.abandon_pending_turn();
-
-    // Fresh NL — this is the request under test.
-    let _ = p.plan("second goal").await.unwrap();
     let seen = mock.seen();
-    let fresh = seen.last().unwrap();
-    let roles: Vec<Role> = fresh.messages.iter().map(|m| m.role).collect();
-    assert_eq!(
-        roles.first().copied(),
-        Some(Role::User),
-        "message chain must start with a User turn; got: {roles:?}"
-    );
-    for pair in roles.windows(2) {
-        assert_ne!(
-            pair[0], pair[1],
-            "messages must strictly alternate roles; got: {roles:?}"
-        );
-    }
-    let joined = fresh
-        .messages
+    let msgs2 = &seen[1].messages;
+    // Should see turn 1's user_nl, assistant DSL, and turn 2's user_nl.
+    let has_turn1_user = msgs2
         .iter()
-        .map(|m| m.content.clone())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
+        .any(|m| m.content == "turn 1" && matches!(m.role, Role::User));
+    let has_turn1_assistant = msgs2
+        .iter()
+        .any(|m| m.content.contains("first") && matches!(m.role, Role::Assistant));
+    let has_turn2_user = msgs2
+        .iter()
+        .any(|m| m.content == "turn 2" && matches!(m.role, Role::User));
+    assert!(has_turn1_user, "history missing turn 1 user_nl");
+    assert!(has_turn1_assistant, "history missing turn 1 assistant DSL");
+    assert!(has_turn2_user, "history missing turn 2 user_nl");
+}
+
+#[tokio::test]
+async fn old_turns_beyond_six_collapse_into_prior_context() {
+    // Build 8 responses so we can commit 7 turns before the 8th; only
+    // the last 6 should appear verbatim; the first 1 should be in the
+    // prior-context prefix.
+    let responses: Vec<String> = (0..8)
+        .map(|i| format!("```agnes\n(pipe \"turn{i}\" finish)\n```"))
+        .collect();
+    let (mut p, mock) = planner_with(responses);
+    for i in 0..7 {
+        p.begin_user_turn(format!("nl {i}"));
+        let d = p.plan_next().await.unwrap();
+        p.record_finish(d, format!("result {i}"));
+    }
+    // 8th turn — the system prompt at this call should include the prior-
+    // context prefix for turn 0 only.
+    p.begin_user_turn("nl 7".into());
+    let _ = p.plan_next().await.unwrap();
+    let seen = mock.seen();
+    let sys8 = seen[7].system.clone().unwrap_or_default();
     assert!(
-        !joined.contains("first goal"),
-        "abandoned NL must NOT leak into the next turn; got: {joined}"
+        sys8.contains("<prior context:"),
+        "system prompt missing prior-context prefix on 8th turn: {sys8}"
     );
-    assert!(
-        !joined.contains("That failed with"),
-        "abandoned error feedback must NOT leak into the next turn; got: {joined}"
-    );
-    assert!(
-        joined.contains("second goal"),
-        "fresh NL must appear in the request; got: {joined}"
-    );
+    assert!(sys8.contains("nl 0"), "prior context should reference turn 0");
+    // But turn 1 (the second one) should NOT be summarized — it should
+    // still be verbatim in messages.
+    let msgs8 = &seen[7].messages;
+    let has_nl1_user = msgs8
+        .iter()
+        .any(|m| m.content == "nl 1" && matches!(m.role, Role::User));
+    assert!(has_nl1_user, "turn 1 should still be in messages verbatim");
 }

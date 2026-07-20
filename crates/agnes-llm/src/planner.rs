@@ -197,14 +197,35 @@ impl Planner {
     }
 
     fn effective_system(&self) -> String {
-        // For now just return base_system. Task 7 will add the "prior context"
-        // summary logic.
-        self.base_system.clone()
+        let n = self.history.len();
+        if n <= MAX_TURNS_VERBATIM {
+            return self.base_system.clone();
+        }
+        let extras: &[Turn] = &self.history[..n - MAX_TURNS_VERBATIM];
+        let mut prefix = String::from("<prior context:\n");
+        for t in extras {
+            let iters = t.iterations.len();
+            let outcome = match &t.outcome {
+                TurnOutcome::Finished { result } => {
+                    format!("finished ({} chars)", result.chars().count())
+                }
+                TurnOutcome::TurnLimitExceeded => "turn-limit-exceeded".to_string(),
+            };
+            prefix.push_str(&format!(
+                "  - user asked {:?}: {iters} iteration(s), outcome: {outcome}\n",
+                t.user_nl,
+            ));
+        }
+        prefix.push_str(">\n\n");
+        prefix.push_str(&self.base_system);
+        prefix
     }
 
     fn build_messages(&self) -> Vec<Message> {
         let mut out = Vec::new();
-        for turn in &self.history {
+        let n = self.history.len();
+        let start = n.saturating_sub(MAX_TURNS_VERBATIM);
+        for turn in &self.history[start..] {
             out.push(Message {
                 role: Role::User,
                 content: turn.user_nl.clone(),
@@ -261,23 +282,12 @@ fn wrap_observation(obs: &Observation) -> String {
     }
 }
 
-fn build_system_prompt(registry: &Registry) -> String {
-    let mut s = String::new();
-    s.push_str("You are the agnes DSL planner. Given a user goal, produce an agnes program that achieves it using the registered tools.\n\n");
-    s.push_str("Output ONLY an ```agnes fenced code block containing the program — no prose, no explanation.\n\n");
-    s.push_str("agnes forms:\n");
-    s.push_str("  (pipe expr1 expr2 ...)                 sequential flow; each step's output becomes the next step's implicit input\n");
-    s.push_str("  (par branch1 branch2 ...)              parallel branches; each branch's value is discarded (use `let` inside)\n");
-    s.push_str("  (let name expr)                        bind expr's value to `name` (or bind the piped-in value if expr omitted)\n");
-    s.push_str("  (tool NAME :key value :key value ...)  call a tool; kwargs match the tool's `requires` param names\n");
-    s.push_str("  (list e1 e2 ...)                       or bracket literal [e1 e2 ...]\n");
-    s.push_str("  (if cond then else) / (match scrutinee (pat arm) ...) / (retry N body) / (catch body fallback)\n");
-    s.push_str("  Literals: strings \"...\", ints, true/false, nil.\n\n");
-    s.push_str("Registered tools:\n");
-    // The registry doesn't expose iteration; we synthesize the catalog by
-    // asking for each known tool name in a fixed order. In practice all
-    // callers register the 7 builtins, so this list matches.
-    for name in [
+fn build_system_prompt(reg: &Registry) -> String {
+    // Tool catalog: iterate the fixed list of builtin tools in a
+    // stable order. Registry does not expose iteration; naming
+    // the tools explicitly is a deliberate choice for prompt
+    // determinism.
+    const BUILTIN_TOOL_ORDER: &[&str] = &[
         "read-file",
         "write-file",
         "summarize",
@@ -285,18 +295,62 @@ fn build_system_prompt(registry: &Registry) -> String {
         "ocr",
         "llm",
         "join-lines",
-    ] {
-        if let Some(sig) = registry.tool_signature(name) {
-            s.push_str(&format!("  {name} :: {}\n", format_sig(sig)));
+        "finish",
+        "observe",
+    ];
+    let mut catalog = String::new();
+    for name in BUILTIN_TOOL_ORDER {
+        if let Some(sig) = reg.tool_signature(name) {
+            catalog.push_str(&format!("  - {} :", name));
+            for (pname, pty) in &sig.requires {
+                catalog.push_str(&format!(" :{pname} {pty}"));
+            }
+            catalog.push_str(&format!("  ->  {}\n", sig.provides));
         }
     }
-    s.push('\n');
-    s.push_str("Examples:\n\n");
-    s.push_str("  goal: read the readme and summarize it\n");
-    s.push_str("  ```agnes\n  (pipe (tool read-file :path \"README.md\") (tool summarize))\n  ```\n\n");
-    s.push_str("  goal: translate the readme into Japanese and English, then join\n");
-    s.push_str("  ```agnes\n  (pipe\n    (par\n      (let ja (pipe (tool read-file :path \"README.md\") (tool translate :lang \"ja\")))\n      (let en (pipe (tool read-file :path \"README.md\") (tool translate :lang \"en\"))))\n    (tool join-lines :lines [ja en]))\n  ```\n");
-    s
+
+    format!(r#"You are the planning brain of an agnes agent. Each turn you produce
+one agnes DSL expression as an ```agnes fenced block. That expression will
+be parsed, type-checked, compiled, and executed by the runtime.
+
+Loop protocol:
+  * If your expression's result is wrapped as `(Observation T)` — e.g.
+    the outermost tool call is `observe` — the runtime feeds the rendered
+    result back to you on the next turn as a `<observation type="T">...</observation>`
+    block, and you produce another DSL expression.
+  * If the result is wrapped as `(Finish T)` — outer tool is `finish` —
+    the rendered result is shown to the user and the turn ENDS.
+  * If the result is neither `Finish` nor `Observation` (any plain type),
+    the runtime treats it as an IMPLICIT finish: shows to user, turn ends.
+    So unlabeled DSL still works; you only *need* `observe` when you want
+    to see the result and continue.
+  * On error (parse/check/compile/execute), you receive
+    `<observation error="true">...</observation>` and should produce a
+    corrected DSL on the next turn.
+
+Available builtin tools:
+{catalog}
+Rules:
+  1. Produce EXACTLY ONE fenced ```agnes block per turn. No prose outside.
+  2. Prefer `finish` at the tail to make your intent explicit; unlabeled
+     is allowed but observability suffers.
+  3. Use `observe` when you need to see the result to decide the next step.
+  4. Do not invent tools not in the catalog above; the checker will reject.
+
+Examples (each is a complete turn):
+
+```agnes
+(pipe (tool read-file :path "notes.md") (tool summarize) finish)
+```
+
+```agnes
+(pipe (tool read-file :path "log.txt") (tool summarize) observe)
+```
+
+```agnes
+(pipe "task complete" finish)
+```
+"#)
 }
 
 fn format_sig(sig: &ToolSignature) -> String {
