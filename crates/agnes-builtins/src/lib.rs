@@ -4,7 +4,7 @@ mod aliases;
 mod tools;
 mod types;
 
-pub use tools::{BoxFuture, ToolImpl, native_dispatch};
+pub use tools::{BoxFuture, ToolImpl, native_dispatch, writes};
 
 use agnes_registry::{Registry, RegistryError};
 use agnes_types::{ToolSignature, TypeExpr, TypeName, canonicalize_union};

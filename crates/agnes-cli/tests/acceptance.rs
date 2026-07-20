@@ -14,15 +14,21 @@ use agnes_compiler::compile;
 use agnes_parser::parse;
 use agnes_registry::Registry;
 use agnes_runtime::execute;
+use std::sync::Arc;
 
 async fn run(src: &str) -> Result<String, String> {
+    run_with(src, vec![]).await
+}
+
+async fn run_with(src: &str, responses: Vec<String>) -> Result<String, String> {
     let mut reg = Registry::new();
     register_builtins(&mut reg).map_err(|e| format!("{e}"))?;
     let program = parse(src).map_err(|e| format!("{e}"))?;
     reg.load(&program).map_err(|e| format!("{e}"))?;
     check(&program, &reg).map_err(|e| format!("{e}"))?;
     let dag = compile(&program, &reg).map_err(|e| format!("{e}"))?;
-    let dispatch = native_dispatch();
+    let mock: Arc<dyn agnes_llm::Provider> = Arc::new(agnes_llm::MockProvider::new(responses));
+    let dispatch = native_dispatch(mock);
     let value = execute(&dag, &reg, &dispatch)
         .await
         .map_err(|e| format!("{e}"))?;
@@ -30,15 +36,9 @@ async fn run(src: &str) -> Result<String, String> {
 }
 
 async fn seed_readme() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "agnes-acceptance-readme-{}-{n}.md",
-        std::process::id()
-    ));
-    tokio::fs::write(&path, "hello world\n").await.unwrap();
-    path.to_string_lossy().into_owned()
+    // Mock read-file has a seeded "README.md" entry; using that path avoids
+    // touching disk in tests.
+    "README.md".to_string()
 }
 
 #[tokio::test]
@@ -58,12 +58,17 @@ async fn positive_full_demo_runs() {
   (tool join-lines :lines [ja ja]))
 "#
     );
-    let out = run(&src).await.expect("full-demo workflow must succeed");
+    // One translate call per read-and-translate invocation.
+    let out = run_with(
+        &src,
+        vec!["[TRANSLATED to ja] agnes".into()],
+    )
+    .await
+    .expect("full-demo workflow must succeed");
     assert!(
         out.contains("[TRANSLATED"),
         "expected translated content in joined output, got: {out}"
     );
-    let _ = tokio::fs::remove_file(&readme).await;
 }
 
 #[tokio::test]
@@ -77,8 +82,8 @@ async fn positive_join_lines_with_list_literal() {
     );
     let out = run(&src).await.expect("join-lines must succeed");
     // The mock implementation of join-lines concatenates array elements with '\n'.
-    assert!(out.contains("hello world"), "got: {out}");
-    let _ = tokio::fs::remove_file(&readme).await;
+    // The mock README fixture contains "agnes".
+    assert!(out.contains("agnes"), "got: {out}");
 }
 
 #[tokio::test]
@@ -90,7 +95,9 @@ async fn positive_option_string_declares_param() {
           (tool llm :prompt "greet" :input "hi"))
         (tool maybe-greet :name "world")
     "#;
-    let out = run(src).await.expect("Option String param must work");
+    let out = run_with(src, vec!["[LLM greeted world]".into()])
+        .await
+        .expect("Option String param must work");
     assert!(out.contains("[LLM"), "got: {out}");
 }
 
@@ -103,7 +110,9 @@ async fn positive_option_string_accepts_nil() {
           (tool llm :prompt "greet" :input "hi"))
         (tool maybe-greet :name nil)
     "#;
-    let out = run(src).await.expect("Option String param must accept nil");
+    let out = run_with(src, vec!["[LLM greeted]".into()])
+        .await
+        .expect("Option String param must accept nil");
     assert!(out.contains("[LLM"), "got: {out}");
 }
 

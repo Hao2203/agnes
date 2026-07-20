@@ -19,3 +19,4 @@ tracing.workspace = true
 [dev-dependencies]
 agnes-parser.workspace = true
 agnes-checker.workspace = true
+agnes-llm.workspace = true

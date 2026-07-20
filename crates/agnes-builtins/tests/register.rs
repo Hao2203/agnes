@@ -1,5 +1,6 @@
 use agnes_builtins::{native_dispatch, register_builtins};
 use agnes_registry::Registry;
+use std::sync::Arc;
 
 #[test]
 fn registers_all_builtins() {
@@ -15,7 +16,8 @@ fn registers_all_builtins() {
 
 #[test]
 fn native_dispatch_has_all_impls() {
-    let d = native_dispatch();
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let d = native_dispatch(mock);
     for name in [
         "read-file",
         "write-file",
@@ -37,6 +39,7 @@ fn join_lines_registered() {
 
 #[test]
 fn native_dispatch_has_join_lines() {
-    let d = native_dispatch();
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let d = native_dispatch(mock);
     assert!(d.contains_key("join-lines"));
 }

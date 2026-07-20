@@ -4,55 +4,49 @@ use agnes_compiler::compile;
 use agnes_parser::parse;
 use agnes_registry::Registry;
 use agnes_runtime::execute;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn runs_read_then_summarize() {
-    let tmp = tempfile_path();
-    tokio::fs::write(&tmp, "hello world").await.unwrap();
-
-    let src = format!(r#"(pipe (tool read-file :path "{tmp}") (tool summarize))"#);
+    let src = r#"(pipe (tool read-file :path "README.md") (tool summarize))"#;
     let mut r = Registry::new();
     register_builtins(&mut r).unwrap();
 
-    let p = parse(&src).unwrap();
+    let p = parse(src).unwrap();
     r.load(&p).unwrap();
     check(&p, &r).unwrap();
     let dag = compile(&p, &r).unwrap();
-    let dispatch = native_dispatch();
+
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
+    let dispatch = native_dispatch(mock);
     let out = execute(&dag, &r, &dispatch).await.expect("run ok");
     let s = out.data.as_str().expect("string result");
-    assert!(s.starts_with("[SUMMARY of"), "got: {s}");
-    let _ = tokio::fs::remove_file(&tmp).await;
+    assert_eq!(s, "[SUMMARY]");
 }
 
 #[tokio::test]
 async fn runs_a_defined_compound_tool() {
-    let tmp = std::env::temp_dir().join(format!("agnes-define-test-{}.txt", std::process::id()));
-    tokio::fs::write(&tmp, "content").await.unwrap();
-    let src = format!(
-        r#"
+    let src = r#"
         (define read-and-summarize
           :params [(path Path)]
           :provides Summary
           (pipe
             (tool read-file :path path)
             (tool summarize)))
-        (tool read-and-summarize :path "{}")
-    "#,
-        tmp.display()
-    );
+        (tool read-and-summarize :path "README.md")
+    "#;
 
     let mut r = agnes_registry::Registry::new();
     agnes_builtins::register_builtins(&mut r).unwrap();
-    let p = agnes_parser::parse(&src).unwrap();
+    let p = agnes_parser::parse(src).unwrap();
     r.load(&p).unwrap();
     agnes_checker::check(&p, &r).unwrap();
     let dag = agnes_compiler::compile(&p, &r).unwrap();
-    let dispatch = agnes_builtins::native_dispatch();
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
+    let dispatch = agnes_builtins::native_dispatch(mock);
     let out = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
     let s = out.data.as_str().unwrap();
-    assert!(s.starts_with("[SUMMARY of"), "got: {s}");
-    let _ = tokio::fs::remove_file(&tmp).await;
+    assert_eq!(s, "[SUMMARY]");
 }
 
 #[tokio::test]
@@ -64,7 +58,8 @@ async fn evaluates_list_literal() {
     r.load(&p).unwrap();
     agnes_checker::check(&p, &r).unwrap();
     let dag = agnes_compiler::compile(&p, &r).unwrap();
-    let dispatch = agnes_builtins::native_dispatch();
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let dispatch = agnes_builtins::native_dispatch(mock);
     let out = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
     let arr = out.data.as_array().expect("array result");
     assert_eq!(arr.len(), 3);
@@ -93,7 +88,8 @@ async fn boundary_validates_list_of_string_at_runtime() {
     // sure the checker + compiler accept the parameterized signature and
     // that runtime boundary validation doesn't panic before reaching dispatch.
     let dag = agnes_compiler::compile(&p, &r).unwrap();
-    let dispatch = agnes_builtins::native_dispatch();
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let dispatch = agnes_builtins::native_dispatch(mock);
     let err = agnes_runtime::execute(&dag, &r, &dispatch)
         .await
         .unwrap_err();
@@ -124,35 +120,22 @@ async fn boundary_validates_list_of_union_at_runtime() {
     //
     // join-lines requires (List (| PlainText Markdown)). Feeding a list of
     // two read-file outputs (both PlainText) must succeed end-to-end.
-    let tmp = std::env::temp_dir().join(format!("agnes-boundary-union-{}.md", std::process::id()));
-    tokio::fs::write(&tmp, "hello world\n").await.unwrap();
-    let src = format!(
-        r#"
+    let src = r#"
         (pipe
-          (let a (tool read-file :path "{p}"))
+          (let a (tool read-file :path "README.md"))
           (tool join-lines :lines [a a]))
-        "#,
-        p = tmp.display()
-    );
+        "#;
     let mut r = agnes_registry::Registry::new();
     agnes_builtins::register_builtins(&mut r).unwrap();
-    let p = agnes_parser::parse(&src).unwrap();
+    let p = agnes_parser::parse(src).unwrap();
     r.load(&p).unwrap();
     agnes_checker::check(&p, &r).unwrap();
     let dag = agnes_compiler::compile(&p, &r).unwrap();
-    let dispatch = agnes_builtins::native_dispatch();
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let dispatch = agnes_builtins::native_dispatch(mock);
     let out = agnes_runtime::execute(&dag, &r, &dispatch)
         .await
         .expect("List (| PlainText Markdown) boundary must accept PlainText elements");
     let s = out.data.as_str().expect("string result");
-    assert!(s.contains("hello world"), "got: {s}");
-    let _ = tokio::fs::remove_file(&tmp).await;
-}
-
-fn tempfile_path() -> String {
-    let dir = std::env::temp_dir();
-    let stamp = std::process::id();
-    dir.join(format!("agnes-test-{stamp}.txt"))
-        .to_string_lossy()
-        .into_owned()
+    assert!(s.contains("agnes"), "got: {s}");
 }

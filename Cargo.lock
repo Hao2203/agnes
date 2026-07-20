@@ -10,6 +10,7 @@ version = "0.1.0"
 name = "agnes-builtins"
 version = "0.1.0"
 dependencies = [
+ "agnes-llm",
  "agnes-registry",
  "agnes-types",
  "anyhow",
@@ -36,6 +37,7 @@ dependencies = [
  "agnes-builtins",
  "agnes-checker",
  "agnes-compiler",
+ "agnes-llm",
  "agnes-parser",
  "agnes-registry",
  "agnes-runtime",
@@ -96,6 +98,7 @@ dependencies = [
  "agnes-builtins",
  "agnes-checker",
  "agnes-compiler",
+ "agnes-llm",
  "agnes-parser",
  "agnes-registry",
  "agnes-types",
