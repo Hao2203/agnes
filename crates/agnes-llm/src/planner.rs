@@ -80,10 +80,16 @@ impl Planner {
     }
 
     pub fn push_error_feedback(&mut self, bad_dsl: String, err: String) {
-        // The most recent scratch entry is the assistant's DSL; the caller
-        // may have already popped it via `plan`. Overwrite/replace as needed.
-        // Simpler: append a fresh assistant echo and a user follow-up.
-        self.scratch.push(Scratch::Assistant(bad_dsl));
+        // After a successful `plan()` the scratch tail is an assistant DSL
+        // entry. Replace it with `bad_dsl` (rather than appending a fresh
+        // assistant turn) so the message chain does not end up with two
+        // consecutive assistant turns — some Messages APIs (Anthropic) 400
+        // on that shape. If the tail is not an assistant entry (defensive),
+        // fall back to appending.
+        match self.scratch.last_mut() {
+            Some(Scratch::Assistant(slot)) => *slot = bad_dsl,
+            _ => self.scratch.push(Scratch::Assistant(bad_dsl)),
+        }
         self.scratch.push(Scratch::User(format!(
             "That failed with: {err}\n\nFix and try again; output only the corrected DSL inside a ```agnes fenced block."
         )));

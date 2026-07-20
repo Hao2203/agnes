@@ -83,3 +83,43 @@ async fn record_result_commits_a_turn_and_scratch_clears() {
     assert_eq!(hist[0].user_nl, "ocr something");
     assert!(hist[0].assistant_dsl.contains("ocr"));
 }
+
+#[tokio::test]
+async fn retry_chain_has_no_consecutive_same_role_turns() {
+    // Regression guard: after `plan()` + `push_error_feedback()` + `plan()`,
+    // the second request's `messages` must strictly alternate roles.
+    // Anthropic's Messages API 400s on consecutive same-role turns.
+    use agnes_llm::Role;
+    let mock = Arc::new(MockProvider::new(vec![
+        "```agnes\nBROKEN\n```".into(),
+        "```agnes\n(tool read-file :path \"README.md\")\n```".into(),
+    ]));
+    let reg = reg_with_builtins();
+    let mut p = Planner::new(mock.clone(), &reg);
+
+    let _ = p.plan("read readme").await.unwrap();
+    p.push_error_feedback("BROKEN".into(), "syntax error at 1:1".into());
+    let _ = p.plan("read readme").await.unwrap();
+
+    let seen = mock.seen();
+    let second = &seen[1];
+    let roles: Vec<Role> = second.messages.iter().map(|m| m.role).collect();
+    for pair in roles.windows(2) {
+        assert_ne!(
+            pair[0], pair[1],
+            "messages must strictly alternate roles; got: {roles:?}"
+        );
+    }
+    // Sanity: the retry still carries the bad DSL and the error hint.
+    let joined = second
+        .messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    assert!(joined.contains("BROKEN"), "chain must carry bad DSL");
+    assert!(
+        joined.contains("That failed with"),
+        "chain must carry error hint"
+    );
+}
