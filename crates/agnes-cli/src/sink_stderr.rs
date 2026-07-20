@@ -111,6 +111,11 @@ impl EventSink for StderrEventSink {
                     );
                 }
             }
+            _ => {
+                // Future SessionEvent variants render nothing by default.
+                // Task 12 will add specific handlers for IterationStart and
+                // ObservationEmitted; anything else stays silent.
+            }
         }
     }
 }

@@ -7,6 +7,7 @@ pub enum NodeKindTag {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SessionEvent {
     PlannerStart,
     PlannerRetry {
