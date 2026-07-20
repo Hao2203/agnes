@@ -20,4 +20,7 @@ pub enum LlmError {
         env_var: &'static str,
         flag: &'static str,
     },
+
+    #[error("Unknown provider `{name}`.\n  Fix: use one of: `anthropic`, `openai`.")]
+    UnknownProvider { name: String },
 }
