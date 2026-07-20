@@ -43,6 +43,20 @@ pub enum SessionEvent {
     WriteSummary {
         entries: Vec<(String, usize)>,
     },
+
+    /// Emitted at the start of each planner↔runtime iteration in a turn.
+    /// `iter` is 0-indexed.
+    IterationStart { iter: u32 },
+
+    /// Emitted when the current iteration's result is fed back to the
+    /// planner as an observation (i.e. runtime returned Observation _
+    /// or errored). `is_error=true` means the runtime threw a
+    /// parse/check/compile/execute error rather than emitting a value.
+    ObservationEmitted {
+        iter: u32,
+        text: String,
+        is_error: bool,
+    },
 }
 
 #[async_trait::async_trait]

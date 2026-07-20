@@ -6,9 +6,49 @@ use agnes_builtins::{ToolImpl, native_dispatch, register_builtins};
 use agnes_llm::{Planner, Provider, Turn};
 use agnes_registry::Registry;
 use agnes_runtime::execute_with;
-use agnes_types::Value;
+use agnes_types::{TypeExpr, TypeName, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Which "root shape" a Value carries — the classification used by the
+/// agent loop to decide whether to terminate (Finish/Other) or feed
+/// back to the planner (Observation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootKind {
+    Finish,
+    Observation,
+    Other,
+}
+
+/// Read `value.declared_type`'s outermost head; classify accordingly.
+pub fn classify_root(value: &agnes_types::Value) -> RootKind {
+    use agnes_types::TypeExpr;
+    match &value.declared_type {
+        TypeExpr::App { head, args } if args.len() == 1 => match head.0.as_str() {
+            "Finish" => RootKind::Finish,
+            "Observation" => RootKind::Observation,
+            _ => RootKind::Other,
+        },
+        _ => RootKind::Other,
+    }
+}
+
+/// For a Finish/Observation wrapper type, return the outermost name of
+/// the inner type (for use as the `type="..."` attribute in observation
+/// XML). Returns `None` for non-wrapper types.
+pub fn extract_inner_type(t: &agnes_types::TypeExpr) -> Option<agnes_types::TypeName> {
+    use agnes_types::TypeExpr;
+    match t {
+        TypeExpr::App { head, args } if args.len() == 1 => match head.0.as_str() {
+            "Finish" | "Observation" => Some(match &args[0] {
+                TypeExpr::Named(n) => n.clone(),
+                TypeExpr::App { head: inner_head, .. } => inner_head.clone(),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 pub enum TurnInput {
     NaturalLanguage(String),
@@ -188,7 +228,7 @@ impl Session {
         // turn with a User-role-first message chain (F1 regression guard).
         // Committed `history` is preserved.
         self.planner.abandon_pending_turn();
-        Err(SessionError::RetriesExhausted { last: last_err })
+        Err(SessionError::TurnLimitExceeded { max_turns: (MAX_PLAN_RETRIES + 1) as u32 })
     }
 }
 

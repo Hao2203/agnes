@@ -11,4 +11,4 @@ mod tracer_bridge;
 pub use error::SessionError;
 pub use events::{EventSink, NodeKindTag, SessionEvent};
 pub use plan_tree::PlanTree;
-pub use session::{Session, TurnInput};
+pub use session::{RootKind, Session, TurnInput, classify_root, extract_inner_type};

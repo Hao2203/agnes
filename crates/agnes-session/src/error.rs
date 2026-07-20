@@ -17,6 +17,8 @@ pub enum SessionError {
     #[error(transparent)]
     Runtime(#[from] agnes_runtime::RuntimeError),
 
-    #[error("planner exhausted retries (attempts=3); last error: {last}")]
-    RetriesExhausted { last: String },
+    #[error(
+        "Agent loop hit the iteration limit.\n  Why: `MAX_TURNS = {max_turns}` reached without a terminating iteration (finish or unlabeled result).\n  Fix: rephrase the request more narrowly, or pass `--max-turns <N>` to raise the ceiling."
+    )]
+    TurnLimitExceeded { max_turns: u32 },
 }
