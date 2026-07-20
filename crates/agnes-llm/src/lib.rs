@@ -6,9 +6,11 @@
 mod anthropic;
 mod error;
 mod mock;
+mod openai;
 mod provider;
 
 pub use anthropic::AnthropicProvider;
 pub use error::LlmError;
 pub use mock::MockProvider;
+pub use openai::OpenAiCompatProvider;
 pub use provider::{CompletionRequest, Message, Provider, Role};
