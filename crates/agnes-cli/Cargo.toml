@@ -5,6 +5,10 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+name = "agnes_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agnes"
 path = "src/main.rs"
@@ -17,6 +21,11 @@ agnes-compiler.workspace = true
 agnes-runtime.workspace = true
 agnes-builtins.workspace = true
 agnes-llm.workspace = true
+agnes-session.workspace = true
+async-trait.workspace = true
+clap = { workspace = true }
+dotenvy.workspace = true
+rustyline = { workspace = true }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -30,4 +39,6 @@ agnes-compiler.workspace = true
 agnes-runtime.workspace = true
 agnes-builtins.workspace = true
 agnes-llm.workspace = true
+agnes-session.workspace = true
+async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }

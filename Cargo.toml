@@ -46,3 +46,5 @@ insta       = { version = "1", features = ["yaml"] }
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 dotenvy     = "0.15"
+clap        = { version = "4", features = ["derive"] }
+rustyline   = "14"
