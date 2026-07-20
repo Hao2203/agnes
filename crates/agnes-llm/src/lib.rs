@@ -17,6 +17,6 @@ pub use dsl_extract::extract_dsl;
 pub use error::{LlmError, PlannerError};
 pub use mock::MockProvider;
 pub use openai::OpenAiCompatProvider;
-pub use planner::{Planner, Turn};
+pub use planner::{Iteration, Observation, Planner, Turn, TurnOutcome};
 pub use provider::{CompletionRequest, Message, Provider, Role};
 pub use resolve::{LlmCliOpts, ResolvedKind, resolve_decision, resolve_provider};
