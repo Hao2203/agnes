@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "agnes-ast",
  "agnes-types",
+ "serde_json",
  "thiserror",
 ]
 

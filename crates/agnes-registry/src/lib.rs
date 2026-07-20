@@ -47,6 +47,10 @@ pub enum RegistryError {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "Show implementation already registered for type `{name}`.\n  Why: `register_show` was called twice with the same type name.\n  Fix: remove the duplicate registration or pick a different type name."
+    )]
+    DuplicateShow { name: String },
 }
 
 pub struct Registry {
@@ -57,6 +61,11 @@ pub struct Registry {
     /// dispatches to these when a tool call misses in the builtin native
     /// dispatch table.
     defines: HashMap<String, (Vec<Param>, Expr)>,
+    /// Show implementations keyed by type name. Independent of the `types`
+    /// map: a type can have a show without being a first-class registered
+    /// type (useful for future dynamic types) and can be a registered type
+    /// without having a show (fallback rendering applies).
+    shows: HashMap<String, agnes_types::ShowFn>,
 }
 
 impl Default for Registry {
@@ -72,6 +81,7 @@ impl Registry {
             aliases: HashMap::new(),
             tools: HashMap::new(),
             defines: HashMap::new(),
+            shows: HashMap::new(),
         }
     }
 
@@ -143,6 +153,102 @@ impl Registry {
     /// Look up the body of a `(define ...)` compound tool for runtime dispatch.
     pub fn define_body(&self, name: &str) -> Option<&(Vec<Param>, Expr)> {
         self.defines.get(name)
+    }
+
+    /// Register a `ShowFn` for a type name. Independent of `register_type`:
+    /// a type can have a show without being registered as a first-class
+    /// type. Conflicts are detected only against the `shows` map itself
+    /// (does not use `ensure_free`).
+    pub fn register_show(
+        &mut self,
+        name: &str,
+        f: agnes_types::ShowFn,
+    ) -> Result<(), RegistryError> {
+        if self.shows.contains_key(name) {
+            return Err(RegistryError::DuplicateShow {
+                name: name.to_string(),
+            });
+        }
+        self.shows.insert(name.to_string(), f);
+        Ok(())
+    }
+
+    /// Look up a registered ShowFn by type name.
+    pub fn show_of(&self, name: &agnes_types::TypeName) -> Option<agnes_types::ShowFn> {
+        self.shows.get(&name.0).copied()
+    }
+
+    /// Serialize a `Value` for display, using registered ShowFns where
+    /// available and built-in composition rules for `List`, `Option`
+    /// (i.e. `(| T Unit)`), `Finish`, `Observation`, and `|` unions.
+    /// Falls back to `serde_json::to_string_pretty` when no show is
+    /// registered.
+    pub fn show_value(&self, value: &agnes_types::Value) -> String {
+        self.show_data(&value.data, &value.declared_type)
+    }
+
+    fn show_data(&self, data: &serde_json::Value, ty: &agnes_types::TypeExpr) -> String {
+        use agnes_types::TypeExpr;
+        match ty {
+            TypeExpr::Named(name) => {
+                if let Some(f) = self.show_of(name) {
+                    f(data)
+                } else {
+                    serde_json::to_string_pretty(data)
+                        .unwrap_or_else(|_| data.to_string())
+                }
+            }
+            TypeExpr::App { head, args } => match head.0.as_str() {
+                "Finish" | "Observation" if args.len() == 1 => {
+                    // Transparent: render inner.
+                    self.show_data(data, &args[0])
+                }
+                "List" if args.len() == 1 => {
+                    let inner = &args[0];
+                    let arr = match data.as_array() {
+                        Some(a) => a,
+                        None => {
+                            return serde_json::to_string_pretty(data)
+                                .unwrap_or_else(|_| data.to_string());
+                        }
+                    };
+                    let parts: Vec<String> =
+                        arr.iter().map(|el| self.show_data(el, inner)).collect();
+                    format!("[{}]", parts.join(", "))
+                }
+                "|" => {
+                    // Union: if any arg is "Unit" and data is null, render as empty
+                    // string (Option-None case). Otherwise, pick the first non-Unit
+                    // member and render with that. This is a best-effort fallback:
+                    // unions with heterogeneous shapes may render imperfectly.
+                    if data.is_null()
+                        && args.iter().any(|a| matches!(a, TypeExpr::Named(n) if n.0 == "Unit"))
+                    {
+                        return String::new();
+                    }
+                    // Pick the first non-Unit member.
+                    for a in args {
+                        if let TypeExpr::Named(n) = a {
+                            if n.0 == "Unit" {
+                                continue;
+                            }
+                        }
+                        return self.show_data(data, a);
+                    }
+                    // Only Unit(s): empty.
+                    String::new()
+                }
+                _ => {
+                    // Unknown App head: try outer registered show, else pretty JSON.
+                    if let Some(f) = self.show_of(head) {
+                        f(data)
+                    } else {
+                        serde_json::to_string_pretty(data)
+                            .unwrap_or_else(|_| data.to_string())
+                    }
+                }
+            },
+        }
     }
 
     pub fn validator_of(&self, ty: &TypeName) -> Option<Validator> {
