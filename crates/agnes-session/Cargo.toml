@@ -1,0 +1,24 @@
+[package]
+name = "agnes-session"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agnes-llm.workspace       = true
+agnes-builtins.workspace  = true
+agnes-parser.workspace    = true
+agnes-checker.workspace   = true
+agnes-compiler.workspace  = true
+agnes-registry.workspace  = true
+agnes-runtime.workspace   = true
+agnes-types.workspace     = true
+agnes-ast.workspace       = true
+async-trait.workspace     = true
+thiserror.workspace       = true
+tokio                     = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+serde_json.workspace      = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

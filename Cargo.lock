@@ -112,6 +112,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agnes-session"
+version = "0.1.0"
+dependencies = [
+ "agnes-ast",
+ "agnes-builtins",
+ "agnes-checker",
+ "agnes-compiler",
+ "agnes-llm",
+ "agnes-parser",
+ "agnes-registry",
+ "agnes-runtime",
+ "agnes-types",
+ "async-trait",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "agnes-types"
 version = "0.1.0"
 dependencies = [

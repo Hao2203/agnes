@@ -11,6 +11,7 @@ members = [
     "crates/agnes-runtime",
     "crates/agnes-cli",
     "crates/agnes-llm",
+    "crates/agnes-session",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ agnes-compiler = { path = "crates/agnes-compiler" }
 agnes-runtime  = { path = "crates/agnes-runtime" }
 agnes-builtins = { path = "crates/agnes-builtins" }
 agnes-llm      = { path = "crates/agnes-llm" }
+agnes-session  = { path = "crates/agnes-session" }
 
 # external
 tokio       = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "sync"] }
