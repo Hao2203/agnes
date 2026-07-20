@@ -10,6 +10,7 @@ members = [
     "crates/agnes-builtins",
     "crates/agnes-runtime",
     "crates/agnes-cli",
+    "crates/agnes-llm",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ agnes-checker  = { path = "crates/agnes-checker" }
 agnes-compiler = { path = "crates/agnes-compiler" }
 agnes-runtime  = { path = "crates/agnes-runtime" }
 agnes-builtins = { path = "crates/agnes-builtins" }
+agnes-llm      = { path = "crates/agnes-llm" }
 
 # external
 tokio       = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "sync"] }
@@ -39,3 +41,5 @@ anyhow      = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 insta       = { version = "1", features = ["yaml"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
