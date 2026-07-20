@@ -95,6 +95,14 @@ impl Planner {
         )));
     }
 
+    /// Abandon the current in-flight turn. Clears `scratch` and `pending_nl`
+    /// without touching committed `history`. Call this when a caller has
+    /// decided the current turn cannot recover.
+    pub fn abandon_pending_turn(&mut self) {
+        self.scratch.clear();
+        self.pending_nl = None;
+    }
+
     pub fn record_result(&mut self, dsl: String, result_preview: String) {
         let user_nl = self.pending_nl.take().unwrap_or_default();
         self.history.push(Turn {

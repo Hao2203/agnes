@@ -93,6 +93,24 @@ impl EventSink for StderrEventSink {
                 let _ = writeln!(e, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 let _ = writeln!(e, "✘ turn failed: {error}");
             }
+            SessionEvent::WriteSummary { entries } => {
+                let t = self.t();
+                let _ = writeln!(e, "writes:");
+                // Right-pad the path column so the byte counts line up.
+                let width = entries
+                    .iter()
+                    .map(|(p, _)| p.len())
+                    .max()
+                    .unwrap_or(0);
+                for (path, bytes) in entries {
+                    let _ = writeln!(
+                        e,
+                        "  {t} would write {:width$}  {bytes} bytes",
+                        format!("\"{path}\""),
+                        width = width + 2,
+                    );
+                }
+            }
         }
     }
 }

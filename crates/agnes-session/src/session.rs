@@ -43,7 +43,42 @@ impl Session {
         self.planner.reset_history();
     }
 
+    /// Drain the process-global write-file recorder. Called at the end of
+    /// every turn (success and failure) so that writes never leak across
+    /// turns and the sink gets a single `WriteSummary` per turn.
+    fn drain_writes() -> Vec<(String, usize)> {
+        let mut w = agnes_builtins::writes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *w)
+    }
+
     pub async fn run_turn(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn EventSink,
+    ) -> Result<Value, SessionError> {
+        match self.run_turn_inner(input, sink).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // Drain any pending write-file records so they don't leak
+                // into the next turn, and surface them alongside the
+                // failure event.
+                let recorded = Self::drain_writes();
+                if !recorded.is_empty() {
+                    sink.emit(SessionEvent::WriteSummary { entries: recorded })
+                        .await;
+                }
+                sink.emit(SessionEvent::TurnFailed {
+                    error: e.to_string(),
+                })
+                .await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn run_turn_inner(
         &mut self,
         input: TurnInput,
         sink: &mut dyn EventSink,
@@ -98,30 +133,27 @@ impl Session {
         // Final drain — pick up any events emitted after the last tick.
         drain(&mut rx, sink).await;
 
-        match result {
-            Ok(v) => {
-                let preview = if let Some(s) = v.data.as_str() {
-                    let t: String = s.chars().take(120).collect();
-                    format!("{t}{}", if s.len() > 120 { "…" } else { "" })
-                } else {
-                    v.data.to_string()
-                };
-                sink.emit(SessionEvent::TurnResult {
-                    value_preview: preview.clone(),
-                    value_type: v.declared_type.to_string(),
-                })
+        let v = result?;
+        let preview = if let Some(s) = v.data.as_str() {
+            let t: String = s.chars().take(120).collect();
+            format!("{t}{}", if s.len() > 120 { "…" } else { "" })
+        } else {
+            v.data.to_string()
+        };
+        // Drain the per-turn write-file recorder before the closing event
+        // so the sink sees `WriteSummary` immediately before `TurnResult`.
+        let recorded = Self::drain_writes();
+        if !recorded.is_empty() {
+            sink.emit(SessionEvent::WriteSummary { entries: recorded })
                 .await;
-                self.planner.record_result(dsl, preview);
-                Ok(v)
-            }
-            Err(e) => {
-                sink.emit(SessionEvent::TurnFailed {
-                    error: e.to_string(),
-                })
-                .await;
-                Err(SessionError::from(e))
-            }
         }
+        sink.emit(SessionEvent::TurnResult {
+            value_preview: preview.clone(),
+            value_type: v.declared_type.to_string(),
+        })
+        .await;
+        self.planner.record_result(dsl, preview);
+        Ok(v)
     }
 
     async fn plan_with_retries(
@@ -151,6 +183,11 @@ impl Session {
                 }
             }
         }
+        // The in-flight turn is unrecoverable — reset the planner's scratch
+        // buffer and pending NL so the next `plan()` call starts a fresh
+        // turn with a User-role-first message chain (F1 regression guard).
+        // Committed `history` is preserved.
+        self.planner.abandon_pending_turn();
         Err(SessionError::RetriesExhausted { last: last_err })
     }
 }

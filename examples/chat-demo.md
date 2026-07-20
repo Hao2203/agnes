@@ -31,8 +31,8 @@ ANTHROPIC_API_KEY=... cargo run -p agnes-cli -- chat \
 ## About the "tools"
 
 Only `llm` reaches out to a network model. Every other built-in tool —
-`read-file`, `translate`, `summarize`, `join-lines`, `write-file`,
-`count-lines` — is an **in-memory mock** that returns pre-baked strings
+`read-file`, `translate`, `summarize`, `join-lines`, `write-file` — is
+an **in-memory mock** that returns pre-baked strings
 so the demo is deterministic and offline-friendly for tools other than
 the planner itself. See
 [`crates/agnes-builtins/src/tools.rs`](../crates/agnes-builtins/src/tools.rs)

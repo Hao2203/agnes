@@ -11,8 +11,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type ToolImpl =
     Arc<dyn Fn(HashMap<String, Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
-/// Per-process recording of every mock write-file call, so a CLI/sink can
-/// print a "would-have-written" summary at end of turn.
+/// Per-process recording of every mock write-file call, drained by
+/// `agnes_session::Session::run_turn` at the end of each turn and emitted
+/// as a `SessionEvent::WriteSummary`. Call sites should NOT rely on this
+/// list accumulating across turns — Session takes ownership of the entries
+/// on both the success and failure paths.
 pub fn writes() -> &'static Mutex<Vec<(String, usize)>> {
     static WRITES: OnceLock<Mutex<Vec<(String, usize)>>> = OnceLock::new();
     WRITES.get_or_init(|| Mutex::new(Vec::new()))

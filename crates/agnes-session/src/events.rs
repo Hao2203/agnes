@@ -37,6 +37,11 @@ pub enum SessionEvent {
     TurnFailed {
         error: String,
     },
+    /// `write-file` invocations that occurred during this turn.
+    /// (path, byte-count) pairs, in call order.
+    WriteSummary {
+        entries: Vec<(String, usize)>,
+    },
 }
 
 #[async_trait::async_trait]
