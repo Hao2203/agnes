@@ -9,6 +9,7 @@ use agnes_runtime::execute_with;
 use agnes_types::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Which "root shape" a Value carries — the classification used by the
 /// agent loop to decide whether to terminate (Finish/Other) or feed
@@ -136,7 +137,18 @@ impl Session {
         input: TurnInput,
         sink: &mut dyn EventSink,
     ) -> Result<Value, SessionError> {
-        match self.run_turn_inner(input, sink).await {
+        // Uncancellable variant: a fresh Notify never fires.
+        let never = Arc::new(tokio::sync::Notify::new());
+        self.run_turn_cancellable(input, sink, never).await
+    }
+
+    pub async fn run_turn_cancellable(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn EventSink,
+        cancel: Arc<tokio::sync::Notify>,
+    ) -> Result<Value, SessionError> {
+        match self.run_turn_inner(input, sink, cancel).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let recorded = Self::drain_writes();
@@ -157,6 +169,7 @@ impl Session {
         &mut self,
         input: TurnInput,
         sink: &mut dyn EventSink,
+        cancel: Arc<tokio::sync::Notify>,
     ) -> Result<Value, SessionError> {
         // Seed: NL starts an in-flight planner turn; RawDsl provides
         // iter=0's DSL directly and still opens a planner turn (so
@@ -170,6 +183,14 @@ impl Session {
         let mut result = None;
         let mut iter = 0;
         while iter < self.max_turns && result.is_none() {
+            // Cancellation check BEFORE emitting IterationStart, so a
+            // pre-fired cancel returns with after_iterations = iter (0).
+            if cancel_fired(&cancel) {
+                self.planner.abandon_pending_turn();
+                return Err(SessionError::Cancelled {
+                    after_iterations: iter,
+                });
+            }
             sink.emit(SessionEvent::IterationStart { iter }).await;
 
             // Get the DSL for this iteration: either the seeded RawDsl
@@ -302,4 +323,19 @@ impl Session {
         drain(&mut rx, sink).await;
         Ok(result?)
     }
+}
+
+/// Non-async, non-blocking check: has the Notify been signaled? We
+/// implement this via a try_recv-shaped pattern using `try_notified`.
+/// tokio::sync::Notify doesn't have a direct "is signaled" query, but
+/// a fresh Notified future polled once returns Ready if a permit is
+/// stored.
+fn cancel_fired(n: &tokio::sync::Notify) -> bool {
+    // If notify_one was called, one permit is stored; a fresh notified()
+    // future returns Ready(()) on first poll.
+    let mut fut = std::pin::pin!(n.notified());
+    use std::task::{Context, Poll, Waker};
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(&waker);
+    matches!(fut.as_mut().poll(&mut cx), Poll::Ready(()))
 }
