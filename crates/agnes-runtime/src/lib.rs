@@ -7,16 +7,44 @@ mod scheduler;
 pub use error::RuntimeError;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use agnes_builtins::ToolImpl;
-use agnes_compiler::Dag;
+use agnes_compiler::{Dag, NodeId, NodeKind};
 use agnes_registry::Registry;
 use agnes_types::Value;
+
+/// Observer for tool + llm node execution. Hooks fire only for
+/// `NodeKind::Tool { .. }` and `NodeKind::Llm` — control-flow nodes are
+/// silent. `args_preview` is a caller-formatted, truncation-friendly
+/// summary of the arg map (no exact contract; consumers must tolerate any
+/// human string).
+pub trait Tracer: Send + Sync {
+    fn node_start(&self, id: NodeId, kind: &NodeKind, args_preview: &str);
+    fn node_end(&self, id: NodeId, result: Result<&Value, &RuntimeError>, elapsed: Duration);
+}
+
+/// Default no-op tracer used by the plain `execute()` entry point.
+pub struct NoopTracer;
+
+impl Tracer for NoopTracer {
+    fn node_start(&self, _id: NodeId, _kind: &NodeKind, _args_preview: &str) {}
+    fn node_end(&self, _id: NodeId, _result: Result<&Value, &RuntimeError>, _elapsed: Duration) {}
+}
 
 pub async fn execute(
     dag: &Dag,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
 ) -> Result<Value, RuntimeError> {
-    scheduler::run(dag, reg, dispatch).await
+    execute_with(dag, reg, dispatch, &NoopTracer).await
+}
+
+pub async fn execute_with(
+    dag: &Dag,
+    reg: &Registry,
+    dispatch: &HashMap<String, ToolImpl>,
+    tracer: &dyn Tracer,
+) -> Result<Value, RuntimeError> {
+    scheduler::run(dag, reg, dispatch, tracer).await
 }

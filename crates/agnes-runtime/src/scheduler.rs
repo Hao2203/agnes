@@ -16,10 +16,11 @@ pub async fn run(
     dag: &Dag,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
+    tracer: &dyn crate::Tracer,
 ) -> Result<Value, RuntimeError> {
     let mut cache: HashMap<NodeId, Value> = HashMap::new();
     let mut env: HashMap<String, Value> = HashMap::new();
-    eval_node(dag, dag.root, reg, dispatch, &mut cache, &mut env).await
+    eval_node(dag, dag.root, reg, dispatch, tracer, &mut cache, &mut env).await
 }
 
 fn eval_node<'a>(
@@ -27,6 +28,7 @@ fn eval_node<'a>(
     id: NodeId,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
+    tracer: &'a dyn crate::Tracer,
     cache: &'a mut HashMap<NodeId, Value>,
     env: &'a mut HashMap<String, Value>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
@@ -46,7 +48,7 @@ fn eval_node<'a>(
                     })?
             }
             NodeKind::Let { name } => {
-                let src = eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?;
+                let src = eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
                 env.insert(name.clone(), src.clone());
                 src
             }
@@ -55,7 +57,7 @@ fn eval_node<'a>(
                 // intermediate steps populate `env` before later steps run.
                 let mut last: Option<Value> = None;
                 for input in &node.inputs {
-                    last = Some(eval_input(dag, input, reg, dispatch, cache, env).await?);
+                    last = Some(eval_input(dag, input, reg, dispatch, tracer, cache, env).await?);
                 }
                 last.ok_or_else(|| RuntimeError::ToolFailed {
                     tool: "<pipe>".into(),
@@ -66,21 +68,21 @@ fn eval_node<'a>(
                 // MVP: evaluate branches sequentially — correctness first;
                 // concurrent join is a follow-up.
                 for input in &node.inputs {
-                    let _ = eval_input(dag, input, reg, dispatch, cache, env).await?;
+                    let _ = eval_input(dag, input, reg, dispatch, tracer, cache, env).await?;
                 }
                 Value::typed(JsonValue::Null, "Unit")
             }
             NodeKind::If => {
-                let cond = eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?;
+                let cond = eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
                 let picked = if cond.data.as_bool().unwrap_or(false) {
                     1
                 } else {
                     2
                 };
-                eval_input(dag, &node.inputs[picked], reg, dispatch, cache, env).await?
+                eval_input(dag, &node.inputs[picked], reg, dispatch, tracer, cache, env).await?
             }
             NodeKind::Match { arms } => {
-                let s = eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?;
+                let s = eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?;
                 let mut chosen: Option<usize> = None;
                 for (i, pat) in arms.iter().enumerate() {
                     if lit_matches(pat, &s.data) {
@@ -90,16 +92,16 @@ fn eval_node<'a>(
                 }
                 let idx = chosen.unwrap_or(arms.len());
                 let idx = idx.min(node.inputs.len() - 1);
-                eval_input(dag, &node.inputs[idx], reg, dispatch, cache, env).await?
+                eval_input(dag, &node.inputs[idx], reg, dispatch, tracer, cache, env).await?
             }
             NodeKind::Foreach { .. } => {
                 // MVP simplification: evaluate body once and return that.
-                eval_input(dag, &node.inputs[1], reg, dispatch, cache, env).await?
+                eval_input(dag, &node.inputs[1], reg, dispatch, tracer, cache, env).await?
             }
             NodeKind::Retry { times, .. } => {
                 let mut last_err: Option<RuntimeError> = None;
                 for _ in 0..(*times + 1) {
-                    match eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await {
+                    match eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await {
                         Ok(v) => {
                             cache.insert(id, v.clone());
                             return Ok(v);
@@ -110,24 +112,26 @@ fn eval_node<'a>(
                 return Err(last_err.unwrap());
             }
             NodeKind::Catch { fallback, .. } => {
-                match eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await {
+                match eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await {
                     Ok(v) => v,
-                    Err(_) => eval_node(dag, *fallback, reg, dispatch, cache, env).await?,
+                    Err(_) => eval_node(dag, *fallback, reg, dispatch, tracer, cache, env).await?,
                 }
             }
             NodeKind::Llm => {
-                let args = collect_kwargs(dag, &node.inputs, reg, dispatch, cache, env).await?;
-                call_native("llm", args, dispatch, reg, &node.provides).await?
+                let args = collect_kwargs(dag, &node.inputs, reg, dispatch, tracer, cache, env).await?;
+                call_native_traced(id, &node.kind, "llm", args, dispatch, reg, &node.provides, tracer).await?
             }
-            NodeKind::Return => eval_input(dag, &node.inputs[0], reg, dispatch, cache, env).await?,
+            NodeKind::Return => {
+                eval_input(dag, &node.inputs[0], reg, dispatch, tracer, cache, env).await?
+            }
             NodeKind::Tool { name } => {
-                let args = collect_kwargs(dag, &node.inputs, reg, dispatch, cache, env).await?;
-                call_native(name, args, dispatch, reg, &node.provides).await?
+                let args = collect_kwargs(dag, &node.inputs, reg, dispatch, tracer, cache, env).await?;
+                call_native_traced(id, &node.kind, name, args, dispatch, reg, &node.provides, tracer).await?
             }
             NodeKind::List => {
                 let mut elems: Vec<Value> = Vec::with_capacity(node.inputs.len());
                 for input in &node.inputs {
-                    elems.push(eval_input(dag, input, reg, dispatch, cache, env).await?);
+                    elems.push(eval_input(dag, input, reg, dispatch, tracer, cache, env).await?);
                 }
                 let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
                 // Prefer the checker-derived provides for declared_type, but if
@@ -164,12 +168,13 @@ fn eval_input<'a>(
     input: &'a Input,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
+    tracer: &'a dyn crate::Tracer,
     cache: &'a mut HashMap<NodeId, Value>,
     env: &'a mut HashMap<String, Value>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
         match input {
-            Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, cache, env).await,
+            Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, tracer, cache, env).await,
             Input::Literal(lit) => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Input::Var(name) => env
                 .get(name)
@@ -178,7 +183,9 @@ fn eval_input<'a>(
                     tool: format!("<var>{name}"),
                     cause: "unbound variable".into(),
                 }),
-            Input::Kw { source, .. } => eval_input(dag, source, reg, dispatch, cache, env).await,
+            Input::Kw { source, .. } => {
+                eval_input(dag, source, reg, dispatch, tracer, cache, env).await
+            }
         }
     })
 }
@@ -188,6 +195,7 @@ async fn collect_kwargs(
     inputs: &[Input],
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
+    tracer: &dyn crate::Tracer,
     cache: &mut HashMap<NodeId, Value>,
     env: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, RuntimeError> {
@@ -195,13 +203,13 @@ async fn collect_kwargs(
     for input in inputs {
         match input {
             Input::Kw { key, source } => {
-                let v = eval_input(dag, source, reg, dispatch, cache, env).await?;
+                let v = eval_input(dag, source, reg, dispatch, tracer, cache, env).await?;
                 out.insert(key.clone(), v);
             }
             other => {
                 // Defensive fallback — Task 7 compiler produces only Kw inputs
                 // for tool/llm nodes, so this branch should not fire in normal use.
-                let v = eval_input(dag, other, reg, dispatch, cache, env).await?;
+                let v = eval_input(dag, other, reg, dispatch, tracer, cache, env).await?;
                 out.insert("_positional".into(), v);
             }
         }
@@ -242,6 +250,47 @@ async fn call_native(
     // Validate `provides`.
     validate(reg, tool, "provides", provides, &result)?;
     Ok(result)
+}
+
+async fn call_native_traced(
+    id: NodeId,
+    kind: &NodeKind,
+    tool: &str,
+    args: HashMap<String, Value>,
+    dispatch: &HashMap<String, ToolImpl>,
+    reg: &Registry,
+    provides: &TypeExpr,
+    tracer: &dyn crate::Tracer,
+) -> Result<Value, RuntimeError> {
+    let preview = args_preview(&args);
+    tracer.node_start(id, kind, &preview);
+    let start = std::time::Instant::now();
+    let out = call_native(tool, args, dispatch, reg, provides).await;
+    let elapsed = start.elapsed();
+    match &out {
+        Ok(v) => tracer.node_end(id, Ok(v), elapsed),
+        Err(e) => tracer.node_end(id, Err(e), elapsed),
+    }
+    out
+}
+
+fn args_preview(args: &HashMap<String, Value>) -> String {
+    let mut kvs: Vec<(&String, &Value)> = args.iter().collect();
+    kvs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut out = String::new();
+    for (i, (k, v)) in kvs.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let val = if let Some(s) = v.data.as_str() {
+            let trimmed: String = s.chars().take(40).collect();
+            format!(":{k}={trimmed:?}")
+        } else {
+            format!(":{k}=<{}>", v.declared_type)
+        };
+        out.push_str(&val);
+    }
+    out
 }
 
 /// Bind incoming kwargs (with default-literal fallback) into a fresh env, then
