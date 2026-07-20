@@ -1,6 +1,7 @@
 //! Built-in types, aliases, and tool implementations for MVP.
 
 mod aliases;
+mod shows;
 mod tools;
 mod types;
 
@@ -25,6 +26,11 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     reg.register_type("String", None)?;
     reg.register_type("Int", None)?;
     reg.register_type("Bool", None)?;
+
+    // --- Show impls for built-in types ---
+    for (name, f) in shows::BUILTIN_SHOWS {
+        reg.register_show(name, *f)?;
+    }
 
     // --- Aliases ---
     reg.register_alias("TextLike", aliases::text_like())?;
