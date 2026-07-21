@@ -16,14 +16,12 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
                 lit: Literal::Nil,
             });
         }
-        // Any other bare symbol is treated as a tool call with zero arguments —
-        // this allows idiomatic pipe sequencing like (pipe input finish) where
-        // the last step just names the tool that needs the upstream input.
-        return Ok(Expr::Tool {
+        // Any other bare symbol is a variable reference. (A bare symbol only
+        // means "zero-arg tool call" as a step inside a `(pipe ...)`, which is
+        // handled specially in `parse_pipe_steps`.)
+        return Ok(Expr::Var {
             span,
             name: sym.to_string(),
-            positional: vec![],
-            args: KwArgs::default(),
         });
     }
     if let Some(s) = v.as_str() {
@@ -65,7 +63,7 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
         "tool" => parse_tool(rest, span),
         "pipe" => Ok(Expr::Pipe {
             span,
-            steps: parse_exprs(rest, span)?,
+            steps: parse_pipe_steps(rest, span)?,
         }),
         "par" => Ok(Expr::Par {
             span,
@@ -124,6 +122,25 @@ fn to_items(v: &lexpr::Value, span: Span) -> Result<Vec<lexpr::Value>, ParseErro
 
 fn parse_exprs(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, ParseError> {
     items.iter().map(|i| parse_expr(i, span)).collect()
+}
+
+/// Parse the steps of a `(pipe ...)`. A pipe step that is a bare symbol (other
+/// than `nil`) is shorthand for a zero-argument tool call that takes the
+/// upstream piped value as its input — e.g. `(pipe "done" finish)`. Any other
+/// step is parsed as a normal expression.
+fn parse_pipe_steps(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, ParseError> {
+    items
+        .iter()
+        .map(|i| match i.as_symbol() {
+            Some(sym) if sym != "nil" => Ok(Expr::Tool {
+                span,
+                name: sym.to_string(),
+                positional: vec![],
+                args: KwArgs::default(),
+            }),
+            _ => parse_expr(i, span),
+        })
+        .collect()
 }
 
 fn parse_tool(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {
