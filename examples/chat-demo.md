@@ -40,19 +40,25 @@ agnes chat — type your goal, or /run <dsl>, /history, /reset, /quit
 ─── iteration 0 ─────────────────────────────
 ━━━ Planning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ━━━ Generated DSL ━━━━━━━━━━━━━━━━━━━━━━━━
-(pipe (tool read-file :path "README.md") (tool summarize) finish)
+(finish (tool summarize :input (tool read-file :path "README.md")))
 ━━━ Plan ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-├── read-file → PlainText
-├── summarize → Summary
-└── finish   → Unknown
+finish   → (Finish Summary)
+└── summarize → Summary
+    └── read-file → PlainText
 ━━━ Trace ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [+0.043s] ▶ read-file :path=README.md
 [+0.081s] ✔ read-file (38ms) → PlainText: <content>…
 [+0.083s] ▶ summarize :input=<from read-file>
 [+1.410s] ✔ summarize (1327ms) → Summary: agnes is a…
-[+1.412s] ▶ finish :input=<from summarize>
-[+1.413s] ✔ finish (1ms) → (Finish Summary): agnes is a…
 agnes is a Rust runtime for a small typed workflow DSL.
+```
+
+Bare `finish` as a pipe tail is equivalent shorthand — both of these
+produce the same DAG:
+
+```agnes
+(finish (tool summarize :input (tool read-file :path "README.md")))
+(pipe (tool read-file :path "README.md") (tool summarize) finish)
 ```
 
 ## `observe` example (agent decides to look before speaking)
@@ -62,12 +68,12 @@ agnes is a Rust runtime for a small typed workflow DSL.
 
 ─── iteration 0 ─────────────────────────────
 ━━━ Generated DSL ━━━━━━━━━━━━━━━━━━━━━━━━
-(pipe (tool read-file :path "README.md") observe)
+(observe (tool read-file :path "README.md"))
 [+0.081s] ↓ observed (iter 0, 3200 chars): # agnes …
 
 ─── iteration 1 ─────────────────────────────
 ━━━ Generated DSL ━━━━━━━━━━━━━━━━━━━━━━━━
-(pipe (tool summarize :input "…") finish)
+(finish (tool summarize :input "…"))
 [+1.410s] ✔ summarize (1327ms) → Summary: agnes is a…
 agnes is a Rust runtime for a small typed workflow DSL.
 ```

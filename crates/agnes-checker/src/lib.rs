@@ -142,6 +142,10 @@ fn check_expr(
             Ok(TypeExpr::Named(TypeName("PlainText".into())))
         }
         Expr::Return { value, .. } => check_expr(value, reg, env, None, None),
+        Expr::Finish { value, .. } => check_wrap(value, "Finish", "finish", reg, env, flowed_in),
+        Expr::Observe { value, .. } => {
+            check_wrap(value, "Observation", "observe", reg, env, flowed_in)
+        }
         Expr::Literal { lit, .. } => Ok(literal_type(lit)),
         Expr::Var { name, .. } => env
             .get(name)
@@ -185,6 +189,30 @@ fn literal_type(lit: &agnes_ast::Literal) -> TypeExpr {
         agnes_ast::Literal::Bool(_) => TypeExpr::Named(TypeName("Bool".into())),
         agnes_ast::Literal::Nil => TypeExpr::Named(TypeName("Unit".into())),
     }
+}
+
+/// Shared implementation for `(finish X)` / `(observe X)` type-checking.
+/// Returns `App { head: wrapper_head, args: [inner_type] }` where `inner_type`
+/// is the type of `X` (or the piped upstream, if `X` is None because the
+/// form was written as a bare pipe step).
+fn check_wrap(
+    value: &Option<Box<Expr>>,
+    wrapper_head: &str,
+    form_name: &str,
+    reg: &Registry,
+    env: &mut env::Env,
+    flowed_in: Option<TypeExpr>,
+) -> Result<TypeExpr, CheckError> {
+    let inner = match value {
+        Some(v) => check_expr(v, reg, env, None, None)?,
+        None => flowed_in.ok_or_else(|| CheckError::UnknownVar {
+            name: format!("bare `{form_name}` used outside a pipe (no upstream to wrap)"),
+        })?,
+    };
+    Ok(TypeExpr::App {
+        head: TypeName(wrapper_head.into()),
+        args: vec![inner],
+    })
 }
 
 fn check_arg(

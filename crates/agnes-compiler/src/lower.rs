@@ -175,6 +175,16 @@ impl<'a> Lowering<'a> {
                 let provides = self.nodes[v.0].provides.clone();
                 Ok(self.add(NodeKind::Return, vec![Input::FromNode(v)], provides))
             }
+            Expr::Finish { value, .. } => {
+                self.lower_wrap(value, upstream, "Finish", "finish", NodeKind::Finish)
+            }
+            Expr::Observe { value, .. } => self.lower_wrap(
+                value,
+                upstream,
+                "Observation",
+                "observe",
+                NodeKind::Observe,
+            ),
             Expr::Literal { lit, .. } => {
                 let ty = match lit {
                     Literal::String(_) => "String",
@@ -303,6 +313,31 @@ impl<'a> Lowering<'a> {
         let provides = self.nodes[last.0].provides.clone();
         let inputs: Vec<Input> = ids.into_iter().map(Input::FromNode).collect();
         Ok(self.add(NodeKind::Pipe, inputs, provides))
+    }
+
+    /// Shared implementation for `Expr::Finish` / `Expr::Observe`. Lowers the
+    /// child (or uses the piped upstream if `value` is `None`), then adds a
+    /// wrapper node whose `provides` is `App { head: wrapper_head, args: [child] }`.
+    fn lower_wrap(
+        &mut self,
+        value: &Option<Box<Expr>>,
+        upstream: Option<NodeId>,
+        wrapper_head: &str,
+        form_name: &str,
+        kind: NodeKind,
+    ) -> Result<NodeId, crate::CompileError> {
+        let inner_id = match value {
+            Some(v) => self.lower_expr(v, None)?,
+            None => upstream.ok_or_else(|| crate::CompileError::UnknownDefine {
+                name: format!("bare `{form_name}` used outside a pipe"),
+            })?,
+        };
+        let inner_provides = self.nodes[inner_id.0].provides.clone();
+        let provides = TypeExpr::App {
+            head: agnes_types::TypeName(wrapper_head.into()),
+            args: vec![inner_provides],
+        };
+        Ok(self.add(kind, vec![Input::FromNode(inner_id)], provides))
     }
 
     fn lower_par(&mut self, branches: &[Expr]) -> Result<NodeId, crate::CompileError> {

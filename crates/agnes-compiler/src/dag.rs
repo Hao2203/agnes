@@ -33,6 +33,13 @@ pub enum NodeKind {
     /// parameter names (`prompt`, `input`). No positional inputs.
     Llm,
     Return,
+    /// `(finish X)` — wraps the child's runtime type in `Finish T` so the
+    /// session loop's `classify_root` treats it as a terminating iteration.
+    /// Single input: the child expression.
+    Finish,
+    /// `(observe X)` — wraps the child's runtime type in `Observation T`
+    /// so the session loop feeds the value back to the planner.
+    Observe,
     Literal(Literal),
     Var(String),
     /// `(list e1 e2 ...)` — inputs are one `Input::FromNode` per element.

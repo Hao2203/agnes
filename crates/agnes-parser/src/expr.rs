@@ -100,6 +100,14 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
                 value: Box::new(parse_expr(inner, span)?),
             })
         }
+        "finish" => parse_wrap_form(rest, span, "finish", |v| Expr::Finish {
+            span,
+            value: Some(Box::new(v)),
+        }),
+        "observe" => parse_wrap_form(rest, span, "observe", |v| Expr::Observe {
+            span,
+            value: Some(Box::new(v)),
+        }),
         other => Err(ParseError {
             span,
             message: format!("unknown expression head `{other}`"),
@@ -125,13 +133,18 @@ fn parse_exprs(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, ParseErr
 }
 
 /// Parse the steps of a `(pipe ...)`. A pipe step that is a bare symbol (other
-/// than `nil`) is shorthand for a zero-argument tool call that takes the
-/// upstream piped value as its input — e.g. `(pipe "done" finish)`. Any other
-/// step is parsed as a normal expression.
+/// than `nil`) is shorthand for a zero-argument call that takes the upstream
+/// piped value as its input — e.g. `(pipe "done" finish)`. Bare `finish` and
+/// `observe` desugar to their special-form counterparts with `value: None`
+/// (the compiler's pipe-threading fills that from upstream); any other bare
+/// symbol desugars to a zero-arg tool call. Non-symbol steps are parsed as
+/// normal expressions.
 fn parse_pipe_steps(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, ParseError> {
     items
         .iter()
         .map(|i| match i.as_symbol() {
+            Some("finish") => Ok(Expr::Finish { span, value: None }),
+            Some("observe") => Ok(Expr::Observe { span, value: None }),
             Some(sym) if sym != "nil" => Ok(Expr::Tool {
                 span,
                 name: sym.to_string(),
@@ -141,6 +154,27 @@ fn parse_pipe_steps(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, Par
             _ => parse_expr(i, span),
         })
         .collect()
+}
+
+/// Shared implementation for `(finish expr)` / `(observe expr)`: exactly one
+/// child expression, no keyword args.
+fn parse_wrap_form(
+    rest: &[lexpr::Value],
+    span: Span,
+    head: &str,
+    make: impl FnOnce(Expr) -> Expr,
+) -> Result<Expr, ParseError> {
+    if rest.len() != 1 {
+        return Err(ParseError {
+            span,
+            message: format!(
+                "`{head}` takes exactly one child expression; got {}",
+                rest.len()
+            ),
+        });
+    }
+    let inner = parse_expr(&rest[0], span)?;
+    Ok(make(inner))
 }
 
 fn parse_tool(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {

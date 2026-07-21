@@ -259,3 +259,81 @@ fn positional_tool_arg_uses_positional_vec() {
         other => panic!("expected Tool, got {other:?}"),
     }
 }
+
+#[test]
+fn parses_finish_direct_form_with_string() {
+    let src = r#"(finish "hello")"#;
+    let p = agnes_parser::parse(src).expect("parse ok");
+    match p.main.unwrap() {
+        agnes_ast::Expr::Finish { value: Some(v), .. } => match &*v {
+            agnes_ast::Expr::Literal { lit: Literal::String(s), .. } => {
+                assert_eq!(s, "hello");
+            }
+            other => panic!("expected String literal inside finish, got {other:?}"),
+        },
+        other => panic!("expected Finish, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_observe_direct_form_with_tool_call() {
+    let src = r#"(observe (tool read-file :path "x"))"#;
+    let p = agnes_parser::parse(src).expect("parse ok");
+    match p.main.unwrap() {
+        agnes_ast::Expr::Observe { value: Some(v), .. } => {
+            assert!(matches!(&*v, agnes_ast::Expr::Tool { name, .. } if name == "read-file"));
+        }
+        other => panic!("expected Observe, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_pipe_bare_finish_as_special_form_with_none_value() {
+    // Bare `finish` in a pipe now desugars to Expr::Finish { value: None },
+    // NOT to a zero-arg Expr::Tool.
+    let src = r#"(pipe "done" finish)"#;
+    let p = agnes_parser::parse(src).expect("parse ok");
+    match p.main.unwrap() {
+        agnes_ast::Expr::Pipe { steps, .. } => {
+            assert_eq!(steps.len(), 2);
+            assert!(matches!(steps[1], agnes_ast::Expr::Finish { value: None, .. }));
+        }
+        other => panic!("expected Pipe, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_pipe_bare_observe_as_special_form_with_none_value() {
+    let src = r#"(pipe (tool read-file :path "x") observe)"#;
+    let p = agnes_parser::parse(src).expect("parse ok");
+    match p.main.unwrap() {
+        agnes_ast::Expr::Pipe { steps, .. } => {
+            assert_eq!(steps.len(), 2);
+            assert!(matches!(steps[1], agnes_ast::Expr::Observe { value: None, .. }));
+        }
+        other => panic!("expected Pipe, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_finish_with_multiple_args() {
+    let src = r#"(finish "a" "b")"#;
+    let err = agnes_parser::parse(src).expect_err("must reject 2 args");
+    assert!(
+        err.to_string().contains("finish"),
+        "error should mention finish: {err}"
+    );
+}
+
+#[test]
+fn rejects_bare_finish_at_top_level() {
+    // `finish` as a bare symbol outside a pipe is a Var reference (unbound),
+    // and `finish` as an unparenthesized head can't happen here — the tricky
+    // case is `(finish)` with no children, which must error out.
+    let src = r#"(finish)"#;
+    let err = agnes_parser::parse(src).expect_err("must reject 0 args");
+    assert!(
+        err.to_string().contains("finish"),
+        "error should mention finish: {err}"
+    );
+}

@@ -143,6 +143,28 @@ fn eval_node<'a>(
             NodeKind::Return => {
                 eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?
             }
+            NodeKind::Finish => {
+                let inner =
+                    eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                Value {
+                    data: inner.data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("Finish".into()),
+                        args: vec![inner.declared_type],
+                    },
+                }
+            }
+            NodeKind::Observe => {
+                let inner =
+                    eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                Value {
+                    data: inner.data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("Observation".into()),
+                        args: vec![inner.declared_type],
+                    },
+                }
+            }
             NodeKind::Tool { name } => {
                 let args =
                     collect_kwargs(dag, &node.inputs, reg, dispatch, resolver, tracer, cache, env).await?;
@@ -491,6 +513,21 @@ fn eval_expr<'a>(
                 call_native("llm", kwargs, dispatch, resolver, reg, &provides).await
             }
             Expr::Return { value, .. } => eval_expr(value, None, reg, dispatch, resolver, env).await,
+            Expr::Finish { value, .. } => {
+                eval_wrap_expr(value.as_deref(), flowed_in, "Finish", reg, dispatch, resolver, env).await
+            }
+            Expr::Observe { value, .. } => {
+                eval_wrap_expr(
+                    value.as_deref(),
+                    flowed_in,
+                    "Observation",
+                    reg,
+                    dispatch,
+                    resolver,
+                    env,
+                )
+                .await
+            }
             Expr::Literal { lit, .. } => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Expr::Var { name, .. } => {
                 env.get(name)
@@ -583,6 +620,36 @@ fn tool_provides(reg: &Registry, name: &str) -> TypeExpr {
     reg.tool_signature(name)
         .map(|s| s.provides.clone())
         .unwrap_or_else(|| TypeExpr::Named(TypeName("Unknown".into())))
+}
+
+/// AST-interpreter helper for `Expr::Finish` / `Expr::Observe`. Evaluates the
+/// child (or takes the upstream from a piped context if `value` is `None`),
+/// then wraps the resulting `Value.declared_type` in `App { wrapper_head, [inner] }`.
+fn eval_wrap_expr<'a>(
+    value: Option<&'a Expr>,
+    flowed_in: Option<Value>,
+    wrapper_head: &'static str,
+    reg: &'a Registry,
+    dispatch: &'a HashMap<String, ToolImpl>,
+    resolver: &'a (dyn PathResolver + Send + Sync),
+    env: &'a mut HashMap<String, Value>,
+) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
+    Box::pin(async move {
+        let inner = match value {
+            Some(v) => eval_expr(v, None, reg, dispatch, resolver, env).await?,
+            None => flowed_in.ok_or_else(|| RuntimeError::ToolFailed {
+                tool: format!("<{}>", wrapper_head.to_lowercase()),
+                cause: format!("bare `{wrapper_head}` used outside a pipe"),
+            })?,
+        };
+        Ok(Value {
+            data: inner.data,
+            declared_type: TypeExpr::App {
+                head: TypeName(wrapper_head.into()),
+                args: vec![inner.declared_type],
+            },
+        })
+    })
 }
 
 fn lit_to_json(lit: &Literal) -> JsonValue {

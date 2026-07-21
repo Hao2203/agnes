@@ -107,7 +107,25 @@ impl Planner {
         let raw = self.provider.complete(request).await?;
         let dsl = crate::dsl_extract::extract_dsl(&raw);
         if dsl.trim().is_empty() {
-            return Err(PlannerError::EmptyResponse);
+            // Surface what the provider actually returned so callers can
+            // tell "empty content" from "prose without a fenced block" from
+            // "fenced block with empty body". Cap preview to keep TurnFailed
+            // events readable in the terminal.
+            const PREVIEW_CHARS: usize = 500;
+            let raw_len = raw.chars().count();
+            let raw_preview = if raw.trim().is_empty() {
+                format!("<whitespace-only, {} bytes>", raw.len())
+            } else {
+                let mut p: String = raw.chars().take(PREVIEW_CHARS).collect();
+                if raw_len > PREVIEW_CHARS {
+                    p.push('…');
+                }
+                p
+            };
+            return Err(PlannerError::EmptyResponse {
+                raw_len,
+                raw_preview,
+            });
         }
         // Append to in-flight.
         let inflight = self
@@ -297,7 +315,9 @@ fn build_system_prompt(reg: &Registry) -> String {
     // Tool catalog: iterate the fixed list of builtin tools in a
     // stable order. Registry does not expose iteration; naming
     // the tools explicitly is a deliberate choice for prompt
-    // determinism.
+    // determinism. NOTE: `finish` and `observe` are special forms,
+    // not tools, so they are NOT listed here — they appear in the
+    // grammar section below instead.
     const BUILTIN_TOOL_ORDER: &[&str] = &[
         "read-file",
         "write-file",
@@ -306,8 +326,6 @@ fn build_system_prompt(reg: &Registry) -> String {
         "ocr",
         "llm",
         "join-lines",
-        "finish",
-        "observe",
     ];
     let mut catalog = String::new();
     for name in BUILTIN_TOOL_ORDER {
@@ -326,41 +344,53 @@ one agnes DSL expression as an ```agnes fenced block. That expression will
 be parsed, type-checked, compiled, and executed by the runtime.
 
 Loop protocol:
-  * If your expression's result is wrapped as `(Observation T)` — e.g.
-    the outermost tool call is `observe` — the runtime feeds the rendered
-    result back to you on the next turn as a `<observation type="T">...</observation>`
-    block, and you produce another DSL expression.
-  * If the result is wrapped as `(Finish T)` — outer tool is `finish` —
-    the rendered result is shown to the user and the turn ENDS.
-  * If the result is neither `Finish` nor `Observation` (any plain type),
-    the runtime treats it as an IMPLICIT finish: shows to user, turn ends.
-    So unlabeled DSL still works; you only *need* `observe` when you want
-    to see the result and continue.
+  * Wrap your final answer with `(finish X)` to end this user turn — the
+    rendered result of `X` is shown to the user and the loop stops.
+  * Wrap a value with `(observe X)` when you want to see the result and
+    decide the next step — the runtime sends `X` back as a
+    `<observation type="T">...</observation>` message on the next turn.
+  * If neither wrapper is present, the runtime treats the result as an
+    IMPLICIT finish (still shown to the user, turn ends). Prefer the
+    explicit `(finish X)` form; unlabeled works but is less clear.
   * On error (parse/check/compile/execute), you receive
     `<observation error="true">...</observation>` and should produce a
     corrected DSL on the next turn.
 
-Available builtin tools:
+Grammar cheatsheet — these are the SPECIAL FORMS (not tools):
+  * `(finish X)` — terminate this turn with `X` as the result.
+  * `(observe X)` — return `X` as an observation, continue the loop.
+  * `(pipe e1 e2 ... eN)` — thread each expression's result into the
+    next. Bare `finish` / `observe` as a pipe tail is shorthand for
+    `(finish <upstream>)` / `(observe <upstream>)`.
+  * `(tool NAME :param1 v1 :param2 v2 ...)` — call a tool from the
+    catalog below.
+  * `(let name expr)` or `(let name)` (inside a pipe) — bind a value.
+  * `(if cond then else)`, `(match scrutinee (pattern arm) ...)`,
+    `(foreach item collection body)` — control flow.
+  * `(list e1 e2 ...)` or `[e1 e2 ...]` — list literals.
+
+Available builtin tools (I/O primitives; use with `(tool NAME ...)`):
 {catalog}
 Rules:
   1. Produce EXACTLY ONE fenced ```agnes block per turn. No prose outside.
-  2. Prefer `finish` at the tail to make your intent explicit; unlabeled
-     is allowed but observability suffers.
-  3. Use `observe` when you need to see the result to decide the next step.
+  2. `finish` and `observe` are LANGUAGE FORMS. Write `(finish X)` — do
+     NOT write `(tool finish :input X)`; there is no such tool.
+  3. Prefer wrapping every terminating result with `(finish ...)` to
+     make your intent explicit.
   4. Do not invent tools not in the catalog above; the checker will reject.
 
 Examples (each is a complete turn):
 
 ```agnes
-(pipe (tool read-file :path "notes.md") (tool summarize) finish)
+(finish "Hello! How can I help you today?")
+```
+
+```agnes
+(finish (tool summarize :input (tool read-file :path "notes.md")))
 ```
 
 ```agnes
 (pipe (tool read-file :path "log.txt") (tool summarize) observe)
-```
-
-```agnes
-(pipe "task complete" finish)
 ```
 "#
     )

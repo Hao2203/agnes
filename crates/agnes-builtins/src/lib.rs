@@ -123,22 +123,10 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
         },
     )?;
 
-    // --- Loop control tools ---
-    let unknown = TypeExpr::named("Unknown");
-    reg.register_tool(
-        "finish",
-        ToolSignature {
-            requires: vec![("input".into(), unknown.clone())],
-            provides: unknown.clone(),
-        },
-    )?;
-    reg.register_tool(
-        "observe",
-        ToolSignature {
-            requires: vec![("input".into(), unknown.clone())],
-            provides: unknown,
-        },
-    )?;
+    // `finish` and `observe` are handled as special-form `Expr::Finish` /
+    // `Expr::Observe` (parser → checker → compiler → runtime); they are NOT
+    // registered as tools. The wrapper types `Finish` / `Observation` remain
+    // registered above so `show_value` and `classify_root` can recognise them.
 
     // shell-run tool
     let string_ty = TypeExpr::named("String");

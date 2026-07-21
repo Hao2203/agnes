@@ -142,6 +142,24 @@ pub enum Expr {
     },
     /// `(return expr)`
     Return { span: Span, value: Box<Expr> },
+    /// `(finish expr)` or, inside a pipe, bare `finish` — wraps the value's
+    /// runtime type in `Finish T`, signalling to the agent-loop that this
+    /// turn should terminate. `value: None` is only produced by the pipe
+    /// bare-symbol desugar and must be resolved to `Some(<upstream>)` by
+    /// the compiler's pipe threading before execution.
+    Finish {
+        span: Span,
+        value: Option<Box<Expr>>,
+    },
+    /// `(observe expr)` or, inside a pipe, bare `observe` — wraps the
+    /// value's runtime type in `Observation T`, signalling to the
+    /// agent-loop that the result should be fed back to the planner as an
+    /// observation and the loop should continue. Same `value: None`
+    /// convention as `Finish`.
+    Observe {
+        span: Span,
+        value: Option<Box<Expr>>,
+    },
     /// A literal in expression position.
     Literal { span: Span, lit: Literal },
     /// A reference to a bound name (from `let` or a `define` param).
@@ -165,6 +183,8 @@ impl Expr {
             | Expr::Catch { span, .. }
             | Expr::Llm { span, .. }
             | Expr::Return { span, .. }
+            | Expr::Finish { span, .. }
+            | Expr::Observe { span, .. }
             | Expr::Literal { span, .. }
             | Expr::Var { span, .. }
             | Expr::List { span, .. } => *span,

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::path::PathBuf;
 
 use agnes_llm::{CompletionRequest, Message, Provider, Role};
-use agnes_types::{TypeExpr, TypeName, Value};
+use agnes_types::Value;
 use serde_json::Value as JsonValue;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -241,44 +241,12 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
         m.insert("translate".into(), Arc::new(translate));
     }
 
-    // --- Loop control: finish / observe ---
-    // Both are identity on data but rewrite declared_type at the outer
-    // layer so Session::run_turn can classify the root shape.
-    let finish: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|mut kw: HashMap<String, Value>, _resolver| {
-            Box::pin(async move {
-                let inner = kw
-                    .remove("input")
-                    .ok_or_else(|| "finish requires :input".to_string())?;
-                Ok(Value {
-                    data: inner.data,
-                    declared_type: TypeExpr::App {
-                        head: TypeName("Finish".into()),
-                        args: vec![inner.declared_type],
-                    },
-                })
-            })
-        });
-    m.insert("finish".into(), Arc::new(finish));
+    // `finish` and `observe` are not registered as tools: they are
+    // Expr::Finish / Expr::Observe special forms dispatched by the compiler
+    // and runtime directly. See `agnes-runtime::scheduler::NodeKind::Finish`
+    // and `NodeKind::Observe`.
 
-    let observe: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|mut kw: HashMap<String, Value>, _resolver| {
-            Box::pin(async move {
-                let inner = kw
-                    .remove("input")
-                    .ok_or_else(|| "observe requires :input".to_string())?;
-                Ok(Value {
-                    data: inner.data,
-                    declared_type: TypeExpr::App {
-                        head: TypeName("Observation".into()),
-                        args: vec![inner.declared_type],
-                    },
-                })
-            })
-        });
-    m.insert("observe".into(), Arc::new(observe));
-
-    // parse-path — parse and validate a string path to Path type
+    // parse-path - parse and validate a string path to Path type
     let parse_path: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
         Box::new(|args, resolver| {
             Box::pin(async move {
@@ -293,7 +261,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
         });
     m.insert("parse-path".into(), Arc::new(parse_path));
 
-    // shell-run — execute shell command with user confirmation
+    // shell-run - execute shell command with user confirmation
     use tokio::process::Command;
     use serde_json::json;
 

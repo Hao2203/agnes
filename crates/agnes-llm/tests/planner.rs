@@ -22,13 +22,16 @@ fn planner_with(responses: Vec<String>) -> (Planner, Arc<MockProvider>) {
 }
 
 #[tokio::test]
-async fn system_prompt_lists_all_builtin_tools_including_finish_and_observe() {
-    let (mut p, mock) = planner_with(vec!["```agnes\n(pipe \"hi\" finish)\n```".into()]);
+async fn system_prompt_lists_all_builtin_tools_and_mentions_finish_observe_forms() {
+    // finish/observe are now special forms — they must NOT appear in the
+    // tool catalog. They MUST still be documented as language forms.
+    let (mut p, mock) = planner_with(vec!["```agnes\n(finish \"hi\")\n```".into()]);
     p.begin_user_turn("hi".into());
     let _ = p.plan_next().await.unwrap();
     let seen = mock.seen();
     assert_eq!(seen.len(), 1);
     let sys = seen[0].system.as_deref().unwrap_or("");
+    // Every I/O tool must be catalogued.
     for name in &[
         "read-file",
         "write-file",
@@ -37,23 +40,36 @@ async fn system_prompt_lists_all_builtin_tools_including_finish_and_observe() {
         "ocr",
         "llm",
         "join-lines",
-        "finish",
-        "observe",
     ] {
         assert!(sys.contains(name), "system prompt missing tool `{name}`");
     }
+    // finish/observe must be described (they're special forms), and the
+    // `(finish X)` / `(observe X)` shape must be shown.
+    assert!(
+        sys.contains("(finish X)") && sys.contains("(observe X)"),
+        "system prompt must document the (finish X) / (observe X) special forms"
+    );
+    // No `- finish :` catalog line should exist (that was the old tool form).
+    assert!(
+        !sys.contains("- finish :"),
+        "finish must not appear in the tool catalog"
+    );
+    assert!(
+        !sys.contains("- observe :"),
+        "observe must not appear in the tool catalog"
+    );
 }
 
 #[tokio::test]
 async fn system_prompt_mentions_finish_and_observation_semantics() {
-    let (mut p, mock) = planner_with(vec!["```agnes\n(pipe \"hi\" finish)\n```".into()]);
+    let (mut p, mock) = planner_with(vec!["```agnes\n(finish \"hi\")\n```".into()]);
     p.begin_user_turn("hi".into());
     let _ = p.plan_next().await.unwrap();
     let sys = mock.seen()[0].system.clone().unwrap_or_default();
-    // The prompt must explain the loop.
+    // The prompt must explain the loop protocol.
     assert!(
-        sys.contains("Finish") && sys.contains("Observation"),
-        "system prompt must reference Finish and Observation semantics"
+        sys.contains("finish") && sys.contains("observe"),
+        "system prompt must reference finish and observe semantics"
     );
     assert!(
         sys.contains("<observation"),

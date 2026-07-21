@@ -120,3 +120,43 @@ fn observation_records_type_name_when_provided() {
     assert!(!obs.is_error);
     assert_eq!(obs.type_name.as_ref().unwrap().0, "Summary");
 }
+
+#[tokio::test]
+async fn empty_response_error_carries_raw_preview() {
+    use agnes_llm::PlannerError;
+    // Fenced block with only whitespace inside — extract_dsl returns "".
+    let raw = "```agnes\n   \n```".to_string();
+    let mut p = planner_with(vec![raw.clone()]);
+    p.begin_user_turn("...".into());
+    let err = p.plan_next().await.unwrap_err();
+    match err {
+        PlannerError::EmptyResponse {
+            raw_len,
+            raw_preview,
+        } => {
+            assert_eq!(raw_len, raw.chars().count());
+            assert!(
+                raw_preview.contains("```agnes"),
+                "preview should contain the fence: {raw_preview:?}"
+            );
+        }
+        other => panic!("expected EmptyResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_response_labels_whitespace_only_raw() {
+    use agnes_llm::PlannerError;
+    let mut p = planner_with(vec!["   \n\n".into()]);
+    p.begin_user_turn("...".into());
+    let err = p.plan_next().await.unwrap_err();
+    match err {
+        PlannerError::EmptyResponse { raw_preview, .. } => {
+            assert!(
+                raw_preview.contains("whitespace-only"),
+                "preview should flag whitespace-only: {raw_preview:?}"
+            );
+        }
+        other => panic!("expected EmptyResponse, got {other:?}"),
+    }
+}

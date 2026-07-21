@@ -1,13 +1,19 @@
-use agnes_builtins::{native_dispatch, register_builtins, PathResolver, Tool};
+// After the finish/observe → special-form refactor, these constructs are
+// no longer registered as tools. What remains testable in agnes-builtins:
+//   * The registry still knows about the wrapper *type* names `Finish` and
+//     `Observation` (so `(declare tool ... provides (Finish T))` and
+//     `show_value` work).
+//   * The tool dispatch table no longer contains `finish` or `observe`.
+//   * The tool registry no longer lists them under `tool_signature`.
+// The full end-to-end wrapping behavior is covered by
+// `agnes-session/tests/session_end_to_end.rs`.
+
+use agnes_builtins::{native_dispatch, register_builtins};
 use agnes_llm::MockProvider;
 use agnes_registry::Registry;
-use agnes_types::{TypeExpr, TypeName, Value};
-use serde_json::{Value as JsonValue, json};
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-fn dispatch() -> HashMap<String, agnes_builtins::ToolImpl> {
+fn dispatch() -> std::collections::HashMap<String, agnes_builtins::ToolImpl> {
     let mock = Arc::new(MockProvider::new(vec![]));
     native_dispatch(mock)
 }
@@ -18,118 +24,44 @@ fn reg() -> Registry {
     r
 }
 
-struct DummyResolver;
-impl PathResolver for DummyResolver {
-    fn resolve_path<'a>(&'a self, _input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
-        panic!("dummy resolver should not be called in this test")
-    }
-}
-
-static DUMMY: DummyResolver = DummyResolver;
-
-fn kwargs_with_input(v: Value) -> HashMap<String, Value> {
-    let mut m = HashMap::new();
-    m.insert("input".to_string(), v);
-    m
-}
-
-#[tokio::test]
-async fn finish_wraps_upstream_type_as_finish() {
-    let d = dispatch();
-    let finish = d.get("finish").expect("finish tool registered");
-    let upstream = Value {
-        data: json!("done"),
-        declared_type: TypeExpr::named("PlainText"),
-    };
-    let out = finish.call(kwargs_with_input(upstream), &DUMMY).await.unwrap();
-    // Data unchanged.
-    assert_eq!(out.data, JsonValue::String("done".to_string()));
-    // declared_type wrapped as (Finish PlainText).
-    assert_eq!(
-        out.declared_type,
-        TypeExpr::App {
-            head: TypeName("Finish".into()),
-            args: vec![TypeExpr::named("PlainText")],
-        }
-    );
-}
-
-#[tokio::test]
-async fn observe_wraps_upstream_type_as_observation() {
-    let d = dispatch();
-    let observe = d.get("observe").expect("observe tool registered");
-    let upstream = Value {
-        data: json!({"tokens": 42}),
-        declared_type: TypeExpr::named("JSON"),
-    };
-    let out = observe.call(kwargs_with_input(upstream), &DUMMY).await.unwrap();
-    assert_eq!(out.data, json!({"tokens": 42}));
-    assert_eq!(
-        out.declared_type,
-        TypeExpr::App {
-            head: TypeName("Observation".into()),
-            args: vec![TypeExpr::named("JSON")],
-        }
-    );
-}
-
-#[tokio::test]
-async fn finish_wraps_already_wrapped_type_last_one_wins() {
-    // (pipe X observe finish) — spec §12 "last one wins" semantics.
-    // Runtime wraps sequentially; the outermost head is what Session sees.
-    let d = dispatch();
-    let observe = d.get("observe").unwrap();
-    let finish = d.get("finish").unwrap();
-
-    let upstream = Value {
-        data: json!("hi"),
-        declared_type: TypeExpr::named("PlainText"),
-    };
-    let after_observe = observe.call(kwargs_with_input(upstream), &DUMMY).await.unwrap();
-    let after_finish = finish.call(kwargs_with_input(after_observe), &DUMMY).await.unwrap();
-
-    // Outer is Finish, inner is Observation of PlainText.
-    assert_eq!(
-        after_finish.declared_type,
-        TypeExpr::App {
-            head: TypeName("Finish".into()),
-            args: vec![TypeExpr::App {
-                head: TypeName("Observation".into()),
-                args: vec![TypeExpr::named("PlainText")],
-            }],
-        }
-    );
-}
-
 #[test]
-fn finish_tool_registered_with_unknown_signature() {
+fn finish_is_not_a_registered_tool_after_refactor() {
     let r = reg();
-    let sig = r.tool_signature("finish").expect("finish registered");
-    // requires: [("input", Unknown)]
-    assert_eq!(sig.requires.len(), 1);
-    assert_eq!(sig.requires[0].0, "input");
-    assert_eq!(sig.requires[0].1, TypeExpr::named("Unknown"));
-    // provides: Unknown
-    assert_eq!(sig.provides, TypeExpr::named("Unknown"));
+    assert!(
+        r.tool_signature("finish").is_none(),
+        "finish must no longer be a tool; it's a special form (Expr::Finish)"
+    );
 }
 
 #[test]
-fn observe_tool_registered_with_unknown_signature() {
+fn observe_is_not_a_registered_tool_after_refactor() {
     let r = reg();
-    let sig = r.tool_signature("observe").expect("observe registered");
-    assert_eq!(sig.requires.len(), 1);
-    assert_eq!(sig.requires[0].0, "input");
-    assert_eq!(sig.requires[0].1, TypeExpr::named("Unknown"));
-    assert_eq!(sig.provides, TypeExpr::named("Unknown"));
+    assert!(
+        r.tool_signature("observe").is_none(),
+        "observe must no longer be a tool; it's a special form (Expr::Observe)"
+    );
 }
 
 #[test]
-fn finish_and_observation_types_registered() {
-    let _r = reg();
-    // Types must be registered so (declare tool ...) syntax with (Finish _)
-    // won't fail with UnknownName. Task 3 already lets resolve accept the
-    // heads; register_type here makes them first-class names too.
-    // The exact API check: registering again fails with NameConflict.
+fn finish_is_not_in_the_native_dispatch_table() {
+    let d = dispatch();
+    assert!(
+        d.get("finish").is_none(),
+        "native_dispatch must not carry a finish entry any more"
+    );
+}
+
+#[test]
+fn observe_is_not_in_the_native_dispatch_table() {
+    let d = dispatch();
+    assert!(d.get("observe").is_none(), "same for observe");
+}
+
+#[test]
+fn finish_and_observation_wrapper_types_stay_registered() {
+    // Wrapper types must remain in the registry so `declared_type`s of the
+    // form `(Finish T)` / `(Observation T)` resolve, and so `show_value`
+    // can strip the wrapper layer.
     let mut r2 = Registry::new();
     register_builtins(&mut r2).unwrap();
     let err = r2.register_type("Finish", None).unwrap_err();
@@ -137,6 +69,13 @@ fn finish_and_observation_types_registered() {
         agnes_registry::RegistryError::NameConflict { name, .. } => {
             assert_eq!(name, "Finish");
         }
-        other => panic!("expected NameConflict, got {other:?}"),
+        other => panic!("expected NameConflict for Finish, got {other:?}"),
+    }
+    let err = r2.register_type("Observation", None).unwrap_err();
+    match err {
+        agnes_registry::RegistryError::NameConflict { name, .. } => {
+            assert_eq!(name, "Observation");
+        }
+        other => panic!("expected NameConflict for Observation, got {other:?}"),
     }
 }

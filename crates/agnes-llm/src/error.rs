@@ -36,6 +36,11 @@ pub enum PlannerError {
     #[error(transparent)]
     Llm(#[from] LlmError),
 
-    #[error("planner produced empty response after DSL extraction")]
-    EmptyResponse,
+    #[error(
+        "planner produced empty response after DSL extraction\n  raw response ({raw_len} chars): {raw_preview}\n  Fix: verify the model actually returned a fenced ```agnes block; check provider rate limits / content filtering; retry."
+    )]
+    EmptyResponse {
+        raw_len: usize,
+        raw_preview: String,
+    },
 }

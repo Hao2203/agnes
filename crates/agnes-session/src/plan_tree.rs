@@ -26,6 +26,8 @@ fn build(dag: &Dag, id: agnes_compiler::NodeId) -> PlanTree {
         NodeKind::Retry { times, .. } => ("retry".into(), format!("retry {times}")),
         NodeKind::Catch { .. } => ("catch".into(), "catch".into()),
         NodeKind::Return => ("return".into(), "return".into()),
+        NodeKind::Finish => ("finish".into(), "finish".into()),
+        NodeKind::Observe => ("observe".into(), "observe".into()),
         NodeKind::Literal(lit) => ("lit".into(), format!("{lit:?}")),
         NodeKind::Var(n) => ("var".into(), n.clone()),
         NodeKind::List => ("list".into(), "list".into()),

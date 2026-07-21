@@ -88,6 +88,11 @@ fn walk(e: &Expr, out: &mut HashSet<String>) {
             }
         }
         Expr::Return { value, .. } => walk(value, out),
+        Expr::Finish { value, .. } | Expr::Observe { value, .. } => {
+            if let Some(v) = value {
+                walk(v, out);
+            }
+        }
         Expr::List { items, .. } => items.iter().for_each(|s| walk(s, out)),
         Expr::Literal { .. } | Expr::Var { .. } => {}
     }
