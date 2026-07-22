@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 struct DummyResolver;
 impl PathResolver for DummyResolver {
-    fn resolve_path<'a>(&'a self, _input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
-        panic!("dummy resolver should not be called in this test");
+    fn resolve_path<'a>(&'a self, input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
+        // Resolve paths relative to the project root
+        let root = std::env::current_dir().unwrap();
+        let path = root.join(input);
+        Box::pin(async move { Ok(path) })
     }
 }
 
