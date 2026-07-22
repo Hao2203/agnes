@@ -99,6 +99,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
             Box::pin(async move {
                 let path_str = arg_str(&args, "path")?;
                 let content = arg_str(&args, "content")?;
+                let content_len = content.len();
                 let path = resolver.resolve_path(&path_str).await?;
 
                 // Create parent directories if they don't exist
@@ -111,6 +112,9 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                 tokio::fs::write(&path, content)
                     .await
                     .map_err(|e| format!("cannot write file '{}': {}", path.display(), e))?;
+
+                // Record write for WriteSummary event
+                writes().lock().unwrap().push((path.display().to_string(), content_len));
 
                 Ok(Value::typed(JsonValue::Null, "Unit"))
             })

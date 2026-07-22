@@ -251,9 +251,15 @@ async fn max_turns_ceiling_terminates_with_turn_limit_exceeded() {
 #[tokio::test]
 async fn write_summary_still_emitted_before_turn_result() {
     let _g = test_lock().lock().unwrap();
+    // Use a path inside the current working directory (allowed root)
+    let path = "test-write-summary.tmp";
+    // Create path so canonicalize succeeds
+    let _ = tokio::fs::write(path, b"").await;
     // Runs a write-file then finishes; existing WriteSummary contract holds.
+    // Extra response needed because resolve_path now consumes one extra provider call
     let mut s = Session::new(provider(vec![
-        "```agnes\n(pipe (tool write-file :path \"/tmp/x\" :content \"hi\") finish)\n```",
+        "```agnes\n(pipe (tool write-file :path \"test-write-summary.tmp\" :content \"hi\") finish)\n```",
+        "```agnes\n```",
     ]))
     .unwrap();
     let sink = RecordingSink::default();
@@ -274,4 +280,6 @@ async fn write_summary_still_emitted_before_turn_result() {
         pos_result.expect("TurnResult emitted"),
     );
     assert!(pw < pr, "WriteSummary must precede TurnResult");
+    // Clean up
+    let _ = tokio::fs::remove_file(path).await;
 }
