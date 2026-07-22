@@ -17,8 +17,8 @@ fn create_test_session() -> Session {
     Session::new(provider).unwrap()
 }
 
-#[test]
-fn test_resolve_path_inside_root_allowed() {
+#[tokio::test]
+async fn test_resolve_path_inside_root_allowed() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_owned();
 
@@ -29,12 +29,12 @@ fn test_resolve_path_inside_root_allowed() {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src").join("main.rs"), "test").unwrap();
     let input = format!("{}/src/main.rs", root.display());
-    let result = session.resolve_path(&input);
+    let result = session.resolve_path(&input).await;
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_resolve_path_outside_root_rejected() {
+#[tokio::test]
+async fn test_resolve_path_outside_root_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -47,14 +47,14 @@ fn test_resolve_path_outside_root_rejected() {
 
     // Use absolute path that is definitely outside the root
     let input = outside.to_str().unwrap();
-    let result = session.resolve_path(input);
+    let result = session.resolve_path(input).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("outside allowed root"));
 }
 
-#[test]
-fn test_resolve_path_symlink_outside_rejected() {
+#[tokio::test]
+async fn test_resolve_path_symlink_outside_rejected() {
     // Skip this test if symlinks are not available
     if cfg!(windows) {
         return;
@@ -74,6 +74,6 @@ fn test_resolve_path_symlink_outside_rejected() {
     let session = create_test_session()
         .with_allow_root(root);
 
-    let result = session.resolve_path("link.txt");
+    let result = session.resolve_path("link.txt").await;
     assert!(result.is_err());
 }

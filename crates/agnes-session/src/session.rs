@@ -123,7 +123,9 @@ impl Session {
 
     /// Builder method to set allowed root directory.
     pub fn with_allow_root(mut self, path: PathBuf) -> Self {
-        self.allow_root = Some(path);
+        let canonical = std::fs::canonicalize(&path)
+            .unwrap_or_else(|e| panic!("failed to canonicalize allow_root path '{}': {}", path.display(), e));
+        self.allow_root = Some(canonical);
         self
     }
 
@@ -139,7 +141,7 @@ impl Session {
     }
 
     /// Resolve and validate a user-provided path against the allowed root.
-    pub fn resolve_path(&self, input: &str) -> Result<PathBuf, String> {
+    pub async fn resolve_path(&self, input: &str) -> Result<PathBuf, String> {
         let current_dir = std::env::current_dir()
             .map_err(|e| format!("failed to get current directory: {}", e))?;
 
@@ -154,7 +156,8 @@ impl Session {
         };
 
         // Canonicalize to resolve symlinks and .. components
-        let canonical = candidate.canonicalize()
+        let canonical = tokio::fs::canonicalize(&candidate)
+            .await
             .map_err(|e| format!("cannot resolve path '{}': {}", input, e))?;
 
         // Check that the canonical path starts with the allowed root
