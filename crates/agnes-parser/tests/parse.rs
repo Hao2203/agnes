@@ -28,17 +28,6 @@ fn parses_a_single_pipe() {
 }
 
 #[test]
-fn parses_declare_type() {
-    let src = r#"(declare type PDF)"#;
-    let p = parse(src).expect("parse ok");
-    assert_eq!(p.toplevels.len(), 1);
-    match &p.toplevels[0] {
-        TopLevel::DeclareType { name, .. } => assert_eq!(name, "PDF"),
-        other => panic!("expected DeclareType, got {other:?}"),
-    }
-}
-
-#[test]
 fn parses_declare_type_alias() {
     let src = r#"(declare type-alias TextLike (| PlainText Markdown HTML))"#;
     let p = parse(src).expect("parse ok");
@@ -85,32 +74,6 @@ fn rejects_infix_union() {
         msg.contains("union") && msg.contains("prefix"),
         "expected migration hint about prefix form, got: {msg}"
     );
-}
-
-#[test]
-fn parses_declare_tool_position_based_param() {
-    // (source (| PDF Image)) — no trailing colon on the name.
-    let src = r#"
-        (declare tool ocr
-          :requires [(source (| PDF Image))]
-          :provides PlainText)
-    "#;
-    let p = parse(src).expect("parse ok");
-    match &p.toplevels[0] {
-        TopLevel::DeclareTool { requires, .. } => {
-            assert_eq!(requires.len(), 1);
-            assert_eq!(requires[0].name, "source");
-            // Type is (App { head: "|", args }) with 2 members.
-            match &requires[0].ty {
-                TypeExprAst::App { head, args } => {
-                    assert_eq!(head, "|");
-                    assert_eq!(args.len(), 2);
-                }
-                other => panic!("expected App union, got {other:?}"),
-            }
-        }
-        other => panic!("expected DeclareTool, got {other:?}"),
-    }
 }
 
 #[test]

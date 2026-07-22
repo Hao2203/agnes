@@ -87,7 +87,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
                 Ok(Value::typed(
                     JsonValue::String(content),
-                    "PlainText",
+                    "String",
                 ))
             })
         });
@@ -121,28 +121,13 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
         });
     m.insert("write-file".into(), Arc::new(write_file));
 
-    // ocr (mock: fixed sentence)
-    let ocr: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|args, _resolver| {
-            Box::pin(async move {
-                let _ = arg_str(&args, "source")?;
-                Ok(Value::typed(
-                    JsonValue::String(
-                        "Extracted text: agnes runtime dispatches LLM-planned workflows.".into(),
-                    ),
-                    "PlainText",
-                ))
-            })
-        });
-    m.insert("ocr".into(), Arc::new(ocr));
-
     // join-lines (real, kept)
     let join_lines: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
         Box::new(|args, _resolver| {
             Box::pin(async move {
                 let lines = args
                     .get("lines")
-                    .ok_or_else(|| "missing :lines".to_string())?
+                    .ok_or_else(|| "missing `lines` parameter".to_string())?
                     .data
                     .as_array()
                     .ok_or_else(|| "lines is not a JSON array".to_string())?
@@ -150,7 +135,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     .map(|v| v.as_str().unwrap_or("").to_string())
                     .collect::<Vec<_>>()
                     .join("\n");
-                Ok(Value::typed(JsonValue::String(lines), "PlainText"))
+                Ok(Value::typed(JsonValue::String(lines), "String"))
             })
         });
     m.insert("join-lines".into(), Arc::new(join_lines));
@@ -180,7 +165,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                         })
                         .await
                         .map_err(|e| e.to_string())?;
-                    Ok(Value::typed(JsonValue::String(out), "PlainText"))
+                    Ok(Value::typed(JsonValue::String(out), "String"))
                 })
             });
         m.insert("llm".into(), Arc::new(llm));
@@ -207,7 +192,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                         })
                         .await
                         .map_err(|e| e.to_string())?;
-                    Ok(Value::typed(JsonValue::String(out), "Summary"))
+                    Ok(Value::typed(JsonValue::String(out), "String"))
                 })
             });
         m.insert("summarize".into(), Arc::new(summarize));
@@ -235,7 +220,7 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                         })
                         .await
                         .map_err(|e| e.to_string())?;
-                    Ok(Value::typed(JsonValue::String(out), "PlainText"))
+                    Ok(Value::typed(JsonValue::String(out), "String"))
                 })
             });
         m.insert("translate".into(), Arc::new(translate));

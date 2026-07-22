@@ -20,7 +20,7 @@ fn args(kvs: &[(&str, &str)]) -> HashMap<String, Value> {
         .map(|(k, v)| {
             (
                 (*k).into(),
-                Value::typed(JsonValue::String((*v).into()), "PlainText"),
+                Value::typed(JsonValue::String((*v).into()), "String"),
             )
         })
         .collect()
@@ -68,7 +68,6 @@ async fn summarize_routes_through_provider() {
         .await
         .unwrap();
     assert_eq!(out.data.as_str().unwrap(), "one-para summary");
-    assert_eq!(out.declared_type.to_string(), "Summary");
 }
 
 #[tokio::test]
@@ -85,17 +84,6 @@ async fn llm_routes_through_provider() {
     assert!(seen[0].messages[0].content.contains("context"));
 }
 
-
-#[tokio::test]
-async fn ocr_returns_fixed_placeholder() {
-    let mock = Arc::new(MockProvider::new(vec![]));
-    let d = native_dispatch(mock);
-    let out = d["ocr"].call(args(&[("source", "any.pdf")]), &DUMMY).await.unwrap();
-    let s = out.data.as_str().unwrap();
-    assert!(!s.is_empty(), "ocr must return some canned sentence");
-    assert_eq!(out.declared_type.to_string(), "PlainText");
-}
-
 #[tokio::test]
 async fn llm_is_callable_via_tool_form() {
     // After de-special-casing, `llm` is an ordinary tool reached through
@@ -104,5 +92,5 @@ async fn llm_is_callable_via_tool_form() {
     let d = dispatch();
     let llm = d.get("llm").expect("llm tool registered");
     let out = llm.call(args(&[("prompt", "hi"), ("input", "")]), &DUMMY).await.unwrap();
-    assert_eq!(out.declared_type.to_string(), "PlainText"); // still PlainText until Task 3
+    assert_eq!(out.declared_type.to_string(), "String");
 }

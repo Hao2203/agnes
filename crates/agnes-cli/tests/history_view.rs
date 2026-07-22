@@ -49,9 +49,9 @@ fn multi_iteration_turn_shows_observations_between_dsls() {
         iterations: vec![
             iter(
                 "(pipe (tool read-file \"x\") observe)",
-                Some(obs("hello world", false, Some("PlainText"))),
+                Some(obs("hello world", false, Some("String"))),
             ),
-            iter("(pipe (tool translate \"text\" \"ja\") finish)", None),
+            iter("(pipe \"text\" (tool translate \"ja\") finish)", None),
         ],
         outcome: TurnOutcome::Finished {
             result: "こんにちは".into(),
@@ -63,7 +63,7 @@ fn multi_iteration_turn_shows_observations_between_dsls() {
     // Two iterations, one observation.
     assert!(s.contains("iter 0:"));
     assert!(s.contains("iter 1:"));
-    assert!(s.contains("obs (PlainText): hello world"));
+    assert!(s.contains("obs (String): hello world"));
     assert!(s.contains("outcome: Finished: こんにちは"));
 }
 

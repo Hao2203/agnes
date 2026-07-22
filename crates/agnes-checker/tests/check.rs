@@ -1,44 +1,27 @@
 use agnes_checker::check;
 use agnes_parser::parse;
 use agnes_registry::Registry;
-use agnes_types::{ToolSignature, TypeExpr, canonicalize_union};
+use agnes_types::{ToolSignature, TypeExpr};
 
 fn seed_registry() -> Registry {
     let mut r = Registry::new();
     r.register_type("Path", None).unwrap();
-    r.register_type("PlainText", None).unwrap();
-    r.register_type("Markdown", None).unwrap();
-    r.register_type("PDF", None).unwrap();
-    r.register_type("Image", None).unwrap();
-    r.register_type("Summary", None).unwrap();
-    r.register_type("Unit", None).unwrap();
     r.register_type("String", None).unwrap();
+    r.register_type("Unit", None).unwrap();
     // Tools
     r.register_tool(
         "read-file",
         ToolSignature {
             requires: vec![("path".into(), TypeExpr::named("Path"))],
-            provides: TypeExpr::named("PlainText"),
+            provides: TypeExpr::named("String"),
         },
     )
     .unwrap();
-    let text_like = canonicalize_union([TypeExpr::named("PlainText"), TypeExpr::named("Markdown")]);
     r.register_tool(
         "summarize",
         ToolSignature {
-            requires: vec![("input".into(), text_like.clone())],
-            provides: TypeExpr::named("Summary"),
-        },
-    )
-    .unwrap();
-    r.register_tool(
-        "ocr",
-        ToolSignature {
-            requires: vec![(
-                "source".into(),
-                canonicalize_union([TypeExpr::named("PDF"), TypeExpr::named("Image")]),
-            )],
-            provides: TypeExpr::named("PlainText"),
+            requires: vec![("input".into(), TypeExpr::named("String"))],
+            provides: TypeExpr::named("String"),
         },
     )
     .unwrap();
@@ -54,20 +37,10 @@ fn happy_path_read_then_summarize() {
 }
 
 #[test]
-fn flow_mismatch_produces_llm_friendly_error() {
-    let src = r#"(pipe (tool read-file "x.md") (tool ocr))"#;
-    let p = parse(src).unwrap();
-    let r = seed_registry();
-    let err = check(&p, &r).unwrap_err();
-    insta::assert_snapshot!("flow_mismatch", format!("{err}"));
-}
-
-#[test]
 fn list_of_string_typed_correctly() {
     // Register a tool that takes (List String).
     let mut r = Registry::new();
     r.register_type("String", None).unwrap();
-    r.register_type("PlainText", None).unwrap();
     r.register_tool(
         "consume-strings",
         ToolSignature {
@@ -78,7 +51,7 @@ fn list_of_string_typed_correctly() {
                     args: vec![TypeExpr::named("String")],
                 },
             )],
-            provides: TypeExpr::named("PlainText"),
+            provides: TypeExpr::named("String"),
         },
     )
     .unwrap();
@@ -93,7 +66,6 @@ fn list_of_mixed_types_rejected_where_list_of_string_expected() {
     let mut r = Registry::new();
     r.register_type("String", None).unwrap();
     r.register_type("Int", None).unwrap();
-    r.register_type("PlainText", None).unwrap();
     r.register_tool(
         "consume-strings",
         ToolSignature {
@@ -104,7 +76,7 @@ fn list_of_mixed_types_rejected_where_list_of_string_expected() {
                     args: vec![TypeExpr::named("String")],
                 },
             )],
-            provides: TypeExpr::named("PlainText"),
+            provides: TypeExpr::named("String"),
         },
     )
     .unwrap();
@@ -122,7 +94,6 @@ fn empty_list_adapts_to_hint() {
     // Given a tool requiring (List String), passing [] should succeed.
     let mut r = Registry::new();
     r.register_type("String", None).unwrap();
-    r.register_type("PlainText", None).unwrap();
     r.register_type("Unknown", None).unwrap();
     r.register_tool(
         "consume-strings",
@@ -134,7 +105,7 @@ fn empty_list_adapts_to_hint() {
                     args: vec![TypeExpr::named("String")],
                 },
             )],
-            provides: TypeExpr::named("PlainText"),
+            provides: TypeExpr::named("String"),
         },
     )
     .unwrap();
@@ -146,11 +117,10 @@ fn empty_list_adapts_to_hint() {
 
 #[test]
 fn unbound_empty_list_via_let_is_still_list_unknown() {
-    // No hint at let site → empty list types as (List Unknown).
+    // No hint at let site -> empty list types as (List Unknown).
     let mut r = Registry::new();
     r.register_type("String", None).unwrap();
     r.register_type("Unknown", None).unwrap();
-    r.register_type("PlainText", None).unwrap();
     r.register_tool(
         "consume-strings",
         ToolSignature {
@@ -161,7 +131,7 @@ fn unbound_empty_list_via_let_is_still_list_unknown() {
                     args: vec![TypeExpr::named("String")],
                 },
             )],
-            provides: TypeExpr::named("PlainText"),
+            provides: TypeExpr::named("String"),
         },
     )
     .unwrap();

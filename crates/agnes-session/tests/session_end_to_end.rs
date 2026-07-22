@@ -65,7 +65,7 @@ async fn single_iteration_with_explicit_finish() {
 #[tokio::test]
 async fn unlabeled_result_is_implicit_finish() {
     let _g = test_lock().lock().unwrap();
-    // No finish or observe. Result is PlainText; Session treats as implicit finish.
+    // No finish or observe. Result is String; Session treats as implicit finish.
     let mut s = Session::new(provider(vec!["```agnes\n\"hello\"\n```"])).unwrap();
     let sink = RecordingSink::default();
     let sink = Arc::new(TokioMutex::new(sink));

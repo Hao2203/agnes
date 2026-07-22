@@ -8,18 +8,12 @@ mod types;
 pub use tools::{BoxFuture, Tool, ToolImpl, PathResolver, native_dispatch, writes};
 
 use agnes_registry::{Registry, RegistryError};
-use agnes_types::{ToolSignature, TypeExpr, TypeName, canonicalize_union};
+use agnes_types::{ToolSignature, TypeExpr, TypeName};
 
 pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     // --- Types + validators ---
     reg.register_type("Path", Some(types::path_validator))?;
-    reg.register_type("PlainText", Some(types::utf8_validator))?;
-    reg.register_type("Markdown", Some(types::utf8_validator))?;
-    reg.register_type("HTML", Some(types::utf8_validator))?;
     reg.register_type("JSON", Some(types::json_validator))?;
-    reg.register_type("PDF", Some(types::pdf_validator))?;
-    reg.register_type("Image", Some(types::image_validator))?;
-    reg.register_type("Summary", Some(types::utf8_validator))?;
     reg.register_type("Unit", Some(types::unit_validator))?;
     reg.register_type("Unknown", None)?;
     // Non-workflow types used by literals.
@@ -37,22 +31,21 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
         reg.register_show(name, *f)?;
     }
 
-    // --- Aliases ---
-    reg.register_alias("TextLike", aliases::text_like())?;
-    reg.register_alias("VisualDoc", aliases::visual_doc())?;
-
     // --- Tools ---
     let path = TypeExpr::named("Path");
-    let plaintext = TypeExpr::named("PlainText");
-    let summary = TypeExpr::named("Summary");
+    let string = TypeExpr::named("String");
     let unit = TypeExpr::named("Unit");
-    let string_ty = TypeExpr::named("String");
+    let command_result = TypeExpr::named("CommandResult");
+    let list_string = TypeExpr::App {
+        head: TypeName("List".into()),
+        args: vec![string.clone()],
+    };
 
     reg.register_tool(
         "read-file",
         ToolSignature {
             requires: vec![("path".into(), path.clone())],
-            provides: plaintext.clone(),
+            provides: string.clone(),
         },
     )?;
     reg.register_tool(
@@ -60,7 +53,7 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
         ToolSignature {
             requires: vec![
                 ("path".into(), path.clone()),
-                ("content".into(), aliases::text_like()),
+                ("content".into(), string.clone()),
             ],
             provides: unit.clone(),
         },
@@ -68,73 +61,55 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     reg.register_tool(
         "summarize",
         ToolSignature {
-            requires: vec![(
-                "input".into(),
-                canonicalize_union([
-                    TypeExpr::named("PlainText"),
-                    TypeExpr::named("Markdown"),
-                    TypeExpr::named("HTML"),
-                    TypeExpr::named("PDF"),
-                ]),
-            )],
-            provides: summary.clone(),
+            requires: vec![("input".into(), string.clone())],
+            provides: string.clone(),
         },
     )?;
     reg.register_tool(
         "translate",
         ToolSignature {
             requires: vec![
-                ("input".into(), aliases::text_like()),
-                ("lang".into(), string_ty.clone()),
+                ("lang".into(), string.clone()),
+                ("input".into(), string.clone()),
             ],
-            provides: plaintext.clone(),
-        },
-    )?;
-    reg.register_tool(
-        "ocr",
-        ToolSignature {
-            requires: vec![("source".into(), aliases::visual_doc())],
-            provides: plaintext.clone(),
+            provides: string.clone(),
         },
     )?;
     reg.register_tool(
         "llm",
         ToolSignature {
             requires: vec![
-                ("prompt".into(), string_ty.clone()),
-                ("input".into(), plaintext.clone()),
+                ("prompt".into(), string.clone()),
+                ("input".into(), string.clone()),
             ],
-            provides: plaintext.clone(),
+            provides: string.clone(),
         },
     )?;
-    let text_or_md =
-        canonicalize_union([TypeExpr::named("PlainText"), TypeExpr::named("Markdown")]);
     reg.register_tool(
         "join-lines",
         ToolSignature {
-            requires: vec![(
-                "lines".into(),
-                TypeExpr::App {
-                    head: TypeName("List".into()),
-                    args: vec![text_or_md],
-                },
-            )],
-            provides: plaintext.clone(),
+            requires: vec![("lines".into(), list_string)],
+            provides: string.clone(),
+        },
+    )?;
+    reg.register_tool(
+        "parse-path",
+        ToolSignature {
+            requires: vec![("path".into(), string.clone())],
+            provides: path.clone(),
         },
     )?;
 
     // `finish` and `observe` are handled as special-form `Expr::Finish` /
-    // `Expr::Observe` (parser → checker → compiler → runtime); they are NOT
+    // `Expr::Observe` (parser -> checker -> compiler -> runtime); they are NOT
     // registered as tools. The wrapper types `Finish` / `Observation` remain
     // registered above so `show_value` and `classify_root` can recognise them.
 
     // shell-run tool
-    let string_ty = TypeExpr::named("String");
-    let command_result = TypeExpr::named("CommandResult");
     reg.register_tool(
         "shell-run",
         ToolSignature {
-            requires: vec![("command".into(), string_ty)],
+            requires: vec![("command".into(), string)],
             provides: command_result,
         },
     )?;

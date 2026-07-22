@@ -4,8 +4,8 @@
 
 (define read-and-translate
   :params  [(path Path) (target String)]
-  :provides PlainText
-  (tool translate (tool read-file path) target))
+  :provides String
+  (pipe (tool read-file path) (tool translate target)))
 
 (pipe
   (par

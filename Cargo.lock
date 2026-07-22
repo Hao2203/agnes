@@ -10,6 +10,7 @@ version = "0.1.0"
 name = "agnes-builtins"
 version = "0.1.0"
 dependencies = [
+ "agnes-ast",
  "agnes-llm",
  "agnes-registry",
  "agnes-types",

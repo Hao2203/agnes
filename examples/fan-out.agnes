@@ -6,4 +6,4 @@
   (pipe
     (tool read-file "README.md")
     (tool summarize))
-  (tool translate (tool read-file "README.md") "ja"))
+  (pipe (tool read-file "README.md") (tool translate "ja")))

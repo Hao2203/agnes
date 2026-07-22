@@ -323,7 +323,6 @@ fn build_system_prompt(reg: &Registry) -> String {
         "write-file",
         "summarize",
         "translate",
-        "ocr",
         "llm",
         "join-lines",
     ];

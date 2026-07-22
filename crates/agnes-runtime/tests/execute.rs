@@ -41,7 +41,7 @@ async fn runs_a_defined_compound_tool() {
     let src = r#"
         (define read-and-summarize
           :params [(path Path)]
-          :provides Summary
+          :provides String
           (pipe
             (tool read-file path)
             (tool summarize)))
@@ -86,11 +86,11 @@ async fn boundary_validates_list_of_string_at_runtime() {
     let mut r = agnes_registry::Registry::new();
     agnes_builtins::register_builtins(&mut r).unwrap();
     // Manually augment: declare a tool that requires (List String) and
-    // returns PlainText — mock via source.
+    // returns String — mock via source.
     let src = r#"
         (declare tool see-list
           :requires [(items (List String))]
-          :provides PlainText)
+          :provides String)
 
         (tool see-list ["a" "b"])
     "#;
@@ -133,8 +133,8 @@ async fn boundary_validates_list_of_union_at_runtime() {
     // union inner. Prior code re-passed the union expected as the element's
     // declared_type, breaking the union-arm set-membership check.
     //
-    // join-lines requires (List (| PlainText Markdown)). Feeding a list of
-    // two read-file outputs (both PlainText) must succeed end-to-end.
+    // join-lines requires (List String). Feeding a list of
+    // two read-file outputs (both String) must succeed end-to-end.
     let src = r#"
         (pipe
           (let a (tool read-file "README.md"))
@@ -151,7 +151,7 @@ async fn boundary_validates_list_of_union_at_runtime() {
     let dummy = DummyResolver;
     let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy)
         .await
-        .expect("List (| PlainText Markdown) boundary must accept PlainText elements");
+        .expect("List String boundary must accept String elements");
     let s = out.data.as_str().expect("string result");
     assert!(s.contains("agnes"), "got: {s}");
 }

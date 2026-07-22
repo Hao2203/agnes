@@ -12,3 +12,6 @@ agnes-llm.workspace = true
 tokio = { workspace = true, features = ["process"] }
 serde_json.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+agnes-ast.workspace = true

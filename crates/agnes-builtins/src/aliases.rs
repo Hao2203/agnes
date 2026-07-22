@@ -1,13 +1,3 @@
-use agnes_types::{TypeExpr, canonicalize_union};
-
-pub fn text_like() -> TypeExpr {
-    canonicalize_union([
-        TypeExpr::named("PlainText"),
-        TypeExpr::named("Markdown"),
-        TypeExpr::named("HTML"),
-    ])
-}
-
-pub fn visual_doc() -> TypeExpr {
-    canonicalize_union([TypeExpr::named("PDF"), TypeExpr::named("Image")])
-}
+// Aliases were removed when PlainText/Markdown/HTML/PDF/Image types were
+// dropped (2026-07-22). Module kept as an empty placeholder so `mod aliases;`
+// in lib.rs still resolves; delete the `mod aliases;` line too if you prefer.

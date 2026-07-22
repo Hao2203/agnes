@@ -64,8 +64,8 @@ async fn positive_full_demo_runs() {
         r#"
 (define read-and-translate
   :params  [(path Path) (target String)]
-  :provides PlainText
-  (tool translate (tool read-file path) target))
+  :provides String
+  (pipe (tool read-file path) (tool translate target)))
 
 (pipe
   (let ja (tool read-and-translate "{readme}" "ja"))
@@ -102,7 +102,7 @@ async fn positive_option_string_declares_param() {
     let src = r#"
         (define maybe-greet
           :params [(name (Option String))]
-          :provides PlainText
+          :provides String
           (tool llm "greet" "hi"))
         (tool maybe-greet "world")
     "#;
@@ -117,7 +117,7 @@ async fn positive_option_string_accepts_nil() {
     let src = r#"
         (define maybe-greet
           :params [(name (Option String))]
-          :provides PlainText
+          :provides String
           (tool llm "greet" "hi"))
         (tool maybe-greet nil)
     "#;
@@ -129,7 +129,7 @@ async fn positive_option_string_accepts_nil() {
 
 #[tokio::test]
 async fn negative_list_arity_mismatch() {
-    let src = r#"(declare tool bad :requires [(x (List))] :provides PlainText)"#;
+    let src = r#"(declare tool bad :requires [(x (List))] :provides String)"#;
     let err = run(src).await.expect_err("must fail");
     let msg = err.to_string();
     assert!(
@@ -140,7 +140,7 @@ async fn negative_list_arity_mismatch() {
 
 #[tokio::test]
 async fn negative_option_arity_mismatch() {
-    let src = r#"(declare tool bad :requires [(x (Option A B))] :provides PlainText)"#;
+    let src = r#"(declare tool bad :requires [(x (Option A B))] :provides String)"#;
     let err = run(src).await.expect_err("must fail");
     let msg = err.to_string();
     assert!(
@@ -151,7 +151,7 @@ async fn negative_option_arity_mismatch() {
 
 #[tokio::test]
 async fn negative_unknown_head_suggests_builtins() {
-    let src = r#"(declare tool bad :requires [(x (Foo Bar))] :provides PlainText)"#;
+    let src = r#"(declare tool bad :requires [(x (Foo Bar))] :provides String)"#;
     let err = run(src).await.expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("Foo"), "got: {msg}");
@@ -182,28 +182,15 @@ async fn negative_comma_in_bracket_list() {
 
 #[tokio::test]
 async fn negative_mixed_list_where_string_list_expected() {
-    // join-lines accepts (List (| PlainText Markdown)) — passing (List Int)
+    // join-lines accepts (List String) — passing (List Int)
     // via a mixed literal fails.
     let src = r#"(tool join-lines ["a" 1])"#;
     let err = run(src).await.expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("List"), "got: {msg}");
 }
-
 #[tokio::test]
-async fn negative_flow_type_mismatch() {
-    // read-file provides PlainText; ocr requires ScannedImage → checker rejects.
-    let src = r#"(pipe (tool read-file "x.md") (tool ocr))"#;
-    let err = run(src).await.expect_err("must fail type check");
-    assert!(err.contains("Type error"), "missing 'Type error': {err}");
-    assert!(err.contains("ocr"), "missing 'ocr': {err}");
-    assert!(
-        err.contains("Fix suggestion"),
-        "missing 'Fix suggestion': {err}"
-    );
-}
 
-#[tokio::test]
 async fn negative_recursive_define() {
     let src = r#"(define loopy :params [] :provides Unit (tool loopy))"#;
     let err = run(src).await.expect_err("must fail compile");
@@ -216,7 +203,7 @@ async fn negative_recursive_define() {
 
 #[tokio::test]
 async fn negative_unknown_type() {
-    let src = r#"(declare tool weird :requires [(x MysteryType)] :provides PlainText)"#;
+    let src = r#"(declare tool weird :requires [(x MysteryType)] :provides String)"#;
     let err = run(src).await.expect_err("must fail registry load");
     assert!(
         err.contains("Unknown name"),
@@ -231,12 +218,12 @@ async fn negative_unknown_type() {
 
 #[tokio::test]
 async fn negative_name_conflict() {
-    // PlainText already registered as a builtin type.
-    let src = r#"(declare type PlainText)"#;
+    // String already registered as a builtin type.
+    let src = r#"(declare type String)"#;
     let err = run(src).await.expect_err("must fail registry load");
     assert!(
         err.contains("Name conflict"),
         "missing 'Name conflict': {err}"
     );
-    assert!(err.contains("PlainText"), "missing 'PlainText': {err}");
+    assert!(err.contains("String"), "missing 'String': {err}");
 }

@@ -3,7 +3,7 @@
 ;; bound from the incoming args.
 (define read-and-translate
   :params  [(path Path) (target String)]
-  :provides PlainText
-  (tool translate (tool read-file path) target))
+  :provides String
+  (pipe (tool read-file path) (tool translate target)))
 
 (tool read-and-translate "README.md" "ja")

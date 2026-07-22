@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn value_typed_helper_wraps_named() {
-        let v = Value::typed(serde_json::json!("x"), "PlainText");
-        assert_eq!(v.declared_type, TypeExpr::named("PlainText"));
+        let v = Value::typed(serde_json::json!("x"), "String");
+        assert_eq!(v.declared_type, TypeExpr::named("String"));
     }
 }

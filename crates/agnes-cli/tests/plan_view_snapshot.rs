@@ -4,7 +4,7 @@ fn sample() -> PlanTree {
     PlanTree {
         kind: "pipe".into(),
         label: "pipe".into(),
-        provides: Some("PlainText".into()),
+        provides: Some("String".into()),
         children: vec![
             PlanTree {
                 kind: "par".into(),
@@ -13,22 +13,22 @@ fn sample() -> PlanTree {
                 children: vec![PlanTree {
                     kind: "let".into(),
                     label: "let ja".into(),
-                    provides: Some("PlainText".into()),
+                    provides: Some("String".into()),
                     children: vec![PlanTree {
                         kind: "pipe".into(),
                         label: "pipe".into(),
-                        provides: Some("PlainText".into()),
+                        provides: Some("String".into()),
                         children: vec![
                             PlanTree {
                                 kind: "tool".into(),
                                 label: "tool read-file".into(),
-                                provides: Some("PlainText".into()),
+                                provides: Some("String".into()),
                                 children: vec![],
                             },
                             PlanTree {
                                 kind: "tool".into(),
                                 label: "tool translate".into(),
-                                provides: Some("PlainText".into()),
+                                provides: Some("String".into()),
                                 children: vec![],
                             },
                         ],
@@ -38,7 +38,7 @@ fn sample() -> PlanTree {
             PlanTree {
                 kind: "tool".into(),
                 label: "tool join-lines".into(),
-                provides: Some("PlainText".into()),
+                provides: Some("String".into()),
                 children: vec![],
             },
         ],
@@ -56,5 +56,5 @@ fn render_plan_uses_indent_tree_glyphs() {
     assert!(out.contains("├── par"));
     assert!(out.contains("│   └── let ja"));
     assert!(out.contains("└── tool join-lines"));
-    assert!(out.contains("→ PlainText"));
+    assert!(out.contains("→ String"));
 }

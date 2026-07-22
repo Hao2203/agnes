@@ -37,7 +37,6 @@ async fn system_prompt_lists_all_builtin_tools_and_mentions_finish_observe_forms
         "write-file",
         "summarize",
         "translate",
-        "ocr",
         "llm",
         "join-lines",
     ] {

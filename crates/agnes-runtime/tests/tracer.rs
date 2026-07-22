@@ -56,7 +56,7 @@ fn stub_dispatch() -> std::collections::HashMap<String, agnes_builtins::ToolImpl
         &'a (dyn agnes_builtins::PathResolver + Send + Sync)
     ) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
         Box::new(move |_args, _resolver| {
-            Box::pin(async { Ok(Value::typed(JsonValue::String("hello".into()), "PlainText")) })
+            Box::pin(async { Ok(Value::typed(JsonValue::String("hello".into()), "String")) })
         });
     m.insert(
         "read-file".to_string(),
@@ -71,7 +71,7 @@ fn stub_dispatch() -> std::collections::HashMap<String, agnes_builtins::ToolImpl
             Box::pin(async {
                 Ok(Value::typed(
                     JsonValue::String("[SUMMARY]".into()),
-                    "Summary",
+                    "String",
                 ))
             })
         });

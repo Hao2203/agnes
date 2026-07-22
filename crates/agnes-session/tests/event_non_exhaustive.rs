@@ -26,6 +26,6 @@ fn other_variants_still_constructible() {
     };
     let _r = SessionEvent::TurnResult {
         value_preview: "".into(),
-        value_type: "PlainText".into(),
+        value_type: "String".into(),
     };
 }

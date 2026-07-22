@@ -6,13 +6,12 @@ use agnes_types::{ToolSignature, TypeExpr, TypeName};
 fn seed() -> Registry {
     let mut r = Registry::new();
     r.register_type("Path", None).unwrap();
-    r.register_type("PlainText", None).unwrap();
-    r.register_type("Summary", None).unwrap();
+    r.register_type("String", None).unwrap();
     r.register_tool(
         "read-file",
         ToolSignature {
             requires: vec![("path".into(), TypeExpr::Named(TypeName("Path".into())))],
-            provides: TypeExpr::Named(TypeName("PlainText".into())),
+            provides: TypeExpr::Named(TypeName("String".into())),
         },
     )
     .unwrap();
@@ -21,9 +20,9 @@ fn seed() -> Registry {
         ToolSignature {
             requires: vec![(
                 "input".into(),
-                TypeExpr::Named(TypeName("PlainText".into())),
+                TypeExpr::Named(TypeName("String".into())),
             )],
-            provides: TypeExpr::Named(TypeName("Summary".into())),
+            provides: TypeExpr::Named(TypeName("String".into())),
         },
     )
     .unwrap();
@@ -61,8 +60,7 @@ fn compiles_a_pipe() {
 #[test]
 fn compiles_list_literal() {
     let src = r#"(list "a" "b")"#;
-    let mut r = seed();
-    r.register_type("String", None).unwrap();
+    let r = seed();
     let p = parse(src).unwrap();
     let dag = compile(&p, &r).expect("compile ok");
     // Expect a NodeKind::List with 2 element inputs.

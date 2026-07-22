@@ -17,42 +17,6 @@ fn v(data: serde_json::Value, ty: &str) -> Value {
 }
 
 #[test]
-fn plaintext_show_returns_raw_string() {
-    let r = reg_with_builtins();
-    assert_eq!(r.show_value(&v(json!("hello"), "PlainText")), "hello");
-}
-
-#[test]
-fn summary_show_returns_raw_string() {
-    let r = reg_with_builtins();
-    assert_eq!(r.show_value(&v(json!("brief"), "Summary")), "brief");
-}
-
-#[test]
-fn markdown_and_html_show_raw() {
-    let r = reg_with_builtins();
-    assert_eq!(r.show_value(&v(json!("# hi"), "Markdown")), "# hi");
-    assert_eq!(r.show_value(&v(json!("<p>hi</p>"), "HTML")), "<p>hi</p>");
-}
-
-#[test]
-fn pdf_show_returns_binary_placeholder() {
-    let r = reg_with_builtins();
-    // PDF data is a base64 or JSON string in practice; the show impl
-    // must NOT include the raw bytes.
-    let out = r.show_value(&v(json!("%PDF-1.4..."), "PDF"));
-    assert!(out.starts_with("<PDF binary"));
-    assert!(out.contains("bytes>"));
-}
-
-#[test]
-fn image_show_returns_binary_placeholder() {
-    let r = reg_with_builtins();
-    let out = r.show_value(&v(json!("iVBORw0K..."), "Image"));
-    assert!(out.starts_with("<Image binary"));
-}
-
-#[test]
 fn json_show_pretty_prints_object() {
     let r = reg_with_builtins();
     let out = r.show_value(&v(json!({"a": 1, "b": [true, null]}), "JSON"));
@@ -85,11 +49,11 @@ fn unit_show_is_empty_string() {
 }
 
 #[test]
-fn list_of_plaintext_shows_bracketed_comma_joined() {
+fn list_of_string_shows_bracketed_comma_joined() {
     let r = reg_with_builtins();
     let ty = TypeExpr::App {
         head: agnes_types::TypeName("List".into()),
-        args: vec![TypeExpr::named("PlainText")],
+        args: vec![TypeExpr::named("String")],
     };
     let v = Value {
         data: json!(["a", "b", "c"]),
@@ -107,7 +71,7 @@ fn duplicate_registration_fails() {
     let err = register_builtins(&mut r).unwrap_err();
     // Could be either NameConflict (types re-registered first) or
     // DuplicateShow (if types happened to succeed). Both are acceptable
-    // — we just check the second call refuses cleanly.
+    // - we just check the second call refuses cleanly.
     let msg = format!("{err}");
     assert!(!msg.is_empty(), "error message must be non-empty");
 }
