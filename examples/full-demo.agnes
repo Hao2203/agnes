@@ -1,11 +1,12 @@
-;; Full demo (spec §VII shape): declare a compound `read-and-translate`
-;; and dispatch it. Also exercises the new list literal + parameterized
-;; type flow via `join-lines`.
+;; Full demo: declare a compound `read-and-translate` and dispatch it.
+;; Also exercises the list literal + parameterized type flow via join-lines.
 
 (define read-and-translate
   :params  [(path Path) (target String)]
   :provides String
-  (pipe (tool read-file path) (tool translate target)))
+  (pipe
+    (tool read-file path)
+    (tool translate target)))
 
 (pipe
   (par

@@ -45,14 +45,14 @@ for the implementation plan.
 ```lisp
 (define read-and-translate
   :params  [(path Path) (target String)]
-  :provides PlainText
+  :provides String
   (pipe
-    (tool read-file :path path)
-    (tool translate :lang target)))
+    (tool read-file path)
+    (tool translate target)))
 
 (pipe
-  (let ja (tool read-and-translate :path "README.md" :target "ja"))
-  (tool join-lines :lines [ja ja]))
+  (let ja (tool read-and-translate "README.md" "ja"))
+  (tool join-lines [ja ja]))
 ```
 
 ## License

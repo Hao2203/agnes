@@ -1,9 +1,9 @@
-;; Parallel branches (Task 9 runtime executes them sequentially, but the
-;; DAG shape is genuine fan-out). Each branch is a self-contained pipe
-;; because MVP `par` does not propagate `let` bindings to later pipe
-;; steps.
+;; Parallel branches (runtime executes them sequentially, but the DAG
+;; shape is genuine fan-out). Each branch is a self-contained pipe.
 (par
   (pipe
     (tool read-file "README.md")
     (tool summarize))
-  (pipe (tool read-file "README.md") (tool translate "ja")))
+  (pipe
+    (tool read-file "README.md")
+    (tool translate "ja")))

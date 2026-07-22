@@ -1,2 +1,4 @@
 ;; Sequential pipe: read a file then translate it.
-(pipe (tool read-file "README.md") (tool translate "ja"))
+(pipe
+  (tool read-file "README.md")
+  (tool translate "ja"))
