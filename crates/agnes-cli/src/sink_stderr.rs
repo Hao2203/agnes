@@ -1,5 +1,6 @@
 use agnes_session::{EventSink, NodeKindTag, SessionEvent};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Renders SessionEvents to stderr with a start-time-relative timestamp.
@@ -140,7 +141,8 @@ impl EventSink for StderrEventSink {
                 let input = input.trim().to_lowercase();
 
                 let approved = input.is_empty() || input == "y" || input == "yes";
-                let _ = responder.send(approved);
+                let tx = Arc::into_inner(responder).expect("Only one Arc reference should exist");
+                let _ = tx.send(approved);
             }
             _ => {
                 // Future SessionEvent variants render nothing by default.

@@ -1,4 +1,5 @@
 use crate::plan_tree::PlanTree;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 #[derive(Debug, Clone)]
@@ -7,7 +8,7 @@ pub enum NodeKindTag {
     Llm,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SessionEvent {
     PlannerStart,
@@ -66,7 +67,7 @@ pub enum SessionEvent {
         /// The command to execute.
         command: String,
         /// Send `true` to approve, `false` to cancel.
-        responder: oneshot::Sender<bool>,
+        responder: Arc<oneshot::Sender<bool>>,
     },
 }
 

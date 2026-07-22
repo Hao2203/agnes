@@ -438,7 +438,7 @@ impl PathResolver for Session {
             if let Some(sink) = &self.current_sink {
                 let event = SessionEvent::ShellConfirm {
                     command,
-                    responder,
+                    responder: Arc::new(responder),
                 };
                 sink.lock().await.emit(event).await;
             } else {
