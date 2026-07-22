@@ -1,2 +1,2 @@
 ;; The smallest agnes workflow: one tool call.
-(tool llm :prompt "say hi" :input "")
+(tool llm "say hi" "")

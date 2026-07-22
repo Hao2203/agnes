@@ -4,8 +4,6 @@
 ;; steps.
 (par
   (pipe
-    (tool read-file :path "README.md")
+    (tool read-file "README.md")
     (tool summarize))
-  (pipe
-    (tool read-file :path "README.md")
-    (tool translate :lang "ja")))
+  (tool translate (tool read-file "README.md") "ja"))

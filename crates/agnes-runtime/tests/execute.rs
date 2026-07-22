@@ -19,7 +19,7 @@ impl PathResolver for DummyResolver {
 
 #[tokio::test]
 async fn runs_read_then_summarize() {
-    let src = r#"(pipe (tool read-file :path "README.md") (tool summarize))"#;
+    let src = r#"(pipe (tool read-file "README.md") (tool summarize))"#;
     let mut r = Registry::new();
     register_builtins(&mut r).unwrap();
 
@@ -43,9 +43,9 @@ async fn runs_a_defined_compound_tool() {
           :params [(path Path)]
           :provides Summary
           (pipe
-            (tool read-file :path path)
+            (tool read-file path)
             (tool summarize)))
-        (tool read-and-summarize :path "README.md")
+        (tool read-and-summarize "README.md")
     "#;
 
     let mut r = agnes_registry::Registry::new();
@@ -92,7 +92,7 @@ async fn boundary_validates_list_of_string_at_runtime() {
           :requires [(items (List String))]
           :provides PlainText)
 
-        (tool see-list :items ["a" "b"])
+        (tool see-list ["a" "b"])
     "#;
     let p = agnes_parser::parse(src).unwrap();
     r.load(&p).unwrap();
@@ -137,8 +137,8 @@ async fn boundary_validates_list_of_union_at_runtime() {
     // two read-file outputs (both PlainText) must succeed end-to-end.
     let src = r#"
         (pipe
-          (let a (tool read-file :path "README.md"))
-          (tool join-lines :lines [a a]))
+          (let a (tool read-file "README.md"))
+          (tool join-lines [a a]))
         "#;
     let mut r = agnes_registry::Registry::new();
     agnes_builtins::register_builtins(&mut r).unwrap();

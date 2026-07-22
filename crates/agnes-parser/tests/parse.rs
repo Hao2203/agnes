@@ -5,7 +5,7 @@ use agnes_parser::parse;
 fn parses_a_single_pipe() {
     let src = r#"
         (pipe
-          (tool read-file :path "x")
+          (tool read-file "x")
           (tool summarize))
     "#;
     let p = parse(src).expect("parse ok");
@@ -14,11 +14,10 @@ fn parses_a_single_pipe() {
         Expr::Pipe { steps, .. } => {
             assert_eq!(steps.len(), 2);
             match &steps[0] {
-                Expr::Tool { name, args, .. } => {
+                Expr::Tool { name, positional, .. } => {
                     assert_eq!(name, "read-file");
-                    assert_eq!(args.len(), 1);
-                    assert_eq!(args[0].0, "path");
-                    assert!(matches!(&args[0].1,
+                    assert_eq!(positional.len(), 1);
+                    assert!(matches!(&positional[0],
                         Expr::Literal { lit: Literal::String(s), .. } if s == "x"));
                 }
                 other => panic!("expected Tool, got {other:?}"),
@@ -120,7 +119,7 @@ fn parses_define_position_based_params() {
         (define greet
           :params [(who PlainText) (times Int :default 1)]
           :provides PlainText
-          (tool llm :prompt "hello" :input who))
+          (tool llm "hello" who))
     "#;
     let p = parse(src).expect("parse ok");
     match &p.toplevels[0] {
@@ -153,25 +152,25 @@ fn rejects_old_colon_suffix_param_syntax() {
 fn parses_let_two_forms() {
     let src = r#"
         (pipe
-          (tool read-file :path "x")
+          (tool read-file "x")
           (let doc)
           (par
             (let sum (tool summarize doc))
-            (let ja  (tool translate :lang "ja"))))
+            (let ja  (tool translate "ja"))))
     "#;
     let _ = parse(src).expect("parse ok");
 }
 
 #[test]
 fn rejects_unclosed_paren() {
-    let src = r#"(pipe (tool read-file :path "x")"#;
+    let src = r#"(pipe (tool read-file "x")"#;
     assert!(parse(src).is_err());
 }
 
 #[test]
 fn parses_source_with_non_ascii_content() {
     // Ensure non-ASCII bytes in string literals survive preprocessing.
-    let src = r#"(tool llm :prompt "你好 world" :input "test")"#;
+    let src = r#"(tool llm "你好 world" "test")"#;
     let p = agnes_parser::parse(src).expect("parse ok");
     let main = p.main.expect("has main");
     // Verify the string literal came through intact.
@@ -248,12 +247,10 @@ fn positional_tool_arg_uses_positional_vec() {
         agnes_ast::Expr::Tool {
             name,
             positional,
-            args,
             ..
         } => {
             assert_eq!(name, "summarize");
             assert_eq!(positional.len(), 1);
-            assert!(args.is_empty(), "no synthetic kwargs");
             assert!(matches!(&positional[0], agnes_ast::Expr::Var { name, .. } if name == "doc"));
         }
         other => panic!("expected Tool, got {other:?}"),
@@ -277,7 +274,7 @@ fn parses_finish_direct_form_with_string() {
 
 #[test]
 fn parses_observe_direct_form_with_tool_call() {
-    let src = r#"(observe (tool read-file :path "x"))"#;
+    let src = r#"(observe (tool read-file "x"))"#;
     let p = agnes_parser::parse(src).expect("parse ok");
     match p.main.unwrap() {
         agnes_ast::Expr::Observe { value: Some(v), .. } => {
@@ -304,7 +301,7 @@ fn parses_pipe_bare_finish_as_special_form_with_none_value() {
 
 #[test]
 fn parses_pipe_bare_observe_as_special_form_with_none_value() {
-    let src = r#"(pipe (tool read-file :path "x") observe)"#;
+    let src = r#"(pipe (tool read-file "x") observe)"#;
     let p = agnes_parser::parse(src).expect("parse ok");
     match p.main.unwrap() {
         agnes_ast::Expr::Pipe { steps, .. } => {
@@ -336,4 +333,26 @@ fn rejects_bare_finish_at_top_level() {
         err.to_string().contains("finish"),
         "error should mention finish: {err}"
     );
+}
+
+#[test]
+fn positional_tool_call_parses() {
+    let prog = agnes_parser::parse("(tool join-lines [\"a\" \"b\"])").unwrap();
+    let main = prog.main.unwrap();
+    match main {
+        agnes_ast::Expr::Tool { name, positional, .. } => {
+            assert_eq!(name, "join-lines");
+            assert_eq!(positional.len(), 1); // one list arg
+        }
+        other => panic!("expected Tool, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_args_are_rejected() {
+    // After the refactor :kw value is no longer valid syntax in a tool call.
+    // `:path` is a keyword with no preceding positional meaning here, so the
+    // parser must error.
+    let err = agnes_parser::parse("(tool read-file :path \"x\")");
+    assert!(err.is_err(), "keyword args should be rejected after refactor");
 }

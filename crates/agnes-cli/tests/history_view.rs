@@ -48,10 +48,10 @@ fn multi_iteration_turn_shows_observations_between_dsls() {
         user_nl: "translate this".into(),
         iterations: vec![
             iter(
-                "(pipe (tool read-file :path \"x\") observe)",
+                "(pipe (tool read-file \"x\") observe)",
                 Some(obs("hello world", false, Some("PlainText"))),
             ),
-            iter("(pipe (tool translate :lang \"ja\") finish)", None),
+            iter("(pipe (tool translate \"text\" \"ja\") finish)", None),
         ],
         outcome: TurnOutcome::Finished {
             result: "こんにちは".into(),

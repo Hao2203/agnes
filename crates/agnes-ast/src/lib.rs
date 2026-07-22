@@ -47,10 +47,7 @@ pub enum TypeExprAst {
     },
 }
 
-/// Keyword arguments: (:key value ...)
-pub type KwArgs = Vec<(String, Expr)>;
-
-/// Top-level directives — registered before any workflow is checked.
+/// Top-level directives - registered before any workflow is checked.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TopLevel {
     /// `(declare type <Name>)` — validator is attached at registry-load time
@@ -82,12 +79,12 @@ pub enum TopLevel {
 /// Workflow expression forms.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// `(tool <name> arg1 arg2 ... :key value ... [:retry N] [:on-error <expr>])`
+    /// `(tool <name> arg1 arg2 ...)` - positional tool call. The single
+    /// unfilled required parameter (if any) binds the piped upstream.
     Tool {
         span: Span,
         name: String,
         positional: Vec<Expr>,
-        args: KwArgs,
     },
     /// `(pipe e1 e2 ...)`
     Pipe { span: Span, steps: Vec<Expr> },
@@ -215,7 +212,7 @@ mod tests {
 
     #[test]
     fn program_can_hold_a_pipe_of_two_tools() {
-        // A minimal Program: (pipe (tool read-file :path "x") (tool summarize))
+        // A minimal Program: (pipe (tool read-file "x") (tool summarize))
         let p = Program {
             toplevels: vec![],
             main: Some(Expr::Pipe {
@@ -224,20 +221,15 @@ mod tests {
                     Expr::Tool {
                         span: Span { start: 0, end: 0 },
                         name: "read-file".into(),
-                        positional: vec![],
-                        args: vec![(
-                            "path".into(),
-                            Expr::Literal {
-                                span: Span { start: 0, end: 0 },
-                                lit: Literal::String("x".into()),
-                            },
-                        )],
+                        positional: vec![Expr::Literal {
+                            span: Span { start: 0, end: 0 },
+                            lit: Literal::String("x".into()),
+                        }],
                     },
                     Expr::Tool {
                         span: Span { start: 0, end: 0 },
                         name: "summarize".into(),
                         positional: vec![],
-                        args: vec![],
                     },
                 ],
             }),

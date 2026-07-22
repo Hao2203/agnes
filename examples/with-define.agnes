@@ -1,11 +1,9 @@
 ;; Declare a compound tool and invoke it. The runtime dispatches the call
 ;; by evaluating the define's body in a fresh env with `path` and `target`
-;; bound from the incoming kwargs.
+;; bound from the incoming args.
 (define read-and-translate
   :params  [(path Path) (target String)]
   :provides PlainText
-  (pipe
-    (tool read-file :path path)
-    (tool translate :lang target)))
+  (tool translate (tool read-file path) target))
 
-(tool read-and-translate :path "README.md" :target "ja")
+(tool read-and-translate "README.md" "ja")

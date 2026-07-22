@@ -33,15 +33,11 @@ fn walk(e: &Expr, out: &mut HashSet<String>) {
         Expr::Tool {
             name,
             positional,
-            args,
             ..
         } => {
             out.insert(name.clone());
             for e in positional {
                 walk(e, out);
-            }
-            for (_, v) in args {
-                walk(v, out);
             }
         }
         Expr::Pipe { steps, .. } => steps.iter().for_each(|s| walk(s, out)),

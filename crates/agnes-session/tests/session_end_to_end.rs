@@ -21,6 +21,7 @@ impl RecordingSink {
     fn events(&self) -> Vec<SessionEvent> {
         self.0.lock().unwrap().clone()
     }
+    #[allow(dead_code)]
     fn shared(&self) -> Arc<Mutex<Vec<SessionEvent>>> {
         Arc::clone(&self.0)
     }
@@ -258,7 +259,7 @@ async fn write_summary_still_emitted_before_turn_result() {
     // Runs a write-file then finishes; existing WriteSummary contract holds.
     // Extra response needed because resolve_path now consumes one extra provider call
     let mut s = Session::new(provider(vec![
-        "```agnes\n(pipe (tool write-file :path \"test-write-summary.tmp\" :content \"hi\") finish)\n```",
+        "```agnes\n(pipe (tool write-file \"test-write-summary.tmp\" \"hi\") finish)\n```",
         "```agnes\n```",
     ]))
     .unwrap();

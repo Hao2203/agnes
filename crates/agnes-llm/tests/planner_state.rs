@@ -36,7 +36,7 @@ async fn plan_next_appends_assistant_dsl_to_inflight_iterations() {
 #[tokio::test]
 async fn push_observation_attaches_to_last_iteration() {
     let mut p = planner_with(vec![
-        "```agnes\n(pipe (tool summarize :input \"x\") observe)\n```".into(),
+        "```agnes\n(pipe (tool summarize \"x\") observe)\n```".into(),
         "```agnes\n(pipe \"done\" finish)\n```".into(),
     ]);
     p.begin_user_turn("...".into());

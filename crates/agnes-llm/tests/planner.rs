@@ -80,7 +80,7 @@ async fn system_prompt_mentions_finish_and_observation_semantics() {
 #[tokio::test]
 async fn observation_message_uses_xml_wrapper_with_type_name() {
     let (mut p, mock) = planner_with(vec![
-        "```agnes\n(pipe (tool summarize :input \"x\") observe)\n```".into(),
+        "```agnes\n(pipe (tool summarize \"x\") observe)\n```".into(),
         "```agnes\n(pipe \"done\" finish)\n```".into(),
     ]);
     p.begin_user_turn("do it".into());

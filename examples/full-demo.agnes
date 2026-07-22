@@ -5,12 +5,10 @@
 (define read-and-translate
   :params  [(path Path) (target String)]
   :provides PlainText
-  (pipe
-    (tool read-file :path path)
-    (tool translate :lang target)))
+  (tool translate (tool read-file path) target))
 
 (pipe
   (par
-    (let ja (tool read-and-translate :path "README.md" :target "ja"))
-    (let en (tool read-and-translate :path "README.md" :target "en")))
-  (tool join-lines :lines [ja en]))
+    (let ja (tool read-and-translate "README.md" "ja"))
+    (let en (tool read-and-translate "README.md" "en")))
+  (tool join-lines [ja en]))

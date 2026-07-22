@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agnes_ast::{Expr, KwArgs, Literal};
+use agnes_ast::{Expr, Literal};
 use agnes_builtins::ToolImpl;
 use agnes_compiler::{Dag, Input, NodeId, NodeKind};
 use agnes_registry::Registry;
@@ -396,11 +396,10 @@ fn eval_expr<'a>(
             Expr::Tool {
                 name,
                 positional,
-                args,
                 ..
             } => {
                 let kwargs =
-                    bind_tool_args(name, positional, args, flowed_in, reg, dispatch, resolver, env).await?;
+                    bind_tool_args(name, positional, flowed_in, reg, dispatch, resolver, env).await?;
                 let provides = tool_provides(reg, name);
                 call_native(name, kwargs, dispatch, resolver, reg, &provides).await
             }
@@ -529,12 +528,11 @@ fn eval_expr<'a>(
     })
 }
 
-/// Bind positional, keyword, and upstream arguments for a `(tool ...)` call in
+/// Bind positional and upstream arguments for a `(tool ...)` call in
 /// the AST interpreter path. Mirrors `Lowering::lower_tool`.
 async fn bind_tool_args(
     tool_name: &str,
     positional: &[Expr],
-    args: &KwArgs,
     flowed_in: Option<Value>,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
@@ -562,11 +560,6 @@ async fn bind_tool_args(
         let v = eval_expr(pv, None, reg, dispatch, resolver, env).await?;
         out.insert(pname.clone(), v);
         filled.insert(pname.clone());
-    }
-    for (k, v) in args {
-        let val = eval_expr(v, None, reg, dispatch, resolver, env).await?;
-        out.insert(k.clone(), val);
-        filled.insert(k.clone());
     }
     let unfilled: Vec<&String> = sig
         .requires

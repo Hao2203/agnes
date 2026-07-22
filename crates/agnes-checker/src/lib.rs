@@ -61,9 +61,8 @@ fn check_expr(
         Expr::Tool {
             name,
             positional,
-            args,
             ..
-        } => check_tool_call(name, positional, args, reg, env, flowed_in),
+        } => check_tool_call(name, positional, reg, env, flowed_in),
         Expr::Pipe { steps, .. } => {
             let mut upstream: Option<TypeExpr> = None;
             let mut last: Option<TypeExpr> = None;
@@ -231,7 +230,6 @@ fn check_arg(
 fn check_tool_call(
     tool_name: &str,
     positional: &[Expr],
-    args: &agnes_ast::KwArgs,
     reg: &Registry,
     env: &mut env::Env,
     flowed_in: Option<TypeExpr>,
@@ -257,20 +255,6 @@ fn check_tool_call(
         let (pname, param_expected) = sig.requires[i].clone();
         check_arg(tool_name, &pname, &param_expected, pv, reg, env)?;
         filled[i] = true;
-    }
-
-    for (k, v) in args {
-        let (idx, param_expected) = sig
-            .requires
-            .iter()
-            .enumerate()
-            .find(|(_, (n, _))| n == k)
-            .map(|(i, (_, t))| (i, t.clone()))
-            .ok_or_else(|| CheckError::UnknownVar {
-                name: format!("keyword arg :{k} in call to `{tool_name}` not in signature"),
-            })?;
-        check_arg(tool_name, k, &param_expected, v, reg, env)?;
-        filled[idx] = true;
     }
 
     let unfilled: Vec<usize> = filled

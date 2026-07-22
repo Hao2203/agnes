@@ -1,4 +1,4 @@
-use agnes_ast::{Expr, KwArgs, Literal, Program};
+use agnes_ast::{Expr, Literal, Program};
 use agnes_registry::Registry;
 use agnes_types::TypeExpr;
 
@@ -51,9 +51,8 @@ impl<'a> Lowering<'a> {
             Expr::Tool {
                 name,
                 positional,
-                args,
                 ..
-            } => self.lower_tool(name, positional, args, upstream),
+            } => self.lower_tool(name, positional, upstream),
             Expr::Pipe { steps, .. } => self.lower_pipe(steps),
             Expr::Par { branches, .. } => self.lower_par(branches),
             Expr::Let { name, value, .. } => self.lower_let(name, value.as_deref(), upstream),
@@ -195,7 +194,6 @@ impl<'a> Lowering<'a> {
         &mut self,
         name: &str,
         positional: &[Expr],
-        args: &KwArgs,
         upstream: Option<NodeId>,
     ) -> Result<NodeId, crate::CompileError> {
         let sig = self.reg.tool_signature(name).cloned().ok_or_else(|| {
@@ -220,16 +218,6 @@ impl<'a> Lowering<'a> {
                 source: Box::new(Input::FromNode(src)),
             });
             filled.insert(param_name.clone());
-        }
-
-        // Keyword args.
-        for (k, v) in args {
-            let src = self.lower_expr(v, None)?;
-            inputs.push(Input::Kw {
-                key: k.clone(),
-                source: Box::new(Input::FromNode(src)),
-            });
-            filled.insert(k.clone());
         }
 
         // Flowed-in upstream fills the sole remaining unfilled require.

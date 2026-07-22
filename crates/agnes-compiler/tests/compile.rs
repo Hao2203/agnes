@@ -32,7 +32,7 @@ fn seed() -> Registry {
 
 #[test]
 fn compiles_a_pipe() {
-    let src = r#"(pipe (tool read-file :path "x") (tool summarize))"#;
+    let src = r#"(pipe (tool read-file "x") (tool summarize))"#;
     let p = parse(src).unwrap();
     let r = seed();
     let dag = compile(&p, &r).expect("compile ok");
@@ -49,7 +49,7 @@ fn compiles_a_pipe() {
         .inputs
         .iter()
         .find(|i| matches!(i, agnes_compiler::Input::Kw { key, .. } if key == "input"))
-        .expect("summarize should have :input kwarg from upstream flow");
+        .expect("summarize should have `input` param from upstream flow");
     match input_kw {
         agnes_compiler::Input::Kw { source, .. } => {
             assert!(matches!(**source, agnes_compiler::Input::FromNode(_)));

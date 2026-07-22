@@ -85,7 +85,7 @@ fn stub_dispatch() -> std::collections::HashMap<String, agnes_builtins::ToolImpl
 
 #[tokio::test]
 async fn tracer_receives_start_and_end_per_tool_node() {
-    let src = r#"(pipe (tool read-file :path "x") (tool summarize))"#;
+    let src = r#"(pipe (tool read-file "x") (tool summarize))"#;
     let mut r = Registry::new();
     register_builtins(&mut r).unwrap();
     let p = parse(src).unwrap();
@@ -110,7 +110,7 @@ async fn tracer_receives_start_and_end_per_tool_node() {
 #[tokio::test]
 async fn existing_execute_still_works_as_noop() {
     // Verifies backward compat: agnes_runtime::execute(...) unchanged.
-    let src = r#"(tool read-file :path "x")"#;
+    let src = r#"(tool read-file "x")"#;
     let mut r = Registry::new();
     register_builtins(&mut r).unwrap();
     let p = parse(src).unwrap();

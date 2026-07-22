@@ -10,9 +10,9 @@ fn multiline_open_not_balanced() {
 }
 #[test]
 fn parens_inside_string_ignored() {
-    assert!(is_balanced(r#"(tool x :s "(a)b")"#));
+    assert!(is_balanced(r#"(tool x "(a)b")"#));
 }
 #[test]
 fn escaped_quote_in_string() {
-    assert!(is_balanced(r#"(tool x :s "a\"b")"#));
+    assert!(is_balanced(r#"(tool x "a\"b")"#));
 }

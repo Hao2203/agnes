@@ -65,13 +65,11 @@ async fn positive_full_demo_runs() {
 (define read-and-translate
   :params  [(path Path) (target String)]
   :provides PlainText
-  (pipe
-    (tool read-file :path path)
-    (tool translate :lang target)))
+  (tool translate (tool read-file path) target))
 
 (pipe
-  (let ja (tool read-and-translate :path "{readme}" :target "ja"))
-  (tool join-lines :lines [ja ja]))
+  (let ja (tool read-and-translate "{readme}" "ja"))
+  (tool join-lines [ja ja]))
 "#
     );
     // One translate call per read-and-translate invocation.
@@ -89,8 +87,8 @@ async fn positive_join_lines_with_list_literal() {
     let readme = seed_readme().await;
     let src = format!(
         r#"
-(tool join-lines :lines [(tool read-file :path "{readme}")
-                          (tool read-file :path "{readme}")])
+(tool join-lines [(tool read-file "{readme}")
+                          (tool read-file "{readme}")])
 "#
     );
     let out = run(&src).await.expect("join-lines must succeed");
@@ -105,8 +103,8 @@ async fn positive_option_string_declares_param() {
         (define maybe-greet
           :params [(name (Option String))]
           :provides PlainText
-          (tool llm :prompt "greet" :input "hi"))
-        (tool maybe-greet :name "world")
+          (tool llm "greet" "hi"))
+        (tool maybe-greet "world")
     "#;
     let out = run_with(src, vec!["[LLM greeted world]".into()])
         .await
@@ -120,8 +118,8 @@ async fn positive_option_string_accepts_nil() {
         (define maybe-greet
           :params [(name (Option String))]
           :provides PlainText
-          (tool llm :prompt "greet" :input "hi"))
-        (tool maybe-greet :name nil)
+          (tool llm "greet" "hi"))
+        (tool maybe-greet nil)
     "#;
     let out = run_with(src, vec!["[LLM greeted]".into()])
         .await
@@ -173,7 +171,7 @@ async fn negative_infix_union_rejected() {
 
 #[tokio::test]
 async fn negative_comma_in_bracket_list() {
-    let src = r#"(tool llm :prompt "x" :input ["a", "b"])"#;
+    let src = r#"(tool llm "x" ["a", "b"])"#;
     let err = run(src).await.expect_err("must fail");
     let msg = err.to_string();
     assert!(
@@ -186,7 +184,7 @@ async fn negative_comma_in_bracket_list() {
 async fn negative_mixed_list_where_string_list_expected() {
     // join-lines accepts (List (| PlainText Markdown)) — passing (List Int)
     // via a mixed literal fails.
-    let src = r#"(tool join-lines :lines ["a" 1])"#;
+    let src = r#"(tool join-lines ["a" 1])"#;
     let err = run(src).await.expect_err("must fail");
     let msg = err.to_string();
     assert!(msg.contains("List"), "got: {msg}");
@@ -195,7 +193,7 @@ async fn negative_mixed_list_where_string_list_expected() {
 #[tokio::test]
 async fn negative_flow_type_mismatch() {
     // read-file provides PlainText; ocr requires ScannedImage → checker rejects.
-    let src = r#"(pipe (tool read-file :path "x.md") (tool ocr))"#;
+    let src = r#"(pipe (tool read-file "x.md") (tool ocr))"#;
     let err = run(src).await.expect_err("must fail type check");
     assert!(err.contains("Type error"), "missing 'Type error': {err}");
     assert!(err.contains("ocr"), "missing 'ocr': {err}");

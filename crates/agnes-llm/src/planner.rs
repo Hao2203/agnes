@@ -332,7 +332,7 @@ fn build_system_prompt(reg: &Registry) -> String {
         if let Some(sig) = reg.tool_signature(name) {
             catalog.push_str(&format!("  - {} :", name));
             for (pname, pty) in &sig.requires {
-                catalog.push_str(&format!(" :{pname} {pty}"));
+                catalog.push_str(&format!(" {pname} {pty}"));
             }
             catalog.push_str(&format!("  ->  {}\n", sig.provides));
         }
@@ -362,8 +362,9 @@ Grammar cheatsheet — these are the SPECIAL FORMS (not tools):
   * `(pipe e1 e2 ... eN)` — thread each expression's result into the
     next. Bare `finish` / `observe` as a pipe tail is shorthand for
     `(finish <upstream>)` / `(observe <upstream>)`.
-  * `(tool NAME :param1 v1 :param2 v2 ...)` — call a tool from the
-    catalog below.
+  * `(tool NAME arg1 arg2 ...)` — call a tool from the catalog below.
+    Args are positional, in the order shown in the catalog. To feed a
+    piped value into a parameter, omit that parameter.
   * `(let name expr)` or `(let name)` (inside a pipe) — bind a value.
   * `(if cond then else)`, `(match scrutinee (pattern arm) ...)`,
     `(foreach item collection body)` — control flow.
@@ -374,7 +375,7 @@ Available builtin tools (I/O primitives; use with `(tool NAME ...)`):
 Rules:
   1. Produce EXACTLY ONE fenced ```agnes block per turn. No prose outside.
   2. `finish` and `observe` are LANGUAGE FORMS. Write `(finish X)` — do
-     NOT write `(tool finish :input X)`; there is no such tool.
+     NOT write `(tool finish X)`; there is no such tool.
   3. Prefer wrapping every terminating result with `(finish ...)` to
      make your intent explicit.
   4. Do not invent tools not in the catalog above; the checker will reject.
@@ -386,11 +387,11 @@ Examples (each is a complete turn):
 ```
 
 ```agnes
-(finish (tool summarize :input (tool read-file :path "notes.md")))
+(finish (tool summarize (tool read-file "notes.md")))
 ```
 
 ```agnes
-(pipe (tool read-file :path "log.txt") (tool summarize) observe)
+(pipe (tool read-file "log.txt") (tool summarize) observe)
 ```
 "#
     )

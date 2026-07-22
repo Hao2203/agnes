@@ -1,7 +1,6 @@
-use agnes_ast::{Expr, KwArgs, Literal, Span};
+use agnes_ast::{Expr, Literal, Span};
 
 use crate::error::ParseError;
-use crate::toplevel::parse_kwargs;
 
 pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
     // Atoms
@@ -141,7 +140,6 @@ fn parse_pipe_steps(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, Par
                 span,
                 name: sym.to_string(),
                 positional: vec![],
-                args: KwArgs::default(),
             }),
             _ => parse_expr(i, span),
         })
@@ -178,40 +176,12 @@ fn parse_tool(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {
             message: "tool name expected".into(),
         })?
         .to_string();
-    let (positional, args) = parse_positional_and_kwargs(&rest[1..], span)?;
+    let positional = parse_exprs(&rest[1..], span)?;
     Ok(Expr::Tool {
         span,
         name,
         positional,
-        args,
     })
-}
-
-/// Split incoming items into a leading positional prefix (everything before the
-/// first `Value::Keyword(_)`) and a trailing keyword-args tail. Positional
-/// items are parsed as `Expr` and returned as a `Vec<Expr>`; keyword items are
-/// parsed pairwise and returned as `KwArgs`.
-fn parse_positional_and_kwargs(
-    items: &[lexpr::Value],
-    span: Span,
-) -> Result<(Vec<Expr>, KwArgs), ParseError> {
-    let mut split = items.len();
-    for (i, it) in items.iter().enumerate() {
-        if it.as_keyword().is_some() {
-            split = i;
-            break;
-        }
-    }
-    let mut positional = Vec::with_capacity(split);
-    for it in &items[..split] {
-        positional.push(parse_expr(it, span)?);
-    }
-    let raw = parse_kwargs(&items[split..], span)?;
-    let mut args: KwArgs = Vec::with_capacity(raw.len());
-    for (k, v) in raw {
-        args.push((k, parse_expr(&v, span)?));
-    }
-    Ok((positional, args))
 }
 
 fn parse_let(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {

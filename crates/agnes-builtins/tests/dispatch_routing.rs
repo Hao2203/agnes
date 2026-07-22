@@ -99,7 +99,7 @@ async fn ocr_returns_fixed_placeholder() {
 #[tokio::test]
 async fn llm_is_callable_via_tool_form() {
     // After de-special-casing, `llm` is an ordinary tool reached through
-    // `(tool llm :prompt "p" :input "")`. The mock provider is wired by the
+    // `(tool llm "p" "")`. The mock provider is wired by the
     // existing `dispatch()` in this file; exercise it the same way read-file etc. are.
     let d = dispatch();
     let llm = d.get("llm").expect("llm tool registered");

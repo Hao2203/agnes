@@ -47,7 +47,7 @@ fn seed_registry() -> Registry {
 
 #[test]
 fn happy_path_read_then_summarize() {
-    let src = r#"(pipe (tool read-file :path "x") (tool summarize))"#;
+    let src = r#"(pipe (tool read-file "x") (tool summarize))"#;
     let p = parse(src).unwrap();
     let r = seed_registry();
     check(&p, &r).expect("should type-check");
@@ -55,7 +55,7 @@ fn happy_path_read_then_summarize() {
 
 #[test]
 fn flow_mismatch_produces_llm_friendly_error() {
-    let src = r#"(pipe (tool read-file :path "x.md") (tool ocr))"#;
+    let src = r#"(pipe (tool read-file "x.md") (tool ocr))"#;
     let p = parse(src).unwrap();
     let r = seed_registry();
     let err = check(&p, &r).unwrap_err();
@@ -83,7 +83,7 @@ fn list_of_string_typed_correctly() {
     )
     .unwrap();
 
-    let src = r#"(tool consume-strings :items ["a" "b" "c"])"#;
+    let src = r#"(tool consume-strings ["a" "b" "c"])"#;
     let p = parse(src).unwrap();
     check(&p, &r).expect("must type-check");
 }
@@ -109,7 +109,7 @@ fn list_of_mixed_types_rejected_where_list_of_string_expected() {
     )
     .unwrap();
 
-    let src = r#"(tool consume-strings :items ["a" 1])"#;
+    let src = r#"(tool consume-strings ["a" 1])"#;
     let p = parse(src).unwrap();
     let err = check(&p, &r).expect_err("must reject");
     let msg = format!("{err}");
@@ -139,7 +139,7 @@ fn empty_list_adapts_to_hint() {
     )
     .unwrap();
 
-    let src = r#"(tool consume-strings :items [])"#;
+    let src = r#"(tool consume-strings [])"#;
     let p = parse(src).unwrap();
     check(&p, &r).expect("empty list must adapt to (List String)");
 }
@@ -169,7 +169,7 @@ fn unbound_empty_list_via_let_is_still_list_unknown() {
     let src = r#"
         (pipe
           (let xs [])
-          (tool consume-strings :items xs))
+          (tool consume-strings xs))
     "#;
     let p = parse(src).unwrap();
     let err = check(&p, &r).expect_err("must fail");
