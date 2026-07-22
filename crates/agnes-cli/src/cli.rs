@@ -11,6 +11,14 @@ pub struct Args {
     #[arg(long, global = true)]
     pub max_turns: Option<u32>,
 
+    /// Restrict file operations to this directory (default: current working directory)
+    #[arg(long = "allow-root")]
+    pub allow_root: Option<std::path::PathBuf>,
+
+    /// Allow shell command execution without interactive confirmation (requires interactive mode)
+    #[arg(long = "allow-shell", default_value_t = false)]
+    pub allow_shell: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }

@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let provider = resolve_provider(&args.llm.to_opts()).map_err(|e| anyhow::anyhow!("{e}"))?;
     match args.cmd.unwrap_or(Command::Chat) {
-        Command::Chat => agnes_cli::chat::run(provider, args.max_turns).await,
+        Command::Chat => agnes_cli::chat::run(provider, args.max_turns, args.allow_root, args.allow_shell).await,
         Command::Run { file } => run_cmd::run_file(&file, provider).await,
     }
 }

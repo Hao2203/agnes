@@ -128,6 +128,22 @@ impl EventSink for StderrEventSink {
                     "{t} {tag} (iter {iter}, {char_count} chars): {preview}{ellipsis}"
                 );
             }
+            SessionEvent::ShellConfirm { command, responder } => {
+                println!();
+                println!("\x1b[1m[agnes] Confirm shell execution:\x1b[0m");
+                println!("  Command: {}", command);
+                print!("  OK to run? [Y/n] ");
+                std::io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).unwrap();
+                let input = input.trim().to_lowercase();
+
+                let approved = input.is_empty() || input == "y" || input == "yes";
+                if let Ok(responder) = std::sync::Arc::try_unwrap(responder) {
+                    let _ = responder.send(approved);
+                }
+            }
             _ => {
                 // Future SessionEvent variants render nothing by default.
             }

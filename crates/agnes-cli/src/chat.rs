@@ -17,12 +17,21 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Prints the banner and enters the REPL. Ctrl-D exits cleanly.
-pub async fn run(provider: Arc<dyn Provider>, max_turns: Option<u32>) -> anyhow::Result<()> {
+pub async fn run(
+    provider: Arc<dyn Provider>,
+    max_turns: Option<u32>,
+    allow_root: Option<std::path::PathBuf>,
+    allow_shell: bool,
+) -> anyhow::Result<()> {
     banner();
     let mut session = match max_turns {
         Some(n) => Session::new_with_max_turns(provider, n)?,
         None => Session::new(provider)?,
     };
+    if let Some(allow_root) = allow_root {
+        session = session.with_allow_root(allow_root);
+    }
+    session = session.with_allow_shell(allow_shell);
     let mut rl: DefaultEditor = DefaultEditor::new()?;
     loop {
         match read_line_or_block(&mut rl) {
