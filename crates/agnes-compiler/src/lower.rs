@@ -136,40 +136,6 @@ impl<'a> Lowering<'a> {
                     provides,
                 ))
             }
-            Expr::Llm {
-                positional, args, ..
-            } => {
-                if !positional.is_empty() {
-                    return Err(crate::CompileError::UnknownDefine {
-                        name: format!(
-                            "(llm ...) does not accept positional args; use :prompt and :input keyword args (got {} positional)",
-                            positional.len()
-                        ),
-                    });
-                }
-                let mut inputs = Vec::new();
-                for (k, v) in args {
-                    let src = self.lower_expr(v, None)?;
-                    inputs.push(Input::Kw {
-                        key: k.clone(),
-                        source: Box::new(Input::FromNode(src)),
-                    });
-                }
-                // Flowed-in upstream fills the :input slot when not already provided.
-                if let Some(up) = upstream
-                    && !args.iter().any(|(k, _)| k == "input")
-                {
-                    inputs.push(Input::Kw {
-                        key: "input".into(),
-                        source: Box::new(Input::FromNode(up)),
-                    });
-                }
-                Ok(self.add(
-                    NodeKind::Llm,
-                    inputs,
-                    TypeExpr::Named(agnes_types::TypeName("PlainText".into())),
-                ))
-            }
             Expr::Return { value, .. } => {
                 let v = self.lower_expr(value, None)?;
                 let provides = self.nodes[v.0].provides.clone();

@@ -29,9 +29,6 @@ pub enum NodeKind {
         on: Option<String>,
         fallback: NodeId,
     },
-    /// Inputs are all `Input::Kw` entries with keys matching the llm builtin's
-    /// parameter names (`prompt`, `input`). No positional inputs.
-    Llm,
     Return,
     /// `(finish X)` — wraps the child's runtime type in `Finish T` so the
     /// session loop's `classify_root` treats it as a terminating iteration.

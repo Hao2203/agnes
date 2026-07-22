@@ -124,22 +124,6 @@ fn eval_node<'a>(
                     Err(_) => eval_node(dag, *fallback, reg, dispatch, resolver, tracer, cache, env).await?,
                 }
             }
-            NodeKind::Llm => {
-                let args =
-                    collect_kwargs(dag, &node.inputs, reg, dispatch, resolver, tracer, cache, env).await?;
-                call_native_traced(
-                    id,
-                    &node.kind,
-                    "llm",
-                    args,
-                    dispatch,
-                    resolver,
-                    reg,
-                    &node.provides,
-                    tracer,
-                )
-                .await?
-            }
             NodeKind::Return => {
                 eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?
             }
@@ -493,24 +477,6 @@ fn eval_expr<'a>(
                     Ok(v) => Ok(v),
                     Err(_) => eval_expr(fallback, None, reg, dispatch, resolver, env).await,
                 }
-            }
-            Expr::Llm {
-                positional: _,
-                args,
-                ..
-            } => {
-                let mut kwargs: HashMap<String, Value> = HashMap::new();
-                for (k, v) in args {
-                    let val = eval_expr(v, None, reg, dispatch, resolver, env).await?;
-                    kwargs.insert(k.clone(), val);
-                }
-                if let Some(up) = flowed_in
-                    && !kwargs.contains_key("input")
-                {
-                    kwargs.insert("input".into(), up);
-                }
-                let provides = TypeExpr::Named(TypeName("PlainText".into()));
-                call_native("llm", kwargs, dispatch, resolver, reg, &provides).await
             }
             Expr::Return { value, .. } => eval_expr(value, None, reg, dispatch, resolver, env).await,
             Expr::Finish { value, .. } => {

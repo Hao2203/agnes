@@ -130,17 +130,6 @@ fn check_expr(
             let _ = check_expr(fallback, reg, env, flowed_in, None)?;
             Ok(t)
         }
-        Expr::Llm {
-            positional, args, ..
-        } => {
-            for pv in positional {
-                let _ = check_expr(pv, reg, env, None, None)?;
-            }
-            for (_, v) in args {
-                let _ = check_expr(v, reg, env, None, None)?;
-            }
-            Ok(TypeExpr::Named(TypeName("PlainText".into())))
-        }
         Expr::Return { value, .. } => check_expr(value, reg, env, None, None),
         Expr::Finish { value, .. } => check_wrap(value, "Finish", "finish", reg, env, flowed_in),
         Expr::Observe { value, .. } => {

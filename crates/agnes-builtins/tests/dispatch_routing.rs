@@ -26,6 +26,12 @@ fn args(kvs: &[(&str, &str)]) -> HashMap<String, Value> {
         .collect()
 }
 
+/// Dispatch table wired with a mock provider that returns a canned string,
+/// so tool-call tests (including `llm`) can exercise the `(tool …)` path.
+fn dispatch() -> HashMap<String, agnes_builtins::ToolImpl> {
+    native_dispatch(Arc::new(MockProvider::new(vec!["ok".into()])))
+}
+
 #[tokio::test]
 async fn translate_routes_through_provider() {
     let mock = Arc::new(MockProvider::new(vec!["こんにちは".into()]));
@@ -88,4 +94,15 @@ async fn ocr_returns_fixed_placeholder() {
     let s = out.data.as_str().unwrap();
     assert!(!s.is_empty(), "ocr must return some canned sentence");
     assert_eq!(out.declared_type.to_string(), "PlainText");
+}
+
+#[tokio::test]
+async fn llm_is_callable_via_tool_form() {
+    // After de-special-casing, `llm` is an ordinary tool reached through
+    // `(tool llm :prompt "p" :input "")`. The mock provider is wired by the
+    // existing `dispatch()` in this file; exercise it the same way read-file etc. are.
+    let d = dispatch();
+    let llm = d.get("llm").expect("llm tool registered");
+    let out = llm.call(args(&[("prompt", "hi"), ("input", "")]), &DUMMY).await.unwrap();
+    assert_eq!(out.declared_type.to_string(), "PlainText"); // still PlainText until Task 3
 }

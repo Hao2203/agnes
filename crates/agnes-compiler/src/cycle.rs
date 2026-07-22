@@ -77,16 +77,6 @@ fn walk(e: &Expr, out: &mut HashSet<String>) {
             walk(body, out);
             walk(fallback, out);
         }
-        Expr::Llm {
-            positional, args, ..
-        } => {
-            for e in positional {
-                walk(e, out);
-            }
-            for (_, v) in args {
-                walk(v, out);
-            }
-        }
         Expr::Return { value, .. } => walk(value, out),
         Expr::Finish { value, .. } | Expr::Observe { value, .. } => {
             if let Some(v) = value {

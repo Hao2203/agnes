@@ -14,8 +14,8 @@ use agnes_compiler::{Dag, NodeId, NodeKind};
 use agnes_registry::Registry;
 use agnes_types::Value;
 
-/// Observer for tool + llm node execution. Hooks fire only for
-/// `NodeKind::Tool { .. }` and `NodeKind::Llm` — control-flow nodes are
+/// Observer for tool node execution. Hooks fire only for
+/// `NodeKind::Tool { .. }` — control-flow nodes are
 /// silent. `args_preview` is a caller-formatted, truncation-friendly
 /// summary of the arg map (no exact contract; consumers must tolerate any
 /// human string).

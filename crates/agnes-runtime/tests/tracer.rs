@@ -24,7 +24,6 @@ impl Tracer for RecordingTracer {
     fn node_start(&self, _id: agnes_compiler::NodeId, kind: &NodeKind, args: &str) {
         let label = match kind {
             NodeKind::Tool { name } => format!("start tool:{name} args={args}"),
-            NodeKind::Llm => format!("start llm args={args}"),
             _ => return,
         };
         self.events.lock().unwrap().push(label);

@@ -16,7 +16,6 @@ fn build(dag: &Dag, id: agnes_compiler::NodeId) -> PlanTree {
     let node = dag.get(id);
     let (kind, label) = match &node.kind {
         NodeKind::Tool { name } => ("tool".into(), format!("tool {name}")),
-        NodeKind::Llm => ("llm".into(), "llm".into()),
         NodeKind::Pipe => ("pipe".into(), "pipe".into()),
         NodeKind::Par => ("par".into(), "par".into()),
         NodeKind::Let { name } => ("let".into(), format!("let {name}")),

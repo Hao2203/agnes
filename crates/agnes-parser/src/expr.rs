@@ -82,14 +82,6 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
         "foreach" => parse_foreach(rest, span),
         "retry" => parse_retry(rest, span),
         "catch" => parse_catch(rest, span),
-        "llm" => {
-            let (positional, args) = parse_positional_and_kwargs(rest, span)?;
-            Ok(Expr::Llm {
-                span,
-                positional,
-                args,
-            })
-        }
         "return" => {
             let inner = rest.first().ok_or_else(|| ParseError {
                 span,

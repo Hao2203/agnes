@@ -25,7 +25,6 @@ impl Tracer for ChannelTracer {
     fn node_start(&self, id: NodeId, kind: &NodeKind, args_preview: &str) {
         let tag = match kind {
             NodeKind::Tool { name } => NodeKindTag::Tool { name: name.clone() },
-            NodeKind::Llm => NodeKindTag::Llm,
             _ => return,
         };
         let args: Vec<(String, String)> = if args_preview.is_empty() {

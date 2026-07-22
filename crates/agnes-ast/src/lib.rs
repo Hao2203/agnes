@@ -134,12 +134,6 @@ pub enum Expr {
         fallback: Box<Expr>,
         body: Box<Expr>,
     },
-    /// `(llm arg1 arg2 ... :key value ...)` — a builtin form for the LLM tool.
-    Llm {
-        span: Span,
-        positional: Vec<Expr>,
-        args: KwArgs,
-    },
     /// `(return expr)`
     Return { span: Span, value: Box<Expr> },
     /// `(finish expr)` or, inside a pipe, bare `finish` — wraps the value's
@@ -181,7 +175,6 @@ impl Expr {
             | Expr::Foreach { span, .. }
             | Expr::Retry { span, .. }
             | Expr::Catch { span, .. }
-            | Expr::Llm { span, .. }
             | Expr::Return { span, .. }
             | Expr::Finish { span, .. }
             | Expr::Observe { span, .. }
