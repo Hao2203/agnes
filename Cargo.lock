@@ -133,6 +133,7 @@ dependencies = [
  "agnes-types",
  "async-trait",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

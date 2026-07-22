@@ -8,6 +8,9 @@ mod plan_tree;
 mod session;
 mod tracer_bridge;
 
+#[cfg(test)]
+mod path_validation_tests;
+
 pub use error::SessionError;
 pub use events::{EventSink, NodeKindTag, SessionEvent};
 pub use plan_tree::PlanTree;

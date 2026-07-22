@@ -1,4 +1,5 @@
 use crate::plan_tree::PlanTree;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Clone)]
 pub enum NodeKindTag {
@@ -58,6 +59,14 @@ pub enum SessionEvent {
         iter: u32,
         text: String,
         is_error: bool,
+    },
+
+    /// Request user confirmation before executing a shell command.
+    ShellConfirm {
+        /// The command to execute.
+        command: String,
+        /// Send `true` to approve, `false` to cancel.
+        responder: std::sync::Arc<oneshot::Sender<bool>>,
     },
 }
 

@@ -8,6 +8,7 @@ use agnes_registry::Registry;
 use agnes_runtime::execute_with;
 use agnes_types::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Which "root shape" a Value carries — the classification used by the
@@ -72,6 +73,23 @@ pub struct Session {
     dispatch: HashMap<String, ToolImpl>,
     planner: Planner,
     max_turns: u32,
+    /// Allowed root directory for file operations.
+    /// If None, defaults to current working directory.
+    allow_root: Option<PathBuf>,
+    /// Whether shell execution is permitted.
+    allow_shell: bool,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("dispatch", &format_args!("HashMap<String, ToolImpl>"))
+            .field("planner", &format_args!("Planner"))
+            .field("max_turns", &self.max_turns)
+            .field("allow_root", &self.allow_root)
+            .field("allow_shell", &self.allow_shell)
+            .finish()
+    }
 }
 
 /// Helper to show a value using the builtins registry
@@ -98,7 +116,56 @@ impl Session {
             dispatch,
             planner,
             max_turns,
+            allow_root: None,
+            allow_shell: false,
         })
+    }
+
+    /// Builder method to set allowed root directory.
+    pub fn with_allow_root(mut self, path: PathBuf) -> Self {
+        self.allow_root = Some(path);
+        self
+    }
+
+    /// Builder method to enable shell execution.
+    pub fn with_allow_shell(mut self, enabled: bool) -> Self {
+        self.allow_shell = enabled;
+        self
+    }
+
+    /// Get whether shell execution is permitted.
+    pub fn allow_shell(&self) -> bool {
+        self.allow_shell
+    }
+
+    /// Resolve and validate a user-provided path against the allowed root.
+    pub fn resolve_path(&self, input: &str) -> Result<PathBuf, String> {
+        let current_dir = std::env::current_dir()
+            .map_err(|e| format!("failed to get current directory: {}", e))?;
+
+        let allow_root = self.allow_root.as_ref()
+            .unwrap_or(&current_dir);
+
+        // Resolve input path against current working directory
+        let candidate = if std::path::Path::new(input).is_absolute() {
+            PathBuf::from(input)
+        } else {
+            current_dir.join(input)
+        };
+
+        // Canonicalize to resolve symlinks and .. components
+        let canonical = candidate.canonicalize()
+            .map_err(|e| format!("cannot resolve path '{}': {}", input, e))?;
+
+        // Check that the canonical path starts with the allowed root
+        if !canonical.starts_with(allow_root) {
+            return Err(format!(
+                "path '{}' (resolved to '{}') is outside allowed root directory '{}'",
+                input, canonical.display(), allow_root.display()
+            ));
+        }
+
+        Ok(canonical)
     }
 
     pub fn history(&self) -> &[Turn] {
