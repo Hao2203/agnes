@@ -140,9 +140,7 @@ impl EventSink for StderrEventSink {
                 let input = input.trim().to_lowercase();
 
                 let approved = input.is_empty() || input == "y" || input == "yes";
-                if let Ok(responder) = std::sync::Arc::try_unwrap(responder) {
-                    let _ = responder.send(approved);
-                }
+                let _ = responder.send(approved);
             }
             _ => {
                 // Future SessionEvent variants render nothing by default.

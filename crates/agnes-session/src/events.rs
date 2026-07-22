@@ -7,7 +7,7 @@ pub enum NodeKindTag {
     Llm,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum SessionEvent {
     PlannerStart,
@@ -66,7 +66,7 @@ pub enum SessionEvent {
         /// The command to execute.
         command: String,
         /// Send `true` to approve, `false` to cancel.
-        responder: std::sync::Arc<oneshot::Sender<bool>>,
+        responder: oneshot::Sender<bool>,
     },
 }
 
