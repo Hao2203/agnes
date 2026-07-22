@@ -26,6 +26,7 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
     reg.register_type("String", None)?;
     reg.register_type("Int", None)?;
     reg.register_type("Bool", None)?;
+    reg.register_type("CommandResult", None)?;
 
     // --- Wrapper types (used at runtime by finish/observe) ---
     reg.register_type("Finish", None)?;
@@ -136,6 +137,17 @@ pub fn register_builtins(reg: &mut Registry) -> Result<(), RegistryError> {
         ToolSignature {
             requires: vec![("input".into(), unknown.clone())],
             provides: unknown,
+        },
+    )?;
+
+    // shell-run tool
+    let string_ty = TypeExpr::named("String");
+    let command_result = TypeExpr::named("CommandResult");
+    reg.register_tool(
+        "shell-run",
+        ToolSignature {
+            requires: vec![("command".into(), string_ty)],
+            provides: command_result,
         },
     )?;
 

@@ -10,9 +10,24 @@ use serde_json::Value as JsonValue;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Trait for types that can resolve and validate paths against an allowed root.
-pub trait PathResolver: Send + Sync {
+pub trait PathResolver: Send + Sync + std::any::Any {
     /// Resolve a user-provided path, ensuring it's within the allowed root directory.
     fn resolve_path<'a>(&'a self, input: &'a str) -> BoxFuture<'a, Result<PathBuf, String>>;
+
+    /// Get whether shell execution is permitted.
+    fn allow_shell(&self) -> bool {
+        false
+    }
+
+    /// Emit a shell confirmation request.
+    fn emit_shell_confirm<'a>(
+        &'a self,
+        _command: String,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    ) -> BoxFuture<'a, ()> {
+        let _ = responder.send(false);
+        Box::pin(async {})
+    }
 }
 
 /// Tool trait defines the interface that all tools must implement.
@@ -273,6 +288,54 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
             })
         });
     m.insert("parse-path".into(), Arc::new(parse_path));
+
+    // shell-run — execute shell command with user confirmation
+    use tokio::process::Command;
+    use serde_json::json;
+
+    let shell_run: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|args, resolver| {
+            Box::pin(async move {
+                let command = arg_str(&args, "command")?;
+
+                if !resolver.allow_shell() {
+                    return Err("shell execution is not enabled in this session. \
+                        Use --allow-shell flag to enable it.".into());
+                }
+
+                // Request user confirmation via resolver event
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                resolver.emit_shell_confirm(command.clone(), tx).await;
+
+                // Wait for user response
+                let confirmed = rx.await.unwrap_or(false);
+                if !confirmed {
+                    return Err("shell execution cancelled by user".into());
+                }
+
+                // Execute command
+                let child = Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .output()
+                    .await
+                    .map_err(|e| format!("failed to spawn command: {}", e))?;
+
+                let stdout = String::from_utf8_lossy(&child.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&child.stderr).into_owned();
+                let exit_code = child.status.code().unwrap_or(-1);
+
+                // Return structured result
+                let result = json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit-code": exit_code,
+                });
+
+                Ok(Value::typed(result, "CommandResult"))
+            })
+        });
+    m.insert("shell-run".into(), Arc::new(shell_run));
 
     m
 }

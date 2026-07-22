@@ -78,7 +78,20 @@ pub struct Session {
     allow_root: Option<PathBuf>,
     /// Whether shell execution is permitted.
     allow_shell: bool,
+    /// Current event sink for the active turn, if available.
+    /// We need an unsafe impl because the raw pointer doesn't auto-implement Send/Sync,
+    /// but this is safe because we only access it during the turn when the pointer
+    /// is guaranteed to be valid, and no concurrent access happens.
+    current_sink: Option<*mut dyn EventSink>,
 }
+
+// Safety: The current_sink pointer is only set during an active turn
+// and cleared before the reference becomes invalid. The Session is never
+// accessed concurrently from multiple threads during execution, so this
+// unsafe impl is correct - it just tells the compiler the Session is OK
+// to be Send/Sync which it is in practice.
+unsafe impl Send for Session {}
+unsafe impl Sync for Session {}
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,6 +131,7 @@ impl Session {
             max_turns,
             allow_root: None,
             allow_shell: false,
+            current_sink: None,
         })
     }
 
@@ -138,6 +152,18 @@ impl Session {
     /// Get whether shell execution is permitted.
     pub fn allow_shell(&self) -> bool {
         self.allow_shell
+    }
+
+    /// Emit a session event to the registered event sink.
+    /// Must only be called during an active turn.
+    pub async fn emit_event(&self, event: SessionEvent) {
+        if let Some(sink_ptr) = self.current_sink {
+            // Safety: this is safe because:
+            // 1. The pointer is only set during an active turn
+            // 2. The mutable reference is guaranteed to be valid for the entire turn
+            // 3. We don't alias the mutable reference in an unsafe way
+            unsafe { &mut *sink_ptr }.emit(event).await;
+        }
     }
 
     /// Resolve and validate a user-provided path against the allowed root.
@@ -228,7 +254,14 @@ impl Session {
         sink: &mut dyn EventSink,
         cancel: Arc<tokio::sync::Notify>,
     ) -> Result<Value, SessionError> {
-        match self.run_turn_inner(input, sink, cancel).await {
+        // Store the current sink for event emission during tool execution
+        // This is safe because:
+        // 1. We clear the pointer before the reference becomes invalid
+        // 2. We only dereference it during the turn when the reference is valid
+        // 3. The unsafe impl just makes the compiler happy about Send/Sync
+        use std::mem;
+        self.current_sink = Some(unsafe { mem::transmute::<*mut dyn EventSink, *mut (dyn EventSink + 'static)>(sink) });
+        let result = match self.run_turn_inner(input, sink, cancel).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let recorded = Self::drain_writes();
@@ -242,7 +275,10 @@ impl Session {
                 .await;
                 Err(e)
             }
-        }
+        };
+        // Clear the current sink after the turn completes
+        self.current_sink = None;
+        result
     }
 
     async fn run_turn_inner(
@@ -403,6 +439,33 @@ impl Session {
 impl PathResolver for Session {
     fn resolve_path<'a>(&'a self, input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<std::path::PathBuf, String>> {
         Box::pin(self.resolve_path(input))
+    }
+
+    fn allow_shell(&self) -> bool {
+        self.allow_shell
+    }
+
+    fn emit_shell_confirm<'a>(
+        &'a self,
+        command: String,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(sink_ptr) = self.current_sink {
+                // Safety: this is safe because:
+                // 1. The pointer is only stored during an active turn
+                // 2. The original mutable reference is guaranteed to be valid for the entire turn
+                // 3. We clear the pointer before the reference becomes invalid
+                // 4. Execution is sequential so there's no concurrent mutable access
+                unsafe { &mut *sink_ptr }.emit(SessionEvent::ShellConfirm {
+                    command,
+                    responder: std::sync::Arc::new(responder),
+                }).await;
+            } else {
+                // No sink available, automatically reject
+                let _ = responder.send(false);
+            }
+        })
     }
 }
 
