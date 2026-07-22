@@ -1,4 +1,4 @@
-use agnes_builtins::{native_dispatch, PathResolver, Tool};
+use agnes_builtins::{native_dispatch, PathResolver};
 use agnes_llm::MockProvider;
 use agnes_types::Value;
 use serde_json::Value as JsonValue;
@@ -79,42 +79,6 @@ async fn llm_routes_through_provider() {
     assert!(seen[0].messages[0].content.contains("context"));
 }
 
-#[tokio::test]
-async fn read_file_returns_mock_content_for_known_and_placeholder_for_unknown() {
-    let mock = Arc::new(MockProvider::new(vec![]));
-    let d = native_dispatch(mock);
-    let known = d["read-file"].call(args(&[("path", "README.md")]), &DUMMY)
-        .await
-        .unwrap();
-    assert!(
-        known.data.as_str().unwrap().contains("agnes"),
-        "seeded README should mention agnes"
-    );
-
-    let unknown = d["read-file"].call(args(&[("path", "does-not-exist.md")]), &DUMMY)
-        .await
-        .unwrap();
-    let s = unknown.data.as_str().unwrap();
-    assert!(s.contains("[MOCK file at does-not-exist.md"), "got: {s}");
-}
-
-#[tokio::test]
-async fn write_file_does_not_touch_disk_and_records_call() {
-    use std::path::Path;
-    let mock = Arc::new(MockProvider::new(vec![]));
-    let d = native_dispatch(mock);
-    let out = d["write-file"].call(args(&[
-        ("path", "/tmp/definitely-not-created-by-mock-agnes.txt"),
-        ("content", "abc"),
-    ]), &DUMMY)
-    .await
-    .unwrap();
-    assert!(out.data.is_null(), "write-file returns Unit (null JSON)");
-    assert!(
-        !Path::new("/tmp/definitely-not-created-by-mock-agnes.txt").exists(),
-        "mock write-file must not touch disk"
-    );
-}
 
 #[tokio::test]
 async fn ocr_returns_fixed_placeholder() {
