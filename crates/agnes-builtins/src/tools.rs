@@ -259,5 +259,20 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
         });
     m.insert("observe".into(), Arc::new(observe));
 
+    // parse-path — parse and validate a string path to Path type
+    let parse_path: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|args, resolver| {
+            Box::pin(async move {
+                let path_str = arg_str(&args, "path")?;
+                let _path = resolver.resolve_path(&path_str).await?;
+                // Path is represented as a string in the AST, but validated by session
+                Ok(Value::typed(
+                    JsonValue::String(path_str),
+                    "Path",
+                ))
+            })
+        });
+    m.insert("parse-path".into(), Arc::new(parse_path));
+
     m
 }
