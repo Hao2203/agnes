@@ -1,9 +1,10 @@
-use agnes_builtins::{native_dispatch, register_builtins};
+use agnes_builtins::{native_dispatch, register_builtins, PathResolver, Tool};
 use agnes_llm::MockProvider;
 use agnes_registry::Registry;
 use agnes_types::{TypeExpr, TypeName, Value};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn dispatch() -> HashMap<String, agnes_builtins::ToolImpl> {
@@ -16,6 +17,15 @@ fn reg() -> Registry {
     register_builtins(&mut r).unwrap();
     r
 }
+
+struct DummyResolver;
+impl PathResolver for DummyResolver {
+    fn resolve_path<'a>(&'a self, _input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
+        panic!("dummy resolver should not be called in this test")
+    }
+}
+
+static DUMMY: DummyResolver = DummyResolver;
 
 fn kwargs_with_input(v: Value) -> HashMap<String, Value> {
     let mut m = HashMap::new();
@@ -31,7 +41,7 @@ async fn finish_wraps_upstream_type_as_finish() {
         data: json!("done"),
         declared_type: TypeExpr::named("PlainText"),
     };
-    let out = finish(kwargs_with_input(upstream)).await.unwrap();
+    let out = finish.call(kwargs_with_input(upstream), &DUMMY).await.unwrap();
     // Data unchanged.
     assert_eq!(out.data, JsonValue::String("done".to_string()));
     // declared_type wrapped as (Finish PlainText).
@@ -52,7 +62,7 @@ async fn observe_wraps_upstream_type_as_observation() {
         data: json!({"tokens": 42}),
         declared_type: TypeExpr::named("JSON"),
     };
-    let out = observe(kwargs_with_input(upstream)).await.unwrap();
+    let out = observe.call(kwargs_with_input(upstream), &DUMMY).await.unwrap();
     assert_eq!(out.data, json!({"tokens": 42}));
     assert_eq!(
         out.declared_type,
@@ -75,8 +85,8 @@ async fn finish_wraps_already_wrapped_type_last_one_wins() {
         data: json!("hi"),
         declared_type: TypeExpr::named("PlainText"),
     };
-    let after_observe = observe(kwargs_with_input(upstream)).await.unwrap();
-    let after_finish = finish(kwargs_with_input(after_observe)).await.unwrap();
+    let after_observe = observe.call(kwargs_with_input(upstream), &DUMMY).await.unwrap();
+    let after_finish = finish.call(kwargs_with_input(after_observe), &DUMMY).await.unwrap();
 
     // Outer is Finish, inner is Observation of PlainText.
     assert_eq!(

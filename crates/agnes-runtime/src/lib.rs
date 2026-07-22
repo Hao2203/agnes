@@ -9,7 +9,7 @@ pub use error::RuntimeError;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use agnes_builtins::ToolImpl;
+use agnes_builtins::{ToolImpl, PathResolver};
 use agnes_compiler::{Dag, NodeId, NodeKind};
 use agnes_registry::Registry;
 use agnes_types::Value;
@@ -36,15 +36,17 @@ pub async fn execute(
     dag: &Dag,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
+    resolver: &(dyn PathResolver + Send + Sync),
 ) -> Result<Value, RuntimeError> {
-    execute_with(dag, reg, dispatch, &NoopTracer).await
+    execute_with(dag, reg, dispatch, resolver, &NoopTracer).await
 }
 
 pub async fn execute_with(
     dag: &Dag,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
+    resolver: &(dyn PathResolver + Send + Sync),
     tracer: &dyn Tracer,
 ) -> Result<Value, RuntimeError> {
-    scheduler::run(dag, reg, dispatch, tracer).await
+    scheduler::run(dag, reg, dispatch, resolver, tracer).await
 }

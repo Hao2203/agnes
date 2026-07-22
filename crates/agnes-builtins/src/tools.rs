@@ -2,14 +2,39 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
 
 use agnes_llm::{CompletionRequest, Message, Provider, Role};
 use agnes_types::{TypeExpr, TypeName, Value};
 use serde_json::Value as JsonValue;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-pub type ToolImpl =
-    Arc<dyn Fn(HashMap<String, Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
+/// Trait for types that can resolve and validate paths against an allowed root.
+pub trait PathResolver: Send + Sync {
+    /// Resolve a user-provided path, ensuring it's within the allowed root directory.
+    fn resolve_path<'a>(&'a self, input: &'a str) -> BoxFuture<'a, Result<PathBuf, String>>;
+}
+
+/// Tool trait defines the interface that all tools must implement.
+pub trait Tool: Send + Sync {
+    /// Call the tool with the given arguments and path resolver.
+    fn call<'a>(&'a self, args: HashMap<String, Value>, resolver: &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>>;
+}
+
+/// Blanket implementation for any correctly-typed function.
+impl<F> Tool for F
+where
+    F: for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>>
+    + Send
+    + Sync
+    + 'static,
+{
+    fn call<'a>(&'a self, args: HashMap<String, Value>, resolver: &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> {
+        self(args, resolver)
+    }
+}
+
+pub type ToolImpl = Arc<dyn Tool + Send + Sync>;
 
 /// Per-process recording of every mock write-file call, drained by
 /// `agnes_session::Session::run_turn` at the end of each turn and emitted
@@ -22,23 +47,6 @@ pub fn writes() -> &'static Mutex<Vec<(String, usize)>> {
 }
 
 const MAX_TOKENS: u32 = 1024;
-
-const MOCK_README: &str = "# agnes\n\nA Lisp-style DSL and Rust runtime for LLM-planned agent workflows, with a TypeScript-style semantic type system.";
-const MOCK_NOTES: &str =
-    "TODO(agnes): example note fixtures live here so demos don't need real disk I/O.";
-const MOCK_DRAFT: &str =
-    "Draft: agnes lets an LLM plan a workflow as a small DSL and hand it to a typed Rust runtime.";
-
-fn read_file_mock(path: &str) -> String {
-    match path {
-        "README.md" => MOCK_README.into(),
-        "NOTES.md" => MOCK_NOTES.into(),
-        "draft.md" => MOCK_DRAFT.into(),
-        other => format!(
-            "[MOCK file at {other}: agnes is a Lisp-style DSL for LLM-planned agent workflows. Placeholder body — swap in seeded content by editing MOCK_* constants in agnes-builtins.]"
-        ),
-    }
-}
 
 fn as_str(v: &Value) -> Option<String> {
     v.data.as_str().map(str::to_string)
@@ -53,37 +61,50 @@ fn arg_str(args: &HashMap<String, Value>, key: &str) -> Result<String, String> {
 pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl> {
     let mut m: HashMap<String, ToolImpl> = HashMap::new();
 
-    // read-file (mock, no disk)
-    m.insert(
-        "read-file".into(),
-        Arc::new(|args| {
+    // read-file (real, from disk)
+    let read_file: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|args, resolver| {
             Box::pin(async move {
-                let path = arg_str(&args, "path")?;
+                let path_str = arg_str(&args, "path")?;
+                let path = resolver.resolve_path(&path_str).await?;
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
                 Ok(Value::typed(
-                    JsonValue::String(read_file_mock(&path)),
+                    JsonValue::String(content),
                     "PlainText",
                 ))
             })
-        }),
-    );
+        });
+    m.insert("read-file".into(), Arc::new(read_file));
 
-    // write-file (mock: record and return Unit)
-    m.insert(
-        "write-file".into(),
-        Arc::new(|args| {
+    // write-file (real, to disk)
+    let write_file: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|args, resolver| {
             Box::pin(async move {
-                let path = arg_str(&args, "path")?;
+                let path_str = arg_str(&args, "path")?;
                 let content = arg_str(&args, "content")?;
-                writes().lock().unwrap().push((path, content.len()));
+                let path = resolver.resolve_path(&path_str).await?;
+
+                // Create parent directories if they don't exist
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| format!("cannot create directory '{}': {}", parent.display(), e))?;
+                }
+
+                tokio::fs::write(&path, content)
+                    .await
+                    .map_err(|e| format!("cannot write file '{}': {}", path.display(), e))?;
+
                 Ok(Value::typed(JsonValue::Null, "Unit"))
             })
-        }),
-    );
+        });
+    m.insert("write-file".into(), Arc::new(write_file));
 
     // ocr (mock: fixed sentence)
-    m.insert(
-        "ocr".into(),
-        Arc::new(|args| {
+    let ocr: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|args, _resolver| {
             Box::pin(async move {
                 let _ = arg_str(&args, "source")?;
                 Ok(Value::typed(
@@ -93,13 +114,12 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     "PlainText",
                 ))
             })
-        }),
-    );
+        });
+    m.insert("ocr".into(), Arc::new(ocr));
 
     // join-lines (real, kept)
-    m.insert(
-        "join-lines".into(),
-        Arc::new(|args| {
+    let join_lines: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|args, _resolver| {
             Box::pin(async move {
                 let lines = args
                     .get("lines")
@@ -113,15 +133,14 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     .join("\n");
                 Ok(Value::typed(JsonValue::String(lines), "PlainText"))
             })
-        }),
-    );
+        });
+    m.insert("join-lines".into(), Arc::new(join_lines));
 
     // llm (real provider call)
     {
         let p = provider.clone();
-        m.insert(
-            "llm".into(),
-            Arc::new(move |args| {
+        let llm: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+            Box::new(move |args, _resolver| {
                 let p = p.clone();
                 Box::pin(async move {
                     let prompt = arg_str(&args, "prompt")?;
@@ -144,16 +163,15 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                         .map_err(|e| e.to_string())?;
                     Ok(Value::typed(JsonValue::String(out), "PlainText"))
                 })
-            }),
-        );
+            });
+        m.insert("llm".into(), Arc::new(llm));
     }
 
     // summarize (real provider call)
     {
         let p = provider.clone();
-        m.insert(
-            "summarize".into(),
-            Arc::new(move |args| {
+        let summarize: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+            Box::new(move |args, _resolver| {
                 let p = p.clone();
                 Box::pin(async move {
                     let input = arg_str(&args, "input")?;
@@ -172,16 +190,15 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                         .map_err(|e| e.to_string())?;
                     Ok(Value::typed(JsonValue::String(out), "Summary"))
                 })
-            }),
-        );
+            });
+        m.insert("summarize".into(), Arc::new(summarize));
     }
 
     // translate (real provider call)
     {
         let p = provider.clone();
-        m.insert(
-            "translate".into(),
-            Arc::new(move |args| {
+        let translate: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+            Box::new(move |args, _resolver| {
                 let p = p.clone();
                 Box::pin(async move {
                     let input = arg_str(&args, "input")?;
@@ -201,16 +218,15 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                         .map_err(|e| e.to_string())?;
                     Ok(Value::typed(JsonValue::String(out), "PlainText"))
                 })
-            }),
-        );
+            });
+        m.insert("translate".into(), Arc::new(translate));
     }
 
     // --- Loop control: finish / observe ---
     // Both are identity on data but rewrite declared_type at the outer
     // layer so Session::run_turn can classify the root shape.
-    m.insert(
-        "finish".to_string(),
-        Arc::new(|mut kw: HashMap<String, Value>| {
+    let finish: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|mut kw: HashMap<String, Value>, _resolver| {
             Box::pin(async move {
                 let inner = kw
                     .remove("input")
@@ -223,11 +239,11 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     },
                 })
             })
-        }),
-    );
-    m.insert(
-        "observe".to_string(),
-        Arc::new(|mut kw: HashMap<String, Value>| {
+        });
+    m.insert("finish".into(), Arc::new(finish));
+
+    let observe: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(|mut kw: HashMap<String, Value>, _resolver| {
             Box::pin(async move {
                 let inner = kw
                     .remove("input")
@@ -240,8 +256,8 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     },
                 })
             })
-        }),
-    );
+        });
+    m.insert("observe".into(), Arc::new(observe));
 
     m
 }

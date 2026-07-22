@@ -1,11 +1,19 @@
-use agnes_builtins::register_builtins;
+use agnes_builtins::{register_builtins, PathResolver};
 use agnes_compiler::{NodeKind, compile};
 use agnes_parser::parse;
 use agnes_registry::Registry;
 use agnes_runtime::{NoopTracer, RuntimeError, Tracer, execute_with};
 use agnes_types::Value;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+struct DummyResolver;
+impl PathResolver for DummyResolver {
+    fn resolve_path<'a>(&'a self, _input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
+        panic!("dummy resolver should not be called in this test");
+    }
+}
 
 #[derive(Default)]
 struct RecordingTracer {
@@ -40,26 +48,39 @@ fn stub_dispatch() -> std::collections::HashMap<String, agnes_builtins::ToolImpl
     use agnes_builtins::BoxFuture;
     use agnes_types::Value;
     use serde_json::Value as JsonValue;
+    use std::collections::HashMap;
     use std::sync::Arc;
     let mut m = std::collections::HashMap::new();
+
+    let read_file: Box<dyn for<'a> Fn(
+        HashMap<String, Value>,
+        &'a (dyn agnes_builtins::PathResolver + Send + Sync)
+    ) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(move |_args, _resolver| {
+            Box::pin(async { Ok(Value::typed(JsonValue::String("hello".into()), "PlainText")) })
+        });
     m.insert(
         "read-file".to_string(),
-        Arc::new(|_args| {
-            Box::pin(async { Ok(Value::typed(JsonValue::String("hello".into()), "PlainText")) })
-                as BoxFuture<'static, Result<Value, String>>
-        }) as agnes_builtins::ToolImpl,
+        Arc::new(read_file) as Arc<dyn agnes_builtins::Tool + Send + Sync>
     );
-    m.insert(
-        "summarize".to_string(),
-        Arc::new(|_args| {
+
+    let summarize: Box<dyn for<'a> Fn(
+        HashMap<String, Value>,
+        &'a (dyn agnes_builtins::PathResolver + Send + Sync)
+    ) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
+        Box::new(move |_args, _resolver| {
             Box::pin(async {
                 Ok(Value::typed(
                     JsonValue::String("[SUMMARY]".into()),
                     "Summary",
                 ))
-            }) as BoxFuture<'static, Result<Value, String>>
-        }) as agnes_builtins::ToolImpl,
+            })
+        });
+    m.insert(
+        "summarize".to_string(),
+        Arc::new(summarize) as Arc<dyn agnes_builtins::Tool + Send + Sync>
     );
+
     m
 }
 
@@ -75,7 +96,8 @@ async fn tracer_receives_start_and_end_per_tool_node() {
     let dispatch = stub_dispatch();
 
     let tracer = RecordingTracer::default();
-    let _ = execute_with(&dag, &r, &dispatch, &tracer).await.unwrap();
+    let dummy = DummyResolver;
+    let _ = execute_with(&dag, &r, &dispatch, &dummy, &tracer).await.unwrap();
 
     let ev = tracer.events.lock().unwrap().clone();
     // read-file start, read-file end, summarize start, summarize end (order preserved by pipe).
@@ -97,7 +119,8 @@ async fn existing_execute_still_works_as_noop() {
     agnes_checker::check(&p, &r).unwrap();
     let dag = compile(&p, &r).unwrap();
     let dispatch = stub_dispatch();
-    let v = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
+    let dummy = DummyResolver;
+    let v = agnes_runtime::execute(&dag, &r, &dispatch, &dummy).await.unwrap();
     assert_eq!(v.data.as_str().unwrap(), "hello");
     let _ = NoopTracer; // touch to ensure it's exported.
 }

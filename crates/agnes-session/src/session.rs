@@ -2,7 +2,7 @@ use crate::error::SessionError;
 use crate::events::{EventSink, SessionEvent};
 use crate::plan_tree::build_plan_tree;
 use crate::tracer_bridge::{ChannelTracer, drain};
-use agnes_builtins::{ToolImpl, native_dispatch, register_builtins};
+use agnes_builtins::{ToolImpl, native_dispatch, register_builtins, PathResolver};
 use agnes_llm::{Planner, Provider, Turn};
 use agnes_registry::Registry;
 use agnes_runtime::execute_with;
@@ -385,7 +385,7 @@ impl Session {
         })
         .await;
         let (tracer, mut rx) = ChannelTracer::new();
-        let exec = execute_with(&dag, &turn_registry, &self.dispatch, &tracer);
+        let exec = execute_with(&dag, &turn_registry, &self.dispatch, self, &tracer);
         tokio::pin!(exec);
         let result = loop {
             tokio::select! {
@@ -397,6 +397,12 @@ impl Session {
         };
         drain(&mut rx, sink).await;
         Ok(result?)
+    }
+}
+
+impl PathResolver for Session {
+    fn resolve_path<'a>(&'a self, input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<std::path::PathBuf, String>> {
+        Box::pin(self.resolve_path(input))
     }
 }
 

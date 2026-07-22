@@ -1,10 +1,18 @@
-use agnes_builtins::{native_dispatch, register_builtins};
+use agnes_builtins::{native_dispatch, register_builtins, PathResolver};
 use agnes_checker::check;
 use agnes_compiler::compile;
 use agnes_parser::parse;
 use agnes_registry::Registry;
 use agnes_runtime::execute;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+struct DummyResolver;
+impl PathResolver for DummyResolver {
+    fn resolve_path<'a>(&'a self, _input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
+        panic!("dummy resolver should not be called in this test");
+    }
+}
 
 #[tokio::test]
 async fn runs_read_then_summarize() {
@@ -19,7 +27,8 @@ async fn runs_read_then_summarize() {
 
     let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
     let dispatch = native_dispatch(mock);
-    let out = execute(&dag, &r, &dispatch).await.expect("run ok");
+    let dummy = DummyResolver;
+    let out = execute(&dag, &r, &dispatch, &dummy).await.expect("run ok");
     let s = out.data.as_str().expect("string result");
     assert_eq!(s, "[SUMMARY]");
 }
@@ -44,7 +53,8 @@ async fn runs_a_defined_compound_tool() {
     let dag = agnes_compiler::compile(&p, &r).unwrap();
     let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
     let dispatch = agnes_builtins::native_dispatch(mock);
-    let out = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
+    let dummy = DummyResolver;
+    let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy).await.unwrap();
     let s = out.data.as_str().unwrap();
     assert_eq!(s, "[SUMMARY]");
 }
@@ -60,7 +70,8 @@ async fn evaluates_list_literal() {
     let dag = agnes_compiler::compile(&p, &r).unwrap();
     let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
     let dispatch = agnes_builtins::native_dispatch(mock);
-    let out = agnes_runtime::execute(&dag, &r, &dispatch).await.unwrap();
+    let dummy = DummyResolver;
+    let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy).await.unwrap();
     let arr = out.data.as_array().expect("array result");
     assert_eq!(arr.len(), 3);
     assert_eq!(arr[0], serde_json::json!("a"));
@@ -90,7 +101,8 @@ async fn boundary_validates_list_of_string_at_runtime() {
     let dag = agnes_compiler::compile(&p, &r).unwrap();
     let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
     let dispatch = agnes_builtins::native_dispatch(mock);
-    let err = agnes_runtime::execute(&dag, &r, &dispatch)
+    let dummy = DummyResolver;
+    let err = agnes_runtime::execute(&dag, &r, &dispatch, &dummy)
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -133,7 +145,8 @@ async fn boundary_validates_list_of_union_at_runtime() {
     let dag = agnes_compiler::compile(&p, &r).unwrap();
     let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
     let dispatch = agnes_builtins::native_dispatch(mock);
-    let out = agnes_runtime::execute(&dag, &r, &dispatch)
+    let dummy = DummyResolver;
+    let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy)
         .await
         .expect("List (| PlainText Markdown) boundary must accept PlainText elements");
     let s = out.data.as_str().expect("string result");

@@ -8,16 +8,24 @@
 //! comma-in-list rejection, mixed-list element-type rejection, flow
 //! mismatch, recursive define, unknown type name, and name conflict.
 
-use agnes_builtins::{native_dispatch, register_builtins};
+use agnes_builtins::{native_dispatch, register_builtins, PathResolver};
 use agnes_checker::check;
 use agnes_compiler::compile;
 use agnes_parser::parse;
 use agnes_registry::Registry;
 use agnes_runtime::execute;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 async fn run(src: &str) -> Result<String, String> {
     run_with(src, vec![]).await
+}
+
+struct DummyResolver;
+impl PathResolver for DummyResolver {
+    fn resolve_path<'a>(&'a self, _input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
+        panic!("dummy resolver should not be called in this test");
+    }
 }
 
 async fn run_with(src: &str, responses: Vec<String>) -> Result<String, String> {
@@ -29,7 +37,8 @@ async fn run_with(src: &str, responses: Vec<String>) -> Result<String, String> {
     let dag = compile(&program, &reg).map_err(|e| format!("{e}"))?;
     let mock: Arc<dyn agnes_llm::Provider> = Arc::new(agnes_llm::MockProvider::new(responses));
     let dispatch = native_dispatch(mock);
-    let value = execute(&dag, &reg, &dispatch)
+    let dummy = DummyResolver;
+    let value = execute(&dag, &reg, &dispatch, &dummy)
         .await
         .map_err(|e| format!("{e}"))?;
     Ok(value.data.to_string())
