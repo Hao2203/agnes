@@ -141,8 +141,9 @@ impl EventSink for StderrEventSink {
                 let input = input.trim().to_lowercase();
 
                 let approved = input.is_empty() || input == "y" || input == "yes";
-                let tx = Arc::into_inner(responder).expect("Only one Arc reference should exist");
-                let _ = tx.send(approved);
+                if let Some(tx) = Arc::into_inner(responder) {
+                    let _ = tx.send(approved);
+                }
             }
             _ => {
                 // Future SessionEvent variants render nothing by default.
