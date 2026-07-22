@@ -14,6 +14,7 @@ use agnes_session::{Session, SessionError, TurnInput};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result as RlResult};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Prints the banner and enters the REPL. Ctrl-D exits cleanly.
 pub async fn run(provider: Arc<dyn Provider>, max_turns: Option<u32>) -> anyhow::Result<()> {
@@ -35,7 +36,8 @@ pub async fn run(provider: Arc<dyn Provider>, max_turns: Option<u32>) -> anyhow:
                 if line.trim().is_empty() {
                     continue;
                 }
-                let mut sink = StderrEventSink::new();
+                let sink = StderrEventSink::new();
+                let sink = Arc::new(Mutex::new(sink));
                 let trimmed = line.trim_start();
                 let input = if trimmed.starts_with('(') || trimmed.starts_with('[') {
                     // Direct DSL injection when the user types raw code.
@@ -58,7 +60,7 @@ pub async fn run(provider: Arc<dyn Provider>, max_turns: Option<u32>) -> anyhow:
                     }
                     cancel_for_signal.notify_one();
                 });
-                let result = session.run_turn_cancellable(input, &mut sink, cancel).await;
+                let result = session.run_turn_cancellable(input, sink, cancel).await;
                 ctrlc_task.abort();
                 match result {
                     Ok(v) => println!("{}", v.data),
@@ -123,9 +125,10 @@ async fn dispatch_slash(cmd: &str, session: &mut Session) -> anyhow::Result<bool
         return Ok(true);
     }
     if let Some(dsl) = cmd.strip_prefix("run ") {
-        let mut sink = StderrEventSink::new();
+        let sink = StderrEventSink::new();
+        let sink = Arc::new(Mutex::new(sink));
         match session
-            .run_turn(TurnInput::RawDsl(dsl.into()), &mut sink)
+            .run_turn(TurnInput::RawDsl(dsl.into()), sink)
             .await
         {
             Ok(v) => println!("{}", v.data),

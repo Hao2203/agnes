@@ -10,6 +10,7 @@ use agnes_types::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Which "root shape" a Value carries — the classification used by the
 /// agent loop to decide whether to terminate (Finish/Other) or feed
@@ -79,19 +80,9 @@ pub struct Session {
     /// Whether shell execution is permitted.
     allow_shell: bool,
     /// Current event sink for the active turn, if available.
-    /// We need an unsafe impl because the raw pointer doesn't auto-implement Send/Sync,
-    /// but this is safe because we only access it during the turn when the pointer
-    /// is guaranteed to be valid, and no concurrent access happens.
-    current_sink: Option<*mut dyn EventSink>,
+    /// Arc<Mutex<>> provides safe shared mutable access with Send/Sync automatically.
+    current_sink: Option<Arc<Mutex<dyn EventSink + Send + 'static>>>,
 }
-
-// Safety: The current_sink pointer is only set during an active turn
-// and cleared before the reference becomes invalid. The Session is never
-// accessed concurrently from multiple threads during execution, so this
-// unsafe impl is correct - it just tells the compiler the Session is OK
-// to be Send/Sync which it is in practice.
-unsafe impl Send for Session {}
-unsafe impl Sync for Session {}
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -157,12 +148,8 @@ impl Session {
     /// Emit a session event to the registered event sink.
     /// Must only be called during an active turn.
     pub async fn emit_event(&self, event: SessionEvent) {
-        if let Some(sink_ptr) = self.current_sink {
-            // Safety: this is safe because:
-            // 1. The pointer is only set during an active turn
-            // 2. The mutable reference is guaranteed to be valid for the entire turn
-            // 3. We don't alias the mutable reference in an unsafe way
-            unsafe { &mut *sink_ptr }.emit(event).await;
+        if let Some(sink) = &self.current_sink {
+            sink.lock().await.emit(event).await;
         }
     }
 
@@ -241,7 +228,7 @@ impl Session {
     pub async fn run_turn(
         &mut self,
         input: TurnInput,
-        sink: &mut dyn EventSink,
+        sink: Arc<Mutex<dyn EventSink + Send + 'static>>,
     ) -> Result<Value, SessionError> {
         // Uncancellable variant: a fresh Notify never fires.
         let never = Arc::new(tokio::sync::Notify::new());
@@ -251,31 +238,28 @@ impl Session {
     pub async fn run_turn_cancellable(
         &mut self,
         input: TurnInput,
-        sink: &mut dyn EventSink,
+        sink: Arc<Mutex<dyn EventSink + Send + 'static>>,
         cancel: Arc<tokio::sync::Notify>,
     ) -> Result<Value, SessionError> {
         // Store the current sink for event emission during tool execution
-        // This is safe because:
-        // 1. We clear the pointer before the reference becomes invalid
-        // 2. We only dereference it during the turn when the reference is valid
-        // 3. The unsafe impl just makes the compiler happy about Send/Sync
-        use std::mem;
-        self.current_sink = Some(unsafe { mem::transmute::<*mut dyn EventSink, *mut (dyn EventSink + 'static)>(sink) });
-        let result = match self.run_turn_inner(input, sink, cancel).await {
+        self.current_sink = Some(sink.clone());
+        let mut guard = sink.lock().await;
+        let result = match self.run_turn_inner(input, &mut *guard, cancel).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let recorded = Self::drain_writes();
                 if !recorded.is_empty() {
-                    sink.emit(SessionEvent::WriteSummary { entries: recorded })
+                    guard.emit(SessionEvent::WriteSummary { entries: recorded })
                         .await;
                 }
-                sink.emit(SessionEvent::TurnFailed {
+                guard.emit(SessionEvent::TurnFailed {
                     error: e.to_string(),
                 })
                 .await;
                 Err(e)
             }
         };
+        drop(guard);
         // Clear the current sink after the turn completes
         self.current_sink = None;
         result
@@ -451,16 +435,12 @@ impl PathResolver for Session {
         responder: tokio::sync::oneshot::Sender<bool>,
     ) -> agnes_builtins::BoxFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(sink_ptr) = self.current_sink {
-                // Safety: this is safe because:
-                // 1. The pointer is only stored during an active turn
-                // 2. The original mutable reference is guaranteed to be valid for the entire turn
-                // 3. We clear the pointer before the reference becomes invalid
-                // 4. Execution is sequential so there's no concurrent mutable access
-                unsafe { &mut *sink_ptr }.emit(SessionEvent::ShellConfirm {
+            if let Some(sink) = &self.current_sink {
+                let event = SessionEvent::ShellConfirm {
                     command,
                     responder: std::sync::Arc::new(responder),
-                }).await;
+                };
+                sink.lock().await.emit(event).await;
             } else {
                 // No sink available, automatically reject
                 let _ = responder.send(false);
