@@ -727,8 +727,8 @@ Replace the tool-signature block. Replace the `let plaintext = …; let summary 
         "translate",
         ToolSignature {
             requires: vec![
-                ("input".into(), string.clone()),
                 ("lang".into(), string.clone()),
+                ("input".into(), string.clone()),
             ],
             provides: string.clone(),
         },

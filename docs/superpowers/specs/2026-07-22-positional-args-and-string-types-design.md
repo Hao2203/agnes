@@ -65,7 +65,7 @@
 | read-file | `path: Path` | `String` |
 | write-file | `path: Path`, `content: String` | `Unit` |
 | summarize | `input: String` | `String` |
-| translate | `input: String`, `lang: String` | `String` |
+| translate | `lang: String`, `input: String` | `String` |
 | llm | `prompt: String`, `input: String` | `String` |
 | join-lines | `lines: List String` | `String` |
 | shell-run | `command: String` | `CommandResult` |
