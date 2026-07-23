@@ -1,4 +1,4 @@
-use crate::events::{EventSink, NodeKindTag, SessionEvent};
+use crate::events::{NodeKindTag, SessionEvent, SinkHandle};
 use agnes_compiler::{NodeId, NodeKind};
 use agnes_runtime::{RuntimeError, Tracer};
 use agnes_types::Value;
@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 
 /// A tracer that forwards NodeStart/NodeEnd events over an in-memory
 /// channel. The receiver side is drained by Session::run_turn and forwarded
-/// to the user-supplied EventSink (which is `&mut dyn EventSink`, so it
-/// cannot be shared across the sync callback boundary directly).
+/// to the user-supplied EventSink via a `SinkHandle` (whose `emit` is
+/// async, so it cannot be called from the sync `Tracer` callback directly).
 pub struct ChannelTracer {
     tx: Mutex<mpsc::UnboundedSender<SessionEvent>>,
 }
@@ -61,7 +61,7 @@ impl Tracer for ChannelTracer {
     }
 }
 
-pub async fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, sink: &mut dyn EventSink) {
+pub async fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, sink: &SinkHandle<'_>) {
     while let Ok(ev) = rx.try_recv() {
         sink.emit(ev).await;
     }

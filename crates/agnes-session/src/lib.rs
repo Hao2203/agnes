@@ -12,6 +12,6 @@ mod tracer_bridge;
 mod path_validation_tests;
 
 pub use error::SessionError;
-pub use events::{EventSink, NodeKindTag, SessionEvent};
+pub use events::{EventSink, NodeKindTag, SessionEvent, SinkHandle};
 pub use plan_tree::PlanTree;
 pub use session::{RootKind, Session, TurnInput, classify_root, extract_inner_type};

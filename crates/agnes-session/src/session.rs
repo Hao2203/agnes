@@ -1,5 +1,5 @@
 use crate::error::SessionError;
-use crate::events::{EventSink, SessionEvent};
+use crate::events::{EventSink, SessionEvent, SinkHandle};
 use crate::plan_tree::build_plan_tree;
 use crate::tracer_bridge::{ChannelTracer, drain};
 use agnes_builtins::{ToolImpl, native_dispatch, register_builtins, PathResolver};
@@ -264,25 +264,31 @@ impl Session {
         sink: Arc<Mutex<dyn EventSink + Send + 'static>>,
         cancel: Arc<tokio::sync::Notify>,
     ) -> Result<Value, SessionError> {
-        // Store the current sink for event emission during tool execution
+        // Store the current sink for event emission during tool execution.
+        // Tools reach it through `PathResolver::emit_shell_confirm`.
         self.current_sink = Some(sink.clone());
-        let mut guard = sink.lock().await;
-        let result = match self.run_turn_inner(input, &mut *guard, cancel).await {
+        // NOTE: do NOT hold a `MutexGuard` across `run_turn_inner`. The
+        // turn awaits tool futures (`execute_with`) that re-enter this
+        // same sink via `emit_shell_confirm`; a long-held guard would
+        // deadlock them. `SinkHandle` locks per emit instead.
+        let sink_handle = SinkHandle::new(&sink);
+        let result = match self.run_turn_inner(input, &sink_handle, cancel).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let recorded = Self::drain_writes();
                 if !recorded.is_empty() {
-                    guard.emit(SessionEvent::WriteSummary { entries: recorded })
+                    sink_handle
+                        .emit(SessionEvent::WriteSummary { entries: recorded })
                         .await;
                 }
-                guard.emit(SessionEvent::TurnFailed {
-                    error: e.to_string(),
-                })
-                .await;
+                sink_handle
+                    .emit(SessionEvent::TurnFailed {
+                        error: e.to_string(),
+                    })
+                    .await;
                 Err(e)
             }
         };
-        drop(guard);
         // Clear the current sink after the turn completes
         self.current_sink = None;
         result
@@ -291,7 +297,7 @@ impl Session {
     async fn run_turn_inner(
         &mut self,
         input: TurnInput,
-        sink: &mut dyn EventSink,
+        sink: &SinkHandle<'_>,
         cancel: Arc<tokio::sync::Notify>,
     ) -> Result<Value, SessionError> {
         // Seed: NL starts an in-flight planner turn; RawDsl provides
@@ -411,7 +417,7 @@ impl Session {
     async fn try_execute(
         &mut self,
         dsl: &str,
-        sink: &mut dyn EventSink,
+        sink: &SinkHandle<'_>,
     ) -> Result<Value, SessionError> {
         let program = agnes_parser::parse(dsl).map_err(|e| SessionError::Parse(e.to_string()))?;
         let mut turn_registry = Registry::new();

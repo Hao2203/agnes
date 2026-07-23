@@ -1,6 +1,6 @@
 use crate::plan_tree::PlanTree;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Clone)]
 pub enum NodeKindTag {
@@ -74,4 +74,32 @@ pub enum SessionEvent {
 #[async_trait::async_trait]
 pub trait EventSink: Send {
     async fn emit(&mut self, ev: SessionEvent);
+}
+
+/// A borrowed handle to the turn's event sink that acquires the shared
+/// `Mutex` on each `emit`, instead of holding a single lock guard across
+/// the whole turn.
+///
+/// Holding one `MutexGuard` for an entire turn deadlocks any tool that
+/// re-enters the sink through `PathResolver::emit_shell_confirm`
+/// (notably `shell-run`): the tool awaits the same mutex the turn task
+/// is already holding, and the turn task is itself awaiting the tool's
+/// result. `SinkHandle` breaks the cycle by locking per event and
+/// releasing between emits, so the tool can acquire the sink while the
+/// turn is parked on `execute_with`.
+#[derive(Clone, Copy)]
+pub struct SinkHandle<'a> {
+    sink: &'a Arc<Mutex<dyn EventSink + Send + 'static>>,
+}
+
+impl<'a> SinkHandle<'a> {
+    pub fn new(sink: &'a Arc<Mutex<dyn EventSink + Send + 'static>>) -> Self {
+        Self { sink }
+    }
+
+    /// Lock the shared sink for a single emit, then release. Safe for a
+    /// tool running under the same turn to call concurrently.
+    pub async fn emit(&self, ev: SessionEvent) {
+        self.sink.lock().await.emit(ev).await;
+    }
 }
