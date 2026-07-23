@@ -54,6 +54,22 @@ async fn test_resolve_path_outside_root_rejected() {
 }
 
 #[tokio::test]
+async fn test_resolve_path_nonexistent_file_inside_root_allowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_owned();
+
+    let session = create_test_session()
+        .with_allow_root(root.clone());
+
+    // A file that does NOT yet exist (write-file creating a new file) should
+    // resolve successfully as long as its parent is inside the root.
+    let input = format!("{}/new_file.rs", root.display());
+    let result = session.resolve_path(&input).await;
+    assert!(result.is_ok(), "expected non-existent file to resolve, got: {:?}", result.err());
+    assert!(result.unwrap().ends_with("new_file.rs"));
+}
+
+#[tokio::test]
 async fn test_resolve_path_symlink_outside_rejected() {
     // Skip this test if symlinks are not available
     if cfg!(windows) {

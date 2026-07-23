@@ -168,10 +168,25 @@ impl Session {
             current_dir.join(input)
         };
 
-        // Canonicalize to resolve symlinks and .. components
-        let canonical = tokio::fs::canonicalize(&candidate)
-            .await
-            .map_err(|e| format!("cannot resolve path '{}': {}", input, e))?;
+        // Canonicalize to resolve symlinks and .. components.
+        // For paths that don't yet exist (e.g. `write-file` creating a new
+        // file), canonicalize the existing parent directory and re-append the
+        // leaf component so the allow-root check still applies.
+        let canonical = match tokio::fs::canonicalize(&candidate).await {
+            Ok(p) => p,
+            Err(e) => {
+                let parent = candidate.parent().ok_or_else(|| {
+                    format!("cannot resolve path '{}': {}", input, e)
+                })?;
+                let canon_parent = tokio::fs::canonicalize(parent)
+                    .await
+                    .map_err(|e| format!("cannot resolve path '{}': {}", input, e))?;
+                let file_name = candidate.file_name().ok_or_else(|| {
+                    format!("cannot resolve path '{}': no file name component", input)
+                })?;
+                canon_parent.join(file_name)
+            }
+        };
 
         // Check that the canonical path starts with the allowed root
         if !canonical.starts_with(allow_root) {
