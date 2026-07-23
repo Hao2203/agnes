@@ -93,3 +93,57 @@ async fn test_resolve_path_symlink_outside_rejected() {
     let result = session.resolve_path("link.txt").await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn test_resolve_path_nonexistent_file_outside_root_via_parent_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(root.join("subdir")).unwrap();
+
+    let session = create_test_session()
+        .with_allow_root(root.clone());
+
+    // The leaf file does NOT exist, so canonicalize(candidate) fails and the
+    // fallback branch canonicalizes the parent instead. The parent
+    // (root/subdir/../..) canonicalizes to outside root, so the resulting
+    // path (parent/evil.txt) must be rejected even though the leaf itself
+    // is non-existent (write-file creating a new file outside the root).
+    let input = format!("{}/subdir/../../evil.txt", root.display());
+    let result = session.resolve_path(&input).await;
+    assert!(result.is_err(), "expected rejection, got: {:?}", result.ok());
+    let err = result.unwrap_err();
+    assert!(err.contains("outside allowed root"), "unexpected error: {}", err);
+}
+
+#[tokio::test]
+async fn test_resolve_path_nonexistent_file_via_symlink_parent_rejected() {
+    // Skip this test if symlinks are not available
+    if cfg!(windows) {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+
+    // A directory OUTSIDE the root that the symlink will point to.
+    let outside_dir = temp.path().join("outside_dir");
+    std::fs::create_dir(&outside_dir).unwrap();
+
+    // Create a symlink from inside the root to the outside directory.
+    let symlink = root.join("link_to_outside");
+    std::os::unix::fs::symlink(&outside_dir, &symlink).unwrap();
+
+    let session = create_test_session()
+        .with_allow_root(root.clone());
+
+    // The leaf file does NOT exist, so canonicalize(candidate) fails and the
+    // fallback branch canonicalizes the parent (the symlink) instead. The
+    // symlink resolves to outside_dir, which is outside the root, so the
+    // resulting path must be rejected.
+    let input = format!("{}/link_to_outside/nonexistent.txt", root.display());
+    let result = session.resolve_path(&input).await;
+    assert!(result.is_err(), "expected rejection, got: {:?}", result.ok());
+    let err = result.unwrap_err();
+    assert!(err.contains("outside allowed root"), "unexpected error: {}", err);
+}
