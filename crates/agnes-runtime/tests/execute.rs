@@ -1,4 +1,4 @@
-use agnes_builtins::{native_dispatch, register_builtins, PathResolver};
+use agnes_builtins::{native_dispatch, register_builtins, PathResolver, Sink, ToolCtx};
 use agnes_checker::check;
 use agnes_compiler::compile;
 use agnes_parser::parse;
@@ -6,6 +6,7 @@ use agnes_registry::Registry;
 use agnes_runtime::execute;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 struct DummyResolver;
 impl PathResolver for DummyResolver {
@@ -14,6 +15,37 @@ impl PathResolver for DummyResolver {
         let root = std::env::current_dir().unwrap();
         let path = root.join(input);
         Box::pin(async move { Ok(path) })
+    }
+}
+
+/// No-op sink for tests that don't exercise shell-run.
+struct DummySink;
+impl Sink for DummySink {
+    fn shell_confirm<'a>(
+        &'a self,
+        _command: String,
+        responder: oneshot::Sender<bool>,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = responder.send(false);
+        })
+    }
+    fn shell_output<'a>(
+        &'a self,
+        _line: String,
+        _is_stderr: bool,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+static DUMMY_SINK: DummySink = DummySink;
+
+fn ctx(resolver: &DummyResolver) -> ToolCtx<'_> {
+    ToolCtx {
+        resolver,
+        sink: &DUMMY_SINK,
+        allow_shell: false,
     }
 }
 
@@ -31,7 +63,7 @@ async fn runs_read_then_summarize() {
     let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
     let dispatch = native_dispatch(mock);
     let dummy = DummyResolver;
-    let out = execute(&dag, &r, &dispatch, &dummy).await.expect("run ok");
+    let out = execute(&dag, &r, &dispatch, &ctx(&dummy)).await.expect("run ok");
     let s = out.data.as_str().expect("string result");
     assert_eq!(s, "[SUMMARY]");
 }
@@ -57,7 +89,7 @@ async fn runs_a_defined_compound_tool() {
     let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
     let dispatch = agnes_builtins::native_dispatch(mock);
     let dummy = DummyResolver;
-    let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy).await.unwrap();
+    let out = agnes_runtime::execute(&dag, &r, &dispatch, &ctx(&dummy)).await.unwrap();
     let s = out.data.as_str().unwrap();
     assert_eq!(s, "[SUMMARY]");
 }
@@ -74,7 +106,7 @@ async fn evaluates_list_literal() {
     let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
     let dispatch = agnes_builtins::native_dispatch(mock);
     let dummy = DummyResolver;
-    let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy).await.unwrap();
+    let out = agnes_runtime::execute(&dag, &r, &dispatch, &ctx(&dummy)).await.unwrap();
     let arr = out.data.as_array().expect("array result");
     assert_eq!(arr.len(), 3);
     assert_eq!(arr[0], serde_json::json!("a"));
@@ -105,7 +137,7 @@ async fn boundary_validates_list_of_string_at_runtime() {
     let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
     let dispatch = agnes_builtins::native_dispatch(mock);
     let dummy = DummyResolver;
-    let err = agnes_runtime::execute(&dag, &r, &dispatch, &dummy)
+    let err = agnes_runtime::execute(&dag, &r, &dispatch, &ctx(&dummy))
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -149,7 +181,7 @@ async fn boundary_validates_list_of_union_at_runtime() {
     let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
     let dispatch = agnes_builtins::native_dispatch(mock);
     let dummy = DummyResolver;
-    let out = agnes_runtime::execute(&dag, &r, &dispatch, &dummy)
+    let out = agnes_runtime::execute(&dag, &r, &dispatch, &ctx(&dummy))
         .await
         .expect("List String boundary must accept String elements");
     let s = out.data.as_str().expect("string result");

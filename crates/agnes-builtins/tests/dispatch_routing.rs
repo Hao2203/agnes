@@ -1,10 +1,11 @@
-use agnes_builtins::{native_dispatch, PathResolver};
+use agnes_builtins::{native_dispatch, PathResolver, Sink, ToolCtx};
 use agnes_llm::MockProvider;
 use agnes_types::Value;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 struct DummyResolver;
 impl PathResolver for DummyResolver {
@@ -13,7 +14,38 @@ impl PathResolver for DummyResolver {
     }
 }
 
-static DUMMY: DummyResolver = DummyResolver;
+/// No-op sink: rejects confirms, drops output. Only translate/summarize/llm
+/// are exercised here, so neither method is actually called.
+struct DummySink;
+impl Sink for DummySink {
+    fn shell_confirm<'a>(
+        &'a self,
+        _command: String,
+        responder: oneshot::Sender<bool>,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = responder.send(false);
+        })
+    }
+    fn shell_output<'a>(
+        &'a self,
+        _line: String,
+        _is_stderr: bool,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+static DUMMY_RESOLVER: DummyResolver = DummyResolver;
+static DUMMY_SINK: DummySink = DummySink;
+
+fn ctx() -> ToolCtx<'static> {
+    ToolCtx {
+        resolver: &DUMMY_RESOLVER,
+        sink: &DUMMY_SINK,
+        allow_shell: false,
+    }
+}
 
 fn args(kvs: &[(&str, &str)]) -> HashMap<String, Value> {
     kvs.iter()
@@ -36,7 +68,7 @@ fn dispatch() -> HashMap<String, agnes_builtins::ToolImpl> {
 async fn translate_routes_through_provider() {
     let mock = Arc::new(MockProvider::new(vec!["こんにちは".into()]));
     let d = native_dispatch(mock.clone());
-    let out = d["translate"].call(args(&[("input", "hello world"), ("lang", "ja")]), &DUMMY)
+    let out = d["translate"].call(args(&[("input", "hello world"), ("lang", "ja")]), &ctx())
         .await
         .unwrap();
     assert_eq!(out.data.as_str().unwrap(), "こんにちは");
@@ -64,7 +96,7 @@ async fn translate_routes_through_provider() {
 async fn summarize_routes_through_provider() {
     let mock = Arc::new(MockProvider::new(vec!["one-para summary".into()]));
     let d = native_dispatch(mock.clone());
-    let out = d["summarize"].call(args(&[("input", "long body...")]), &DUMMY)
+    let out = d["summarize"].call(args(&[("input", "long body...")]), &ctx())
         .await
         .unwrap();
     assert_eq!(out.data.as_str().unwrap(), "one-para summary");
@@ -75,7 +107,7 @@ async fn summarize_routes_through_provider() {
 async fn llm_routes_through_provider() {
     let mock = Arc::new(MockProvider::new(vec!["result".into()]));
     let d = native_dispatch(mock.clone());
-    let out = d["llm"].call(args(&[("prompt", "answer this"), ("input", "context")]), &DUMMY)
+    let out = d["llm"].call(args(&[("prompt", "answer this"), ("input", "context")]), &ctx())
         .await
         .unwrap();
     assert_eq!(out.data.as_str().unwrap(), "result");
@@ -92,6 +124,6 @@ async fn llm_is_callable_via_tool_form() {
     // existing `dispatch()` in this file; exercise it the same way read-file etc. are.
     let d = dispatch();
     let llm = d.get("llm").expect("llm tool registered");
-    let out = llm.call(args(&[("prompt", "hi"), ("input", "")]), &DUMMY).await.unwrap();
+    let out = llm.call(args(&[("prompt", "hi"), ("input", "")]), &ctx()).await.unwrap();
     assert_eq!(out.declared_type.to_string(), "String");
 }

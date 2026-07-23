@@ -34,6 +34,40 @@ impl StderrEventSink {
 #[async_trait::async_trait]
 impl EventSink for StderrEventSink {
     async fn emit(&mut self, ev: SessionEvent) {
+        // ShellConfirm awaits `spawn_blocking` on stdin. Handle it BEFORE
+        // acquiring the stderr lock: `StderrLock` is `!Send`, so holding it
+        // across an await would make this future `!Send`.
+        if let SessionEvent::ShellConfirm { command, responder } = ev {
+            println!();
+            println!("\x1b[1m[agnes] Confirm shell execution:\x1b[0m");
+            println!("  Command: {}", command);
+            print!("  OK to run? [Y/n] ");
+            std::io::stdout().flush().unwrap();
+
+            // Read the confirmation on a blocking thread so waiting on
+            // stdin does not stall the async runtime (and the turn that
+            // is driving this sink while parked on the tool result).
+            let input = tokio::task::spawn_blocking(|| {
+                let mut input = String::new();
+                let _ = std::io::stdin().read_line(&mut input);
+                input
+            })
+            .await;
+            let approved = match input {
+                Ok(s) => {
+                    let s = s.trim().to_lowercase();
+                    s.is_empty() || s == "y" || s == "yes"
+                }
+                // JoinError (blocking task panicked): refuse rather than
+                // default-approve.
+                Err(_) => false,
+            };
+            if let Some(tx) = Arc::into_inner(responder) {
+                let _ = tx.send(approved);
+            }
+            return;
+        }
+
         let e = &mut std::io::stderr().lock();
         match ev {
             SessionEvent::PlannerStart => {
@@ -129,21 +163,9 @@ impl EventSink for StderrEventSink {
                     "{t} {tag} (iter {iter}, {char_count} chars): {preview}{ellipsis}"
                 );
             }
-            SessionEvent::ShellConfirm { command, responder } => {
-                println!();
-                println!("\x1b[1m[agnes] Confirm shell execution:\x1b[0m");
-                println!("  Command: {}", command);
-                print!("  OK to run? [Y/n] ");
-                std::io::stdout().flush().unwrap();
-
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).unwrap();
-                let input = input.trim().to_lowercase();
-
-                let approved = input.is_empty() || input == "y" || input == "yes";
-                if let Some(tx) = Arc::into_inner(responder) {
-                    let _ = tx.send(approved);
-                }
+            SessionEvent::ShellOutput { is_stderr, line } => {
+                let stream = if is_stderr { "stderr" } else { "stdout" };
+                let _ = writeln!(e, "{} shell {stream} │ {line}", self.t());
             }
             _ => {
                 // Future SessionEvent variants render nothing by default.

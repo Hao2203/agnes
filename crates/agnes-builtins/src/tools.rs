@@ -9,47 +9,72 @@ use agnes_types::Value;
 use serde_json::Value as JsonValue;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-/// Trait for types that can resolve and validate paths against an allowed root.
+
+/// Resolve and validate paths against an allowed root. This is the only
+/// capability a path-handling tool needs; shell gating and sink emission
+/// live on separate traits (ISP - tools no longer depend on methods they
+/// don't use).
 pub trait PathResolver: Send + Sync + std::any::Any {
     /// Resolve a user-provided path, ensuring it's within the allowed root directory.
     fn resolve_path<'a>(&'a self, input: &'a str) -> BoxFuture<'a, Result<PathBuf, String>>;
+}
 
-    /// Get whether shell execution is permitted.
-    fn allow_shell(&self) -> bool {
-        false
-    }
-
-    /// Emit a shell confirmation request.
-    fn emit_shell_confirm<'a>(
+/// Emit shell-related events to the session sink. Kept separate from
+/// `PathResolver` so non-shell tools don't depend on these methods, and
+/// so adding a path capability doesn't touch shell plumbing (and vice
+/// versa). Implementations forward to the shared sink without holding a
+/// lock across a long await.
+pub trait Sink: Send + Sync {
+    /// Request user confirmation before running a shell command. The
+    /// `responder` receives `true` to approve, `false` to cancel.
+    fn shell_confirm<'a>(
         &'a self,
-        _command: String,
+        command: String,
         responder: tokio::sync::oneshot::Sender<bool>,
-    ) -> BoxFuture<'a, ()> {
-        let _ = responder.send(false);
-        Box::pin(async {})
-    }
+    ) -> BoxFuture<'a, ()>;
+
+    /// Forward one line of live output from a running shell command.
+    /// `is_stderr` marks the stream origin. Streamed as produced (not
+    /// buffered until exit) so the user can watch long-running commands.
+    fn shell_output<'a>(&'a self, line: String, is_stderr: bool) -> BoxFuture<'a, ()>;
+}
+
+/// Everything a tool needs from the session at call time: path
+/// resolution, shell-event emission, and the shell-gating flag. Passed
+/// as a single borrowed context so the scheduler threads one value
+/// instead of three, and so each trait stays narrow.
+pub struct ToolCtx<'a> {
+    pub resolver: &'a (dyn PathResolver + Send + Sync),
+    pub sink: &'a (dyn Sink + Send + Sync),
+    pub allow_shell: bool,
 }
 
 /// Tool trait defines the interface that all tools must implement.
 pub trait Tool: Send + Sync {
-    /// Call the tool with the given arguments and path resolver.
-    fn call<'a>(&'a self, args: HashMap<String, Value>, resolver: &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>>;
+    /// Call the tool with the given arguments and context.
+    fn call<'a>(&'a self, args: HashMap<String, Value>, ctx: &'a ToolCtx<'a>) -> BoxFuture<'a, Result<Value, String>>;
 }
 
 /// Blanket implementation for any correctly-typed function.
 impl<F> Tool for F
 where
-    F: for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>>
+    F: for<'a> Fn(HashMap<String, Value>, &'a ToolCtx<'a>) -> BoxFuture<'a, Result<Value, String>>
     + Send
     + Sync
     + 'static,
 {
-    fn call<'a>(&'a self, args: HashMap<String, Value>, resolver: &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> {
-        self(args, resolver)
+    fn call<'a>(&'a self, args: HashMap<String, Value>, ctx: &'a ToolCtx<'a>) -> BoxFuture<'a, Result<Value, String>> {
+        self(args, ctx)
     }
 }
 
 pub type ToolImpl = Arc<dyn Tool + Send + Sync>;
+
+/// Concrete type of a native tool closure: `Fn(args, &ToolCtx) -> BoxFuture`.
+/// Spelled out once here so tool registrations read cleanly and clippy's
+/// `very_complex_type` stays quiet.
+pub type ToolFn =
+    Box<dyn for<'a> Fn(HashMap<String, Value>, &'a ToolCtx<'a>) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static>;
 
 /// Per-process recording of every mock write-file call, drained by
 /// `agnes_session::Session::run_turn` at the end of each turn and emitted
@@ -77,11 +102,11 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     let mut m: HashMap<String, ToolImpl> = HashMap::new();
 
     // read-file (real, from disk)
-    let read_file: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|args, resolver| {
+    let read_file: ToolFn =
+        Box::new(|args, ctx| {
             Box::pin(async move {
                 let path_str = arg_str(&args, "path")?;
-                let path = resolver.resolve_path(&path_str).await?;
+                let path = ctx.resolver.resolve_path(&path_str).await?;
                 let content = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
@@ -94,13 +119,13 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     m.insert("read-file".into(), Arc::new(read_file));
 
     // write-file (real, to disk)
-    let write_file: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|args, resolver| {
+    let write_file: ToolFn =
+        Box::new(|args, ctx| {
             Box::pin(async move {
                 let path_str = arg_str(&args, "path")?;
                 let content = arg_str(&args, "content")?;
                 let content_len = content.len();
-                let path = resolver.resolve_path(&path_str).await?;
+                let path = ctx.resolver.resolve_path(&path_str).await?;
 
                 // Create parent directories if they don't exist
                 if let Some(parent) = path.parent() {
@@ -122,8 +147,8 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     m.insert("write-file".into(), Arc::new(write_file));
 
     // join-lines (real, kept)
-    let join_lines: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|args, _resolver| {
+    let join_lines: ToolFn =
+        Box::new(|args, _ctx| {
             Box::pin(async move {
                 let lines = args
                     .get("lines")
@@ -143,8 +168,8 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     // llm (real provider call)
     {
         let p = provider.clone();
-        let llm: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-            Box::new(move |args, _resolver| {
+        let llm: ToolFn =
+            Box::new(move |args, _ctx| {
                 let p = p.clone();
                 Box::pin(async move {
                     let prompt = arg_str(&args, "prompt")?;
@@ -174,8 +199,8 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     // summarize (real provider call)
     {
         let p = provider.clone();
-        let summarize: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-            Box::new(move |args, _resolver| {
+        let summarize: ToolFn =
+            Box::new(move |args, _ctx| {
                 let p = p.clone();
                 Box::pin(async move {
                     let input = arg_str(&args, "input")?;
@@ -201,8 +226,8 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     // translate (real provider call)
     {
         let p = provider.clone();
-        let translate: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-            Box::new(move |args, _resolver| {
+        let translate: ToolFn =
+            Box::new(move |args, _ctx| {
                 let p = p.clone();
                 Box::pin(async move {
                     let input = arg_str(&args, "input")?;
@@ -232,11 +257,11 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
     // and `NodeKind::Observe`.
 
     // parse-path - parse and validate a string path to Path type
-    let parse_path: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|args, resolver| {
+    let parse_path: ToolFn =
+        Box::new(|args, ctx| {
             Box::pin(async move {
                 let path_str = arg_str(&args, "path")?;
-                let _path = resolver.resolve_path(&path_str).await?;
+                let _path = ctx.resolver.resolve_path(&path_str).await?;
                 // Path is represented as a string in the AST, but validated by session
                 Ok(Value::typed(
                     JsonValue::String(path_str),
@@ -248,21 +273,23 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
 
     // shell-run - execute shell command with user confirmation
     use tokio::process::Command;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use std::process::Stdio;
     use serde_json::json;
 
-    let shell_run: Box<dyn for<'a> Fn(HashMap<String, Value>, &'a (dyn PathResolver + Send + Sync)) -> BoxFuture<'a, Result<Value, String>> + Send + Sync + 'static> =
-        Box::new(|args, resolver| {
+    let shell_run: ToolFn =
+        Box::new(|args, ctx| {
             Box::pin(async move {
                 let command = arg_str(&args, "command")?;
 
-                if !resolver.allow_shell() {
+                if !ctx.allow_shell {
                     return Err("shell execution is not enabled in this session. \
                         Use --allow-shell flag to enable it.".into());
                 }
 
-                // Request user confirmation via resolver event
+                // Request user confirmation via the sink
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                resolver.emit_shell_confirm(command.clone(), tx).await;
+                ctx.sink.shell_confirm(command.clone(), tx).await;
 
                 // Wait for user response
                 let confirmed = rx.await.unwrap_or(false);
@@ -270,22 +297,56 @@ pub fn native_dispatch(provider: Arc<dyn Provider>) -> HashMap<String, ToolImpl>
                     return Err("shell execution cancelled by user".into());
                 }
 
-                // Execute command
-                let child = Command::new("sh")
+                // Spawn with piped stdout/stderr so we can stream each line
+                // live as it is produced, instead of buffering everything
+                // until exit (which made long builds look hung).
+                let mut child = Command::new("sh")
                     .arg("-c")
                     .arg(&command)
-                    .output()
-                    .await
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
                     .map_err(|e| format!("failed to spawn command: {}", e))?;
 
-                let stdout = String::from_utf8_lossy(&child.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&child.stderr).into_owned();
-                let exit_code = child.status.code().unwrap_or(-1);
+                let stdout = child.stdout.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
+
+                // Drain both streams concurrently: forward each line to the
+                // sink for live display and accumulate into buffers for the
+                // returned CommandResult. Both share `ctx.sink` by ref.
+                let stdout_task = async {
+                    let mut buf = String::new();
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        ctx.sink.shell_output(line.clone(), false).await;
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                    buf
+                };
+                let stderr_task = async {
+                    let mut buf = String::new();
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        ctx.sink.shell_output(line.clone(), true).await;
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                    buf
+                };
+                let (stdout_str, stderr_str) = tokio::join!(stdout_task, stderr_task);
+
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| format!("failed to wait for command: {}", e))?;
+                let exit_code = status.code().unwrap_or(-1);
 
                 // Return structured result
                 let result = json!({
-                    "stdout": stdout,
-                    "stderr": stderr,
+                    "stdout": stdout_str,
+                    "stderr": stderr_str,
                     "exit-code": exit_code,
                 });
 

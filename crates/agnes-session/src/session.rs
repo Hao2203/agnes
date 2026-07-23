@@ -1,8 +1,8 @@
 use crate::error::SessionError;
-use crate::events::{EventSink, SessionEvent, SinkHandle};
+use crate::events::{EventSink, SessionEvent, SharedSink, SinkHandle};
 use crate::plan_tree::build_plan_tree;
-use crate::tracer_bridge::{ChannelTracer, drain};
-use agnes_builtins::{ToolImpl, native_dispatch, register_builtins, PathResolver};
+use crate::tracer_bridge::ChannelTracer;
+use agnes_builtins::{PathResolver, Sink, ToolCtx, ToolImpl, native_dispatch, register_builtins};
 use agnes_llm::{Planner, Provider, Turn};
 use agnes_registry::Registry;
 use agnes_runtime::execute_with;
@@ -79,9 +79,10 @@ pub struct Session {
     allow_root: Option<PathBuf>,
     /// Whether shell execution is permitted.
     allow_shell: bool,
-    /// Current event sink for the active turn, if available.
-    /// Arc<Mutex<>> provides safe shared mutable access with Send/Sync automatically.
-    current_sink: Option<Arc<Mutex<dyn EventSink + Send + 'static>>>,
+    /// Current event sink for the active turn, if available. Shared by the
+    /// turn (via `SinkHandle`), the per-iteration drain task, and tools
+    /// (via the `Sink` impl). `SharedSink` is `Arc<Mutex<Box<dyn EventSink>>>`.
+    current_sink: Option<SharedSink>,
 }
 
 impl std::fmt::Debug for Session {
@@ -251,7 +252,7 @@ impl Session {
     pub async fn run_turn(
         &mut self,
         input: TurnInput,
-        sink: Arc<Mutex<dyn EventSink + Send + 'static>>,
+        sink: Box<dyn EventSink + Send + 'static>,
     ) -> Result<Value, SessionError> {
         // Uncancellable variant: a fresh Notify never fires.
         let never = Arc::new(tokio::sync::Notify::new());
@@ -261,15 +262,17 @@ impl Session {
     pub async fn run_turn_cancellable(
         &mut self,
         input: TurnInput,
-        sink: Arc<Mutex<dyn EventSink + Send + 'static>>,
+        sink: Box<dyn EventSink + Send + 'static>,
         cancel: Arc<tokio::sync::Notify>,
     ) -> Result<Value, SessionError> {
-        // Store the current sink for event emission during tool execution.
-        // Tools reach it through `PathResolver::emit_shell_confirm`.
+        // Wrap the owned sink in an internal mutex for shared access by the
+        // turn, the drain task, and tools (via the `Sink` impl). Callers
+        // pass an owned `Box` and never see this lock (DIP).
+        let sink: SharedSink = Arc::new(Mutex::new(sink));
         self.current_sink = Some(sink.clone());
         // NOTE: do NOT hold a `MutexGuard` across `run_turn_inner`. The
         // turn awaits tool futures (`execute_with`) that re-enter this
-        // same sink via `emit_shell_confirm`; a long-held guard would
+        // same sink via the `Sink` trait; a long-held guard would
         // deadlock them. `SinkHandle` locks per emit instead.
         let sink_handle = SinkHandle::new(&sink);
         let result = match self.run_turn_inner(input, &sink_handle, cancel).await {
@@ -434,17 +437,39 @@ impl Session {
         })
         .await;
         let (tracer, mut rx) = ChannelTracer::new();
-        let exec = execute_with(&dag, &turn_registry, &self.dispatch, self, &tracer);
-        tokio::pin!(exec);
-        let result = loop {
-            tokio::select! {
-                r = &mut exec => break r,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                    drain(&mut rx, sink).await;
-                }
+
+        // Pump tracer NodeStart/NodeEnd events to the sink on a SEPARATE
+        // task. The previous design drained them on the turn task inside a
+        // `select!` loop; when a tool (shell-run) held the sink lock across
+        // a long await (the confirm prompt), the select committed to the
+        // drain arm, blocked on the lock, and stopped polling the tool -
+        // deadlocking. With drain on its own task there is no same-task
+        // contender: the turn task just polls `execute_with` (tools
+        // cooperate), and the drain task waits out any lock the tool holds.
+        let drain_sink: SharedSink = self
+            .current_sink
+            .clone()
+            .expect("current_sink set for the active turn");
+        let drain_handle = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                drain_sink.lock().await.emit(ev).await;
             }
+        });
+
+        let resolver: &(dyn PathResolver + Send + Sync) = self;
+        let sink_trait: &(dyn Sink + Send + Sync) = self;
+        let ctx = ToolCtx {
+            resolver,
+            sink: sink_trait,
+            allow_shell: self.allow_shell,
         };
-        drain(&mut rx, sink).await;
+        let result = execute_with(&dag, &turn_registry, &self.dispatch, &ctx, &tracer).await;
+
+        // Dropping the tracer drops its sender, so the drain task's `rx`
+        // returns None and the task exits. Join to flush remaining trace
+        // events before the caller emits TurnResult/Observation (ordering).
+        drop(tracer);
+        let _ = drain_handle.await;
         Ok(result?)
     }
 }
@@ -453,12 +478,10 @@ impl PathResolver for Session {
     fn resolve_path<'a>(&'a self, input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<std::path::PathBuf, String>> {
         Box::pin(self.resolve_path(input))
     }
+}
 
-    fn allow_shell(&self) -> bool {
-        self.allow_shell
-    }
-
-    fn emit_shell_confirm<'a>(
+impl Sink for Session {
+    fn shell_confirm<'a>(
         &'a self,
         command: String,
         responder: tokio::sync::oneshot::Sender<bool>,
@@ -473,6 +496,21 @@ impl PathResolver for Session {
             } else {
                 // No sink available, automatically reject
                 let _ = responder.send(false);
+            }
+        })
+    }
+
+    fn shell_output<'a>(
+        &'a self,
+        line: String,
+        is_stderr: bool,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(sink) = &self.current_sink {
+                sink.lock()
+                    .await
+                    .emit(SessionEvent::ShellOutput { is_stderr, line })
+                    .await;
             }
         })
     }

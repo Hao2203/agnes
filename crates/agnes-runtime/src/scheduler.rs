@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use crate::boundary::validate;
 use crate::error::RuntimeError;
 
-use agnes_builtins::PathResolver;
+use agnes_builtins::ToolCtx;
 
 /// Recursively evaluate the DAG root, returning the produced Value.
 /// Results are memoized in `cache` so shared subgraphs execute once.
@@ -18,12 +18,12 @@ pub async fn run(
     dag: &Dag,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
-    resolver: &(dyn PathResolver + Send + Sync),
+    ctx: &ToolCtx<'_>,
     tracer: &dyn crate::Tracer,
 ) -> Result<Value, RuntimeError> {
     let mut cache: HashMap<NodeId, Value> = HashMap::new();
     let mut env: HashMap<String, Value> = HashMap::new();
-    eval_node(dag, dag.root, reg, dispatch, resolver, tracer, &mut cache, &mut env).await
+    eval_node(dag, dag.root, reg, dispatch, ctx, tracer, &mut cache, &mut env).await
 }
 
 fn eval_node<'a>(
@@ -31,7 +31,7 @@ fn eval_node<'a>(
     id: NodeId,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
-    resolver: &'a (dyn PathResolver + Send + Sync),
+    ctx: &'a ToolCtx<'a>,
     tracer: &'a dyn crate::Tracer,
     cache: &'a mut HashMap<NodeId, Value>,
     env: &'a mut HashMap<String, Value>,
@@ -53,7 +53,7 @@ fn eval_node<'a>(
             }
             NodeKind::Let { name } => {
                 let src =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
                 env.insert(name.clone(), src.clone());
                 src
             }
@@ -62,7 +62,7 @@ fn eval_node<'a>(
                 // intermediate steps populate `env` before later steps run.
                 let mut last: Option<Value> = None;
                 for input in &node.inputs {
-                    last = Some(eval_input(dag, input, reg, dispatch, resolver, tracer, cache, env).await?);
+                    last = Some(eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env).await?);
                 }
                 last.ok_or_else(|| RuntimeError::ToolFailed {
                     tool: "<pipe>".into(),
@@ -73,22 +73,22 @@ fn eval_node<'a>(
                 // MVP: evaluate branches sequentially — correctness first;
                 // concurrent join is a follow-up.
                 for input in &node.inputs {
-                    let _ = eval_input(dag, input, reg, dispatch, resolver, tracer, cache, env).await?;
+                    let _ = eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env).await?;
                 }
                 Value::typed(JsonValue::Null, "Unit")
             }
             NodeKind::If => {
                 let cond =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
                 let picked = if cond.data.as_bool().unwrap_or(false) {
                     1
                 } else {
                     2
                 };
-                eval_input(dag, &node.inputs[picked], reg, dispatch, resolver, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[picked], reg, dispatch, ctx, tracer, cache, env).await?
             }
             NodeKind::Match { arms } => {
-                let s = eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                let s = eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
                 let mut chosen: Option<usize> = None;
                 for (i, pat) in arms.iter().enumerate() {
                     if lit_matches(pat, &s.data) {
@@ -98,16 +98,16 @@ fn eval_node<'a>(
                 }
                 let idx = chosen.unwrap_or(arms.len());
                 let idx = idx.min(node.inputs.len() - 1);
-                eval_input(dag, &node.inputs[idx], reg, dispatch, resolver, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[idx], reg, dispatch, ctx, tracer, cache, env).await?
             }
             NodeKind::Foreach { .. } => {
                 // MVP simplification: evaluate body once and return that.
-                eval_input(dag, &node.inputs[1], reg, dispatch, resolver, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[1], reg, dispatch, ctx, tracer, cache, env).await?
             }
             NodeKind::Retry { times, .. } => {
                 let mut last_err: Option<RuntimeError> = None;
                 for _ in 0..(*times + 1) {
-                    match eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await
+                    match eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await
                     {
                         Ok(v) => {
                             cache.insert(id, v.clone());
@@ -119,17 +119,17 @@ fn eval_node<'a>(
                 return Err(last_err.unwrap());
             }
             NodeKind::Catch { fallback, .. } => {
-                match eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await {
+                match eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await {
                     Ok(v) => v,
-                    Err(_) => eval_node(dag, *fallback, reg, dispatch, resolver, tracer, cache, env).await?,
+                    Err(_) => eval_node(dag, *fallback, reg, dispatch, ctx, tracer, cache, env).await?,
                 }
             }
             NodeKind::Return => {
-                eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?
             }
             NodeKind::Finish => {
                 let inner =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
                 Value {
                     data: inner.data,
                     declared_type: TypeExpr::App {
@@ -140,7 +140,7 @@ fn eval_node<'a>(
             }
             NodeKind::Observe => {
                 let inner =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, resolver, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
                 Value {
                     data: inner.data,
                     declared_type: TypeExpr::App {
@@ -151,14 +151,14 @@ fn eval_node<'a>(
             }
             NodeKind::Tool { name } => {
                 let args =
-                    collect_kwargs(dag, &node.inputs, reg, dispatch, resolver, tracer, cache, env).await?;
+                    collect_kwargs(dag, &node.inputs, reg, dispatch, ctx, tracer, cache, env).await?;
                 call_native_traced(
                     id,
                     &node.kind,
                     name,
                     args,
                     dispatch,
-                    resolver,
+                    ctx,
                     reg,
                     &node.provides,
                     tracer,
@@ -168,7 +168,7 @@ fn eval_node<'a>(
             NodeKind::List => {
                 let mut elems: Vec<Value> = Vec::with_capacity(node.inputs.len());
                 for input in &node.inputs {
-                    elems.push(eval_input(dag, input, reg, dispatch, resolver, tracer, cache, env).await?);
+                    elems.push(eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env).await?);
                 }
                 let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
                 // Prefer the checker-derived provides for declared_type, but if
@@ -205,14 +205,14 @@ fn eval_input<'a>(
     input: &'a Input,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
-    resolver: &'a (dyn PathResolver + Send + Sync),
+    ctx: &'a ToolCtx<'a>,
     tracer: &'a dyn crate::Tracer,
     cache: &'a mut HashMap<NodeId, Value>,
     env: &'a mut HashMap<String, Value>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
         match input {
-            Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, resolver, tracer, cache, env).await,
+            Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, ctx, tracer, cache, env).await,
             Input::Literal(lit) => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Input::Var(name) => env
                 .get(name)
@@ -222,7 +222,7 @@ fn eval_input<'a>(
                     cause: "unbound variable".into(),
                 }),
             Input::Kw { source, .. } => {
-                eval_input(dag, source, reg, dispatch, resolver, tracer, cache, env).await
+                eval_input(dag, source, reg, dispatch, ctx, tracer, cache, env).await
             }
         }
     })
@@ -233,7 +233,7 @@ async fn collect_kwargs(
     inputs: &[Input],
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
-    resolver: &(dyn PathResolver + Send + Sync),
+    ctx: &ToolCtx<'_>,
     tracer: &dyn crate::Tracer,
     cache: &mut HashMap<NodeId, Value>,
     env: &mut HashMap<String, Value>,
@@ -242,13 +242,13 @@ async fn collect_kwargs(
     for input in inputs {
         match input {
             Input::Kw { key, source } => {
-                let v = eval_input(dag, source, reg, dispatch, resolver, tracer, cache, env).await?;
+                let v = eval_input(dag, source, reg, dispatch, ctx, tracer, cache, env).await?;
                 out.insert(key.clone(), v);
             }
             other => {
                 // Defensive fallback — Task 7 compiler produces only Kw inputs
                 // for tool/llm nodes, so this branch should not fire in normal use.
-                let v = eval_input(dag, other, reg, dispatch, resolver, tracer, cache, env).await?;
+                let v = eval_input(dag, other, reg, dispatch, ctx, tracer, cache, env).await?;
                 out.insert("_positional".into(), v);
             }
         }
@@ -260,7 +260,7 @@ async fn call_native(
     tool: &str,
     args: HashMap<String, Value>,
     dispatch: &HashMap<String, ToolImpl>,
-    resolver: &(dyn PathResolver + Send + Sync),
+    ctx: &ToolCtx<'_>,
     reg: &Registry,
     provides: &TypeExpr,
 ) -> Result<Value, RuntimeError> {
@@ -276,12 +276,12 @@ async fn call_native(
     }
     // Native dispatch first; on miss, fall back to a `define`d compound tool.
     let result = if let Some(f) = dispatch.get(tool) {
-        f.call(args, resolver).await.map_err(|cause| RuntimeError::ToolFailed {
+        f.call(args, ctx).await.map_err(|cause| RuntimeError::ToolFailed {
             tool: tool.to_string(),
             cause,
         })?
     } else if reg.define_body(tool).is_some() {
-        dispatch_define(tool, args, resolver, reg, dispatch).await?
+        dispatch_define(tool, args, ctx, reg, dispatch).await?
     } else {
         return Err(RuntimeError::MissingImpl {
             tool: tool.to_string(),
@@ -303,7 +303,7 @@ async fn call_native_traced(
     tool: &str,
     args: HashMap<String, Value>,
     dispatch: &HashMap<String, ToolImpl>,
-    resolver: &(dyn PathResolver + Send + Sync),
+    ctx: &ToolCtx<'_>,
     reg: &Registry,
     provides: &TypeExpr,
     tracer: &dyn crate::Tracer,
@@ -311,7 +311,7 @@ async fn call_native_traced(
     let preview = args_preview(&args);
     tracer.node_start(id, kind, &preview);
     let start = std::time::Instant::now();
-    let out = call_native(tool, args, dispatch, resolver, reg, provides).await;
+    let out = call_native(tool, args, dispatch, ctx, reg, provides).await;
     let elapsed = start.elapsed();
     match &out {
         Ok(v) => tracer.node_end(id, Ok(v), elapsed),
@@ -344,7 +344,7 @@ fn args_preview(args: &HashMap<String, Value>) -> String {
 fn dispatch_define<'a>(
     tool: &'a str,
     args: HashMap<String, Value>,
-    resolver: &'a (dyn PathResolver + Send + Sync),
+    ctx: &'a ToolCtx<'a>,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
@@ -376,7 +376,7 @@ fn dispatch_define<'a>(
                 }
             }
         }
-        eval_expr(body, None, reg, dispatch, resolver, &mut sub_env).await
+        eval_expr(body, None, reg, dispatch, ctx, &mut sub_env).await
     })
 }
 
@@ -388,7 +388,7 @@ fn eval_expr<'a>(
     flowed_in: Option<Value>,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
-    resolver: &'a (dyn PathResolver + Send + Sync),
+    ctx: &'a ToolCtx<'a>,
     env: &'a mut HashMap<String, Value>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
@@ -399,14 +399,14 @@ fn eval_expr<'a>(
                 ..
             } => {
                 let kwargs =
-                    bind_tool_args(name, positional, flowed_in, reg, dispatch, resolver, env).await?;
+                    bind_tool_args(name, positional, flowed_in, reg, dispatch, ctx, env).await?;
                 let provides = tool_provides(reg, name);
-                call_native(name, kwargs, dispatch, resolver, reg, &provides).await
+                call_native(name, kwargs, dispatch, ctx, reg, &provides).await
             }
             Expr::Pipe { steps, .. } => {
                 let mut upstream: Option<Value> = None;
                 for step in steps {
-                    let v = eval_expr(step, upstream.clone(), reg, dispatch, resolver, env).await?;
+                    let v = eval_expr(step, upstream.clone(), reg, dispatch, ctx, env).await?;
                     upstream = Some(v);
                 }
                 upstream.ok_or_else(|| RuntimeError::ToolFailed {
@@ -416,13 +416,13 @@ fn eval_expr<'a>(
             }
             Expr::Par { branches, .. } => {
                 for b in branches {
-                    let _ = eval_expr(b, None, reg, dispatch, resolver, env).await?;
+                    let _ = eval_expr(b, None, reg, dispatch, ctx, env).await?;
                 }
                 Ok(Value::typed(JsonValue::Null, "Unit"))
             }
             Expr::Let { name, value, .. } => {
                 let bound = match value {
-                    Some(v) => eval_expr(v, None, reg, dispatch, resolver, env).await?,
+                    Some(v) => eval_expr(v, None, reg, dispatch, ctx, env).await?,
                     None => flowed_in.clone().ok_or_else(|| RuntimeError::ToolFailed {
                         tool: format!("<let>{name}"),
                         cause: "(let ...) with no upstream to name".into(),
@@ -437,20 +437,20 @@ fn eval_expr<'a>(
                 else_branch,
                 ..
             } => {
-                let c = eval_expr(cond, None, reg, dispatch, resolver, env).await?;
+                let c = eval_expr(cond, None, reg, dispatch, ctx, env).await?;
                 if c.data.as_bool().unwrap_or(false) {
-                    eval_expr(then_branch, None, reg, dispatch, resolver, env).await
+                    eval_expr(then_branch, None, reg, dispatch, ctx, env).await
                 } else {
-                    eval_expr(else_branch, None, reg, dispatch, resolver, env).await
+                    eval_expr(else_branch, None, reg, dispatch, ctx, env).await
                 }
             }
             Expr::Match {
                 scrutinee, arms, ..
             } => {
-                let s = eval_expr(scrutinee, None, reg, dispatch, resolver, env).await?;
+                let s = eval_expr(scrutinee, None, reg, dispatch, ctx, env).await?;
                 for (pat, arm) in arms {
                     if lit_matches(pat, &s.data) {
-                        return eval_expr(arm, None, reg, dispatch, resolver, env).await;
+                        return eval_expr(arm, None, reg, dispatch, ctx, env).await;
                     }
                 }
                 Ok(s)
@@ -458,13 +458,13 @@ fn eval_expr<'a>(
             Expr::Foreach {
                 collection, body, ..
             } => {
-                let _ = eval_expr(collection, None, reg, dispatch, resolver, env).await?;
-                eval_expr(body, None, reg, dispatch, resolver, env).await
+                let _ = eval_expr(collection, None, reg, dispatch, ctx, env).await?;
+                eval_expr(body, None, reg, dispatch, ctx, env).await
             }
             Expr::Retry { times, body, .. } => {
                 let mut last_err: Option<RuntimeError> = None;
                 for _ in 0..(*times + 1) {
-                    match eval_expr(body, flowed_in.clone(), reg, dispatch, resolver, env).await {
+                    match eval_expr(body, flowed_in.clone(), reg, dispatch, ctx, env).await {
                         Ok(v) => return Ok(v),
                         Err(e) => last_err = Some(e),
                     }
@@ -472,14 +472,14 @@ fn eval_expr<'a>(
                 Err(last_err.unwrap())
             }
             Expr::Catch { body, fallback, .. } => {
-                match eval_expr(body, flowed_in.clone(), reg, dispatch, resolver, env).await {
+                match eval_expr(body, flowed_in.clone(), reg, dispatch, ctx, env).await {
                     Ok(v) => Ok(v),
-                    Err(_) => eval_expr(fallback, None, reg, dispatch, resolver, env).await,
+                    Err(_) => eval_expr(fallback, None, reg, dispatch, ctx, env).await,
                 }
             }
-            Expr::Return { value, .. } => eval_expr(value, None, reg, dispatch, resolver, env).await,
+            Expr::Return { value, .. } => eval_expr(value, None, reg, dispatch, ctx, env).await,
             Expr::Finish { value, .. } => {
-                eval_wrap_expr(value.as_deref(), flowed_in, "Finish", reg, dispatch, resolver, env).await
+                eval_wrap_expr(value.as_deref(), flowed_in, "Finish", reg, dispatch, ctx, env).await
             }
             Expr::Observe { value, .. } => {
                 eval_wrap_expr(
@@ -488,7 +488,7 @@ fn eval_expr<'a>(
                     "Observation",
                     reg,
                     dispatch,
-                    resolver,
+                    ctx,
                     env,
                 )
                 .await
@@ -506,7 +506,7 @@ fn eval_expr<'a>(
                 let mut elems: Vec<Value> = Vec::with_capacity(items.len());
                 let mut elem_types: Vec<TypeExpr> = Vec::with_capacity(items.len());
                 for it in items {
-                    let v = eval_expr(it, None, reg, dispatch, resolver, env).await?;
+                    let v = eval_expr(it, None, reg, dispatch, ctx, env).await?;
                     elem_types.push(v.declared_type.clone());
                     elems.push(v);
                 }
@@ -536,7 +536,7 @@ async fn bind_tool_args(
     flowed_in: Option<Value>,
     reg: &Registry,
     dispatch: &HashMap<String, ToolImpl>,
-    resolver: &(dyn PathResolver + Send + Sync),
+    ctx: &ToolCtx<'_>,
     env: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, RuntimeError> {
     let sig: ToolSignature =
@@ -557,7 +557,7 @@ async fn bind_tool_args(
                 tool: tool_name.into(),
                 cause: format!("extra positional arg at index {i}"),
             })?;
-        let v = eval_expr(pv, None, reg, dispatch, resolver, env).await?;
+        let v = eval_expr(pv, None, reg, dispatch, ctx, env).await?;
         out.insert(pname.clone(), v);
         filled.insert(pname.clone());
     }
@@ -590,12 +590,12 @@ fn eval_wrap_expr<'a>(
     wrapper_head: &'static str,
     reg: &'a Registry,
     dispatch: &'a HashMap<String, ToolImpl>,
-    resolver: &'a (dyn PathResolver + Send + Sync),
+    ctx: &'a ToolCtx<'a>,
     env: &'a mut HashMap<String, Value>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
         let inner = match value {
-            Some(v) => eval_expr(v, None, reg, dispatch, resolver, env).await?,
+            Some(v) => eval_expr(v, None, reg, dispatch, ctx, env).await?,
             None => flowed_in.ok_or_else(|| RuntimeError::ToolFailed {
                 tool: format!("<{}>", wrapper_head.to_lowercase()),
                 cause: format!("bare `{wrapper_head}` used outside a pipe"),

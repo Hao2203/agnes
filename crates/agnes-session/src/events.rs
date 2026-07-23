@@ -69,6 +69,15 @@ pub enum SessionEvent {
         /// Send `true` to approve, `false` to cancel.
         responder: Arc<oneshot::Sender<bool>>,
     },
+
+    /// One line of live output from a running `shell-run` command,
+    /// streamed as it is produced (not buffered until exit) so the user
+    /// can watch long-running commands progress.
+    ShellOutput {
+        /// `true` for stderr, `false` for stdout.
+        is_stderr: bool,
+        line: String,
+    },
 }
 
 #[async_trait::async_trait]
@@ -76,24 +85,31 @@ pub trait EventSink: Send {
     async fn emit(&mut self, ev: SessionEvent);
 }
 
+/// The shared, mutex-protected sink the turn, the drain task, and tools
+/// all emit through. Callers pass an owned `Box<dyn EventSink>` to
+/// `run_turn`; the session wraps it in this type internally (DIP: callers
+/// never construct the lock). The inner `Box` is because a boxed trait
+/// object can't be moved out into the mutex directly; `MutexGuard`
+/// auto-derefs through it to reach `EventSink::emit`.
+pub type SharedSink = Arc<Mutex<Box<dyn EventSink + Send + 'static>>>;
+
 /// A borrowed handle to the turn's event sink that acquires the shared
 /// `Mutex` on each `emit`, instead of holding a single lock guard across
 /// the whole turn.
 ///
 /// Holding one `MutexGuard` for an entire turn deadlocks any tool that
-/// re-enters the sink through `PathResolver::emit_shell_confirm`
-/// (notably `shell-run`): the tool awaits the same mutex the turn task
-/// is already holding, and the turn task is itself awaiting the tool's
-/// result. `SinkHandle` breaks the cycle by locking per event and
-/// releasing between emits, so the tool can acquire the sink while the
-/// turn is parked on `execute_with`.
+/// re-enters the sink (notably `shell-run` via the `Sink` trait): the tool
+/// awaits the same mutex the turn task is already holding, and the turn
+/// task is itself awaiting the tool's result. `SinkHandle` breaks the
+/// cycle by locking per event and releasing between emits, so the tool can
+/// acquire the sink while the turn is parked on `execute_with`.
 #[derive(Clone, Copy)]
 pub struct SinkHandle<'a> {
-    sink: &'a Arc<Mutex<dyn EventSink + Send + 'static>>,
+    sink: &'a SharedSink,
 }
 
 impl<'a> SinkHandle<'a> {
-    pub fn new(sink: &'a Arc<Mutex<dyn EventSink + Send + 'static>>) -> Self {
+    pub fn new(sink: &'a SharedSink) -> Self {
         Self { sink }
     }
 

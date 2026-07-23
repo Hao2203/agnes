@@ -2,7 +2,7 @@ use agnes_llm::{MockProvider, Provider};
 use agnes_session::{EventSink, Session, SessionError, SessionEvent, TurnInput};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::Notify;
 
 fn test_lock() -> &'static std::sync::Mutex<()> {
     static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -23,13 +23,11 @@ async fn cancel_before_first_iteration_returns_cancelled_with_zero() {
     let _g = test_lock().lock().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
     let mut s = Session::new(provider).unwrap();
-    let sink = Recording::default();
-    let wrapped = Arc::new(TokioMutex::new(sink));
     let cancel = Arc::new(Notify::new());
     // Pre-notify: the loop should see it on the very first check.
     cancel.notify_one();
     let err = s
-        .run_turn_cancellable(TurnInput::NaturalLanguage("go".into()), wrapped, cancel)
+        .run_turn_cancellable(TurnInput::NaturalLanguage("go".into()), Box::new(Recording::default()), cancel)
         .await
         .expect_err("expected cancelled");
     match err {
@@ -73,10 +71,8 @@ async fn cancel_between_iterations_stops_after_current_iteration() {
     }
 
     let cancel = Arc::new(Notify::new());
-    let sink = Sink(ev_log.clone(), cancel.clone());
-    let wrapped = Arc::new(TokioMutex::new(sink));
     let err = s
-        .run_turn_cancellable(TurnInput::NaturalLanguage("go".into()), wrapped, cancel)
+        .run_turn_cancellable(TurnInput::NaturalLanguage("go".into()), Box::new(Sink(ev_log.clone(), cancel.clone())), cancel)
         .await
         .expect_err("expected cancelled");
     match err {

@@ -1,4 +1,4 @@
-use crate::events::{NodeKindTag, SessionEvent, SinkHandle};
+use crate::events::{NodeKindTag, SessionEvent};
 use agnes_compiler::{NodeId, NodeKind};
 use agnes_runtime::{RuntimeError, Tracer};
 use agnes_types::Value;
@@ -58,11 +58,5 @@ impl Tracer for ChannelTracer {
             preview,
             elapsed_ms: elapsed.as_millis() as u64,
         });
-    }
-}
-
-pub async fn drain(rx: &mut mpsc::UnboundedReceiver<SessionEvent>, sink: &SinkHandle<'_>) {
-    while let Ok(ev) = rx.try_recv() {
-        sink.emit(ev).await;
     }
 }

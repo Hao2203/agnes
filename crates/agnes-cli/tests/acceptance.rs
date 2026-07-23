@@ -8,7 +8,7 @@
 //! comma-in-list rejection, mixed-list element-type rejection, flow
 //! mismatch, recursive define, unknown type name, and name conflict.
 
-use agnes_builtins::{native_dispatch, register_builtins, PathResolver};
+use agnes_builtins::{native_dispatch, register_builtins, PathResolver, Sink, ToolCtx};
 use agnes_checker::check;
 use agnes_compiler::compile;
 use agnes_parser::parse;
@@ -16,6 +16,7 @@ use agnes_registry::Registry;
 use agnes_runtime::execute;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 async fn run(src: &str) -> Result<String, String> {
     run_with(src, vec![]).await
@@ -35,6 +36,37 @@ impl PathResolver for DummyResolver {
     }
 }
 
+/// No-op sink for tests that don't exercise shell-run.
+struct DummySink;
+impl Sink for DummySink {
+    fn shell_confirm<'a>(
+        &'a self,
+        _command: String,
+        responder: oneshot::Sender<bool>,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = responder.send(false);
+        })
+    }
+    fn shell_output<'a>(
+        &'a self,
+        _line: String,
+        _is_stderr: bool,
+    ) -> agnes_builtins::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+static DUMMY_SINK: DummySink = DummySink;
+
+fn ctx(resolver: &DummyResolver) -> ToolCtx<'_> {
+    ToolCtx {
+        resolver,
+        sink: &DUMMY_SINK,
+        allow_shell: false,
+    }
+}
+
 async fn run_with(src: &str, responses: Vec<String>) -> Result<String, String> {
     let mut reg = Registry::new();
     register_builtins(&mut reg).map_err(|e| format!("{e}"))?;
@@ -45,7 +77,7 @@ async fn run_with(src: &str, responses: Vec<String>) -> Result<String, String> {
     let mock: Arc<dyn agnes_llm::Provider> = Arc::new(agnes_llm::MockProvider::new(responses));
     let dispatch = native_dispatch(mock);
     let dummy = DummyResolver;
-    let value = execute(&dag, &reg, &dispatch, &dummy)
+    let value = execute(&dag, &reg, &dispatch, &ctx(&dummy))
         .await
         .map_err(|e| format!("{e}"))?;
     Ok(value.data.to_string())

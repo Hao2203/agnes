@@ -5,7 +5,6 @@ use agnes_llm::{MockProvider, Provider};
 use agnes_session::{EventSink, Session, SessionError, SessionEvent, TurnInput};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as TokioMutex;
 
 /// Serialize integration tests that share the process-global writes()
 /// recorder in agnes-builtins.
@@ -18,10 +17,6 @@ fn test_lock() -> &'static std::sync::Mutex<()> {
 struct RecordingSink(Arc<Mutex<Vec<SessionEvent>>>);
 
 impl RecordingSink {
-    fn events(&self) -> Vec<SessionEvent> {
-        self.0.lock().unwrap().clone()
-    }
-    #[allow(dead_code)]
     fn shared(&self) -> Arc<Mutex<Vec<SessionEvent>>> {
         Arc::clone(&self.0)
     }
@@ -45,13 +40,13 @@ async fn single_iteration_with_explicit_finish() {
     let _g = test_lock().lock().unwrap();
     let mut s = Session::new(provider(vec!["```agnes\n(pipe \"done\" finish)\n```"])).unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let v = s
-        .run_turn(TurnInput::NaturalLanguage("hi".into()), sink.clone())
+        .run_turn(TurnInput::NaturalLanguage("hi".into()), Box::new(sink))
         .await
         .unwrap();
     assert_eq!(v.data.as_str(), Some("done"));
-    let evs = sink.lock().await.events();
+    let evs = shared.lock().unwrap().clone();
     let has_iter_0 = evs
         .iter()
         .any(|e| matches!(e, SessionEvent::IterationStart { iter: 0 }));
@@ -68,13 +63,13 @@ async fn unlabeled_result_is_implicit_finish() {
     // No finish or observe. Result is String; Session treats as implicit finish.
     let mut s = Session::new(provider(vec!["```agnes\n\"hello\"\n```"])).unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let v = s
-        .run_turn(TurnInput::NaturalLanguage("say hi".into()), sink.clone())
+        .run_turn(TurnInput::NaturalLanguage("say hi".into()), Box::new(sink))
         .await
         .unwrap();
     assert_eq!(v.data.as_str(), Some("hello"));
-    let evs = sink.lock().await.events();
+    let evs = shared.lock().unwrap().clone();
     // Only one iteration.
     let iter_starts = evs
         .iter()
@@ -92,13 +87,13 @@ async fn observation_feeds_back_and_second_iteration_finishes() {
     ]))
     .unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let v = s
-        .run_turn(TurnInput::NaturalLanguage("go".into()), sink.clone())
+        .run_turn(TurnInput::NaturalLanguage("go".into()), Box::new(sink))
         .await
         .unwrap();
     assert_eq!(v.data.as_str(), Some("final"));
-    let evs = sink.lock().await.events();
+    let evs = shared.lock().unwrap().clone();
     // Two IterationStart events: iter=0 and iter=1.
     assert!(
         evs.iter()
@@ -134,13 +129,13 @@ async fn parse_error_feeds_back_and_self_heals() {
     ]))
     .unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let v = s
-        .run_turn(TurnInput::NaturalLanguage("go".into()), sink.clone())
+        .run_turn(TurnInput::NaturalLanguage("go".into()), Box::new(sink))
         .await
         .unwrap();
     assert_eq!(v.data.as_str(), Some("recovered"));
-    let evs = sink.lock().await.events();
+    let evs = shared.lock().unwrap().clone();
     let has_err_obs = evs.iter().any(|e| {
         matches!(
             e,
@@ -164,20 +159,19 @@ async fn raw_dsl_seeds_iteration_zero_and_continues_on_observation() {
     // Observation, feeds back; planner fills iter 1.
     let mut s = Session::new(provider(vec!["```agnes\n(pipe \"planned\" finish)\n```"])).unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let v = s
         .run_turn(
             TurnInput::RawDsl("(pipe \"seed\" observe)".into()),
-            sink.clone(),
+            Box::new(sink),
         )
         .await
         .unwrap();
     assert_eq!(v.data.as_str(), Some("planned"));
     // Two iterations: iter 0 (raw) and iter 1 (planner-produced).
-    let iter_count = sink
+    let iter_count = shared
         .lock()
-        .await
-        .events()
+        .unwrap()
         .iter()
         .filter(|e| matches!(e, SessionEvent::IterationStart { .. }))
         .count();
@@ -191,19 +185,18 @@ async fn raw_dsl_that_finishes_directly_stops_after_one_iteration() {
     // planner is never consulted (empty response queue is fine).
     let mut s = Session::new(provider(vec![])).unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let v = s
         .run_turn(
             TurnInput::RawDsl("(pipe \"just this\" finish)".into()),
-            sink.clone(),
+            Box::new(sink),
         )
         .await
         .unwrap();
     assert_eq!(v.data.as_str(), Some("just this"));
-    let iter_count = sink
+    let iter_count = shared
         .lock()
-        .await
-        .events()
+        .unwrap()
         .iter()
         .filter(|e| matches!(e, SessionEvent::IterationStart { .. }))
         .count();
@@ -221,9 +214,9 @@ async fn max_turns_ceiling_terminates_with_turn_limit_exceeded() {
     let mut s =
         Session::new_with_max_turns(Arc::new(MockProvider::new(responses.clone())), 3).unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let err = s
-        .run_turn(TurnInput::NaturalLanguage("go".into()), sink.clone())
+        .run_turn(TurnInput::NaturalLanguage("go".into()), Box::new(sink))
         .await
         .expect_err("must exceed limit");
     match err {
@@ -231,19 +224,17 @@ async fn max_turns_ceiling_terminates_with_turn_limit_exceeded() {
         other => panic!("expected TurnLimitExceeded, got {other:?}"),
     }
     // Exactly 3 IterationStart events fired.
-    let iter_count = sink
+    let iter_count = shared
         .lock()
-        .await
-        .events()
+        .unwrap()
         .iter()
         .filter(|e| matches!(e, SessionEvent::IterationStart { .. }))
         .count();
     assert_eq!(iter_count, 3);
     // TurnFailed was emitted before returning Err.
-    let has_failed = sink
+    let has_failed = shared
         .lock()
-        .await
-        .events()
+        .unwrap()
         .iter()
         .any(|e| matches!(e, SessionEvent::TurnFailed { .. }));
     assert!(has_failed);
@@ -264,12 +255,12 @@ async fn write_summary_still_emitted_before_turn_result() {
     ]))
     .unwrap();
     let sink = RecordingSink::default();
-    let sink = Arc::new(TokioMutex::new(sink));
+    let shared = sink.shared();
     let _ = s
-        .run_turn(TurnInput::NaturalLanguage("write it".into()), sink.clone())
+        .run_turn(TurnInput::NaturalLanguage("write it".into()), Box::new(sink))
         .await
         .unwrap();
-    let evs = sink.lock().await.events();
+    let evs = shared.lock().unwrap().clone();
     let pos_write = evs
         .iter()
         .position(|e| matches!(e, SessionEvent::WriteSummary { .. }));
