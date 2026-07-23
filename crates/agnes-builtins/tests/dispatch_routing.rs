@@ -68,6 +68,7 @@ async fn summarize_routes_through_provider() {
         .await
         .unwrap();
     assert_eq!(out.data.as_str().unwrap(), "one-para summary");
+    assert_eq!(out.declared_type.to_string(), "String");
 }
 
 #[tokio::test]

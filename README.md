@@ -4,7 +4,7 @@ A Lisp-style DSL and Rust runtime for LLM-planned agent workflows, with a
 TypeScript-style semantic type system that lets LLMs annotate untyped
 tools (MCP / CLI / HTTP) and get compile-time and runtime type safety.
 
-**Status:** MVP — proves the language design. Ships 7 built-in tools and
+**Status:** MVP — proves the language design. Ships 8 built-in tools and
 a workspace of 9 focused crates.
 
 ## Try it

@@ -175,6 +175,14 @@ impl Session {
         let canonical = match tokio::fs::canonicalize(&candidate).await {
             Ok(p) => p,
             Err(e) => {
+                // canonicalize fails for a missing path (a new file write-file
+                // will create) OR for a broken symlink whose target is gone.
+                // In the broken-symlink case the link itself exists and may
+                // point outside allow_root; appending its name and writing
+                // would follow it out of root. Reject if the entry exists.
+                if tokio::fs::symlink_metadata(&candidate).await.is_ok() {
+                    return Err(format!("cannot resolve path '{}': {}", input, e));
+                }
                 let parent = candidate.parent().ok_or_else(|| {
                     format!("cannot resolve path '{}': {}", input, e)
                 })?;

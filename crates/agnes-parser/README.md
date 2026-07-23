@@ -24,25 +24,32 @@ is the *main* expression. At most one main expression is allowed — put a
 **Top-level forms:**
 
 ```lisp
-(declare type PDF)
-(declare type-alias TextLike (| PlainText Markdown HTML))
-(declare tool ocr :requires [(source (| PDF Image))] :provides PlainText)
-(declare tool join-lines :requires [(lines (List PlainText))] :provides PlainText)
-(define greet :params [(who PlainText)] :provides PlainText
-  (tool llm :prompt "hello" :input who))
+(declare type JSON)
+(declare type-alias Name (| String Path))
+(declare tool translate :requires [(lang String) (input String)] :provides String)
+(declare tool join-lines :requires [(lines (List String))] :provides String)
+(define greet :params [(who String)] :provides String
+  (tool translate "ja" who))
 ```
 
 **Expressions:**
 
 `tool`, `pipe`, `par`, `let` (1-arg and 2-arg forms), `if`, `match`,
-`foreach`, `retry`, `catch`, `llm`, `return`, list literals `[e1 e2 ...]`,
-literals, variables.
+`foreach`, `retry`, `catch`, `return`, `finish`, `observe`, list literals
+`[e1 e2 ...]`, literals, variables.
 
-Keyword arguments use the `:key value` syntax. Type expressions are
-themselves S-exprs: `Named` types are bare symbols (`PDF`), unions use
-prefix `|` (`(| A B C)`), and container types use head-first application
-(`(List T)`, `(Option T)`). Param and requires lists use the
-prefix-name form `(name Type)` — no colon before the type.
+`llm` is **not** a special form - it is an ordinary tool reached through
+`(tool llm prompt input)`. `finish` and `observe` are special forms that
+wrap a value (or thread the piped upstream value when used bare in a pipe).
+
+Tool calls pass arguments positionally: `(tool name arg1 arg2 …)` - there
+is no `:key value` keyword-argument syntax for tool calls. The `:key value`
+syntax is used only by the special forms `define`, `declare tool`, `retry`,
+and `catch` for their own clauses. Type expressions are themselves S-exprs:
+`Named` types are bare symbols (`String`), unions use prefix `|`
+(`(| A B C)`), and container types use head-first application (`(List T)`,
+`(Option T)`). Param and requires lists use the prefix-name form
+`(name Type)` — no colon before the type.
 
 ## Pipeline position
 

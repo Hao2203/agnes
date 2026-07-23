@@ -147,3 +147,38 @@ async fn test_resolve_path_nonexistent_file_via_symlink_parent_rejected() {
     let err = result.unwrap_err();
     assert!(err.contains("outside allowed root"), "unexpected error: {}", err);
 }
+
+#[tokio::test]
+async fn test_resolve_path_broken_symlink_leaf_rejected() {
+    // Skip this test if symlinks are not available
+    if cfg!(windows) {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+
+    // A target OUTSIDE the root that does NOT exist, so the symlink is broken.
+    let outside_missing = temp.path().join("does_not_exist.txt");
+
+    // Create a broken symlink from inside the root to the outside (missing)
+    // target. canonicalize(candidate) fails because the target is gone, but
+    // the symlink entry itself exists. Without the leaf-exists guard the
+    // fallback would canonicalize the in-root parent and re-append the symlink
+    // name, passing the allow-root check - and a subsequent write would follow
+    // the link out of root.
+    let symlink = root.join("link.txt");
+    std::os::unix::fs::symlink(&outside_missing, &symlink).unwrap();
+
+    let session = create_test_session()
+        .with_allow_root(root);
+
+    let input = symlink.to_str().unwrap().to_string();
+    let result = session.resolve_path(&input).await;
+    assert!(
+        result.is_err(),
+        "expected broken symlink to be rejected, got: {:?}",
+        result.ok()
+    );
+}
