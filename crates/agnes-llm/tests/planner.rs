@@ -35,10 +35,12 @@ async fn system_prompt_lists_all_builtin_tools_and_mentions_finish_observe_forms
     for name in &[
         "read-file",
         "write-file",
+        "parse-path",
         "summarize",
         "translate",
         "llm",
         "join-lines",
+        "shell-run",
     ] {
         assert!(sys.contains(name), "system prompt missing tool `{name}`");
     }

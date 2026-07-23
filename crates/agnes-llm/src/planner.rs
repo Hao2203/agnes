@@ -321,10 +321,12 @@ fn build_system_prompt(reg: &Registry) -> String {
     const BUILTIN_TOOL_ORDER: &[&str] = &[
         "read-file",
         "write-file",
+        "parse-path",
         "summarize",
         "translate",
         "llm",
         "join-lines",
+        "shell-run",
     ];
     let mut catalog = String::new();
     for name in BUILTIN_TOOL_ORDER {
@@ -378,6 +380,10 @@ Rules:
   3. Prefer wrapping every terminating result with `(finish ...)` to
      make your intent explicit.
   4. Do not invent tools not in the catalog above; the checker will reject.
+  5. `shell-run` executes an arbitrary shell command and requires the
+     `--allow-shell` flag plus per-command user confirmation, so it may be
+     rejected at runtime. Prefer `read-file`/`write-file` for file access;
+     use `shell-run` only when no builtin tool fits.
 
 Examples (each is a complete turn):
 
