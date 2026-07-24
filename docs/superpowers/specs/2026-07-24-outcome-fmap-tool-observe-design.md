@@ -22,7 +22,7 @@ Additionally, `Finish T` and `Observation T` are distinct wrapper types. A condi
 
 `Finish T` and `Observation T` remain separate wrapper types (`App { head: "Finish", args: [T] }` / `App { head: "Observation", args: [T] }`). `classify_root` reads the outermost type head to determine terminate-vs-continue — exactly as it does today.
 
-Rationale: the intent label (finish vs observe) is semantically meaningful at the type level. Keeping them separate lets the type system track the intent, and `classify_root` works without a runtime mode field. The "same return type" goal from the original ask is satisfied by making `finish` and `observe` both return the *inner* type `T` at the type level (both are `T → T` identity on types), with the wrapper applied at runtime — but the wrapper types `Finish T` / `Observation T` remain distinct for `classify_root`.
+Rationale: the intent label (finish vs observe) is semantically meaningful at the type level. Keeping them separate lets the type system track the intent, and `classify_root` works without a runtime mode field. The checker returns `Finish T` for `finish` and `Observation T` for `observe` — distinct types reflecting distinct intents. For conditional `(if c (finish x) (observe y))`, the runtime correctly classifies the result (the actual branch's type head is read by `classify_root`); the checker's static type for `if`/`match` (taking only the then-branch / last arm) is a pre-existing limitation, not addressed by this design.
 
 ### 2. `fmap` — Explicit Functor Lift
 
@@ -37,6 +37,8 @@ New special form `(fmap expr)`.
 **Runtime:** The scheduler extracts `inner.data` and `inner.declared_type`, evaluates `expr` with the inner value as upstream, and wraps the result in the same `App { head, args: [U] }`.
 
 **Example:** `(fmap (tool summarize))` on `Observation String` → extracts `String`, runs `summarize` → `Summary`, wraps in `Observation Summary`.
+
+`fmap` over `Finish T` is included for symmetry and extensibility; in practice `finish` is terminal, so `fmap` is primarily used with `Observation T`.
 
 ### 3. `tool_observe` — Combinator for Tool + Observe
 
@@ -79,6 +81,8 @@ The pipe is **uniform**: each step's declared input type must match the previous
 | Transition | `(tool_observe name args...)` | `T → Observation U` |
 | Outcome | `(fmap expr)`, `(fmap expr2)`, ... | `Observation U → Observation V → ...` |
 | Terminal | `(observe)` or `(finish)` | Ends the pipe |
+
+Bare `(tool_observe)` as a pipe tail (no tool name) is equivalent to a non-terminal `observe`: snapshots the upstream value and wraps in `Observation T`, without ending the pipe. This is useful when the LLM wants to surface a value that was already computed by a previous step, without running an additional tool.
 
 **Example:**
 ```lisp
