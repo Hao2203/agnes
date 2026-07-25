@@ -27,7 +27,7 @@ fn build(dag: &Dag, id: agnes_compiler::NodeId) -> PlanTree {
         NodeKind::Return => ("return".into(), "return".into()),
         NodeKind::Finish => ("finish".into(), "finish".into()),
         NodeKind::Observe => ("observe".into(), "observe".into()),
-        NodeKind::Fmap => ("fmap".into(), "fmap".into()),
+        NodeKind::Fmap { .. } => ("fmap".into(), "fmap".into()),
         NodeKind::ToolObserve { name } => ("tool_observe".into(), format!("tool_observe {name}")),
         NodeKind::Literal(lit) => ("lit".into(), format!("{lit:?}")),
         NodeKind::Var(n) => ("var".into(), n.clone()),

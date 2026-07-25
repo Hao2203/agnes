@@ -1,4 +1,4 @@
-use agnes_ast::Literal;
+use agnes_ast::{Expr, Literal, Span};
 use agnes_types::TypeExpr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,10 +37,14 @@ pub enum NodeKind {
     /// `(observe X)` — wraps the child's runtime type in `Observation T`
     /// so the session loop feeds the value back to the planner.
     Observe,
-    /// `(fmap expr)` — functor lift: single input (the child expression).
-    /// Provides is `App { head: wrapper_head, args: [child_provides] }`
-    /// where `wrapper_head` is the upstream Outcome's head (Observation/Finish).
-    Fmap,
+    /// `(fmap expr)` — functor lift over an upstream Outcome.
+    /// The child `Expr` is stored inline so the runtime can evaluate it
+    /// via `eval_expr` with a dynamically-threaded upstream (the inner
+    /// value extracted from the Outcome). Single input: the upstream
+    /// Outcome node. Provides is `App { head: wrapper_head, args: [child_provides] }`.
+    Fmap {
+        child: Box<Expr>,
+    },
     /// `(tool_observe name args...)` — tool + observe combinator.
     /// Inputs are kwargs (like a Tool node). Provides is
     /// `App { head: "Observation", args: [tool_provides] }`.
@@ -86,6 +90,9 @@ pub struct Node {
 pub struct Dag {
     pub nodes: Vec<Node>,
     pub root: NodeId,
+    /// Maps `NodeId` → source `Span` of the original `Expr` that produced
+    /// this node. Used for post-execution branch-pruned DSL rendering.
+    pub node_spans: Vec<Span>,
 }
 
 impl Dag {

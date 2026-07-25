@@ -149,7 +149,7 @@ fn eval_node<'a>(
                     },
                 }
             }
-            NodeKind::Fmap => {
+            NodeKind::Fmap { child: _ } => {
                 // Placeholder: fmap evaluates its child expression.
                 // Real fmap semantics (unwrapping upstream Outcome,
                 // applying child, re-wrapping) are implemented in a later task.

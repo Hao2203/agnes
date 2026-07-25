@@ -1,4 +1,4 @@
-use agnes_ast::{Expr, Literal, Program};
+use agnes_ast::{Expr, Literal, Program, Span};
 use agnes_registry::Registry;
 use agnes_types::TypeExpr;
 
@@ -7,6 +7,9 @@ use crate::dag::{Dag, Input, Node, NodeId, NodeKind};
 pub struct Lowering<'a> {
     reg: &'a Registry,
     nodes: Vec<Node>,
+    /// Maps `NodeId` → source `Span` of the original `Expr` that produced
+    /// this node. Used for post-execution branch-pruned DSL rendering.
+    pub node_spans: Vec<Span>,
 }
 
 impl<'a> Lowering<'a> {
@@ -14,10 +17,17 @@ impl<'a> Lowering<'a> {
         Self {
             reg,
             nodes: Vec::new(),
+            node_spans: Vec::new(),
         }
     }
 
-    fn add(&mut self, kind: NodeKind, inputs: Vec<Input>, provides: TypeExpr) -> NodeId {
+    fn add(
+        &mut self,
+        kind: NodeKind,
+        inputs: Vec<Input>,
+        provides: TypeExpr,
+        span: Span,
+    ) -> NodeId {
         let id = NodeId(self.nodes.len());
         self.nodes.push(Node {
             id,
@@ -25,6 +35,7 @@ impl<'a> Lowering<'a> {
             inputs,
             provides,
         });
+        self.node_spans.push(span);
         id
     }
 
@@ -39,6 +50,7 @@ impl<'a> Lowering<'a> {
         Ok(Dag {
             nodes: std::mem::take(&mut self.nodes),
             root,
+            node_spans: std::mem::take(&mut self.node_spans),
         })
     }
 
@@ -47,15 +59,18 @@ impl<'a> Lowering<'a> {
         e: &Expr,
         upstream: Option<NodeId>,
     ) -> Result<NodeId, crate::CompileError> {
+        let span = e.span();
         match e {
             Expr::Tool {
                 name,
                 positional,
                 ..
-            } => self.lower_tool(name, positional, upstream),
-            Expr::Pipe { steps, .. } => self.lower_pipe(steps),
-            Expr::Par { branches, .. } => self.lower_par(branches),
-            Expr::Let { name, value, .. } => self.lower_let(name, value.as_deref(), upstream),
+            } => self.lower_tool(name, positional, upstream, span),
+            Expr::Pipe { steps, .. } => self.lower_pipe(steps, span),
+            Expr::Par { branches, .. } => self.lower_par(branches, span),
+            Expr::Let { name, value, .. } => {
+                self.lower_let(name, value.as_deref(), upstream, span)
+            }
             Expr::If {
                 cond,
                 then_branch,
@@ -70,6 +85,7 @@ impl<'a> Lowering<'a> {
                     NodeKind::If,
                     vec![Input::FromNode(c), Input::FromNode(t), Input::FromNode(f)],
                     provides,
+                    span,
                 );
                 Ok(id)
             }
@@ -86,7 +102,12 @@ impl<'a> Lowering<'a> {
                     inputs.push(Input::FromNode(b));
                     last_provides = self.nodes[b.0].provides.clone();
                 }
-                Ok(self.add(NodeKind::Match { arms: pats }, inputs, last_provides))
+                Ok(self.add(
+                    NodeKind::Match { arms: pats },
+                    inputs,
+                    last_provides,
+                    span,
+                ))
             }
             Expr::Foreach {
                 item,
@@ -101,6 +122,7 @@ impl<'a> Lowering<'a> {
                     NodeKind::Foreach { item: item.clone() },
                     vec![Input::FromNode(c), Input::FromNode(b)],
                     provides,
+                    span,
                 ))
             }
             Expr::Retry {
@@ -118,6 +140,7 @@ impl<'a> Lowering<'a> {
                     },
                     vec![Input::FromNode(b)],
                     provides,
+                    span,
                 ))
             }
             Expr::Catch {
@@ -133,15 +156,21 @@ impl<'a> Lowering<'a> {
                     },
                     vec![Input::FromNode(b)],
                     provides,
+                    span,
                 ))
             }
             Expr::Return { value, .. } => {
                 let v = self.lower_expr(value, None)?;
                 let provides = self.nodes[v.0].provides.clone();
-                Ok(self.add(NodeKind::Return, vec![Input::FromNode(v)], provides))
+                Ok(self.add(
+                    NodeKind::Return,
+                    vec![Input::FromNode(v)],
+                    provides,
+                    span,
+                ))
             }
             Expr::Finish { value, .. } => {
-                self.lower_wrap(value, upstream, "Finish", "finish", NodeKind::Finish)
+                self.lower_wrap(value, upstream, "Finish", "finish", NodeKind::Finish, span)
             }
             Expr::Observe { value, .. } => self.lower_wrap(
                 value,
@@ -149,38 +178,14 @@ impl<'a> Lowering<'a> {
                 "Observation",
                 "observe",
                 NodeKind::Observe,
+                span,
             ),
-            Expr::Fmap { value, .. } => {
-                // fmap lifts a child expression over an upstream Outcome.
-                // The child is lowered with no upstream (the piped upstream's
-                // inner value gets threaded in by the runtime). The provides
-                // is initially "Unknown" — the checker resolves it to the
-                // proper Outcome-wrapped type based on the pipe context.
-                let child = self.lower_expr(value, None)?;
-                let provides = TypeExpr::Named(agnes_types::TypeName("Unknown".into()));
-                Ok(self.add(NodeKind::Fmap, vec![Input::FromNode(child)], provides))
-            }
+            Expr::Fmap { value, .. } => self.lower_fmap(value, upstream, span),
             Expr::ToolObserve {
                 name,
                 positional,
                 ..
-            } => {
-                // tool_observe: run the tool, then wrap the result in Observation.
-                // First lower as a Tool, then add a ToolObserve wrapper node.
-                let tool_id = self.lower_tool(name, positional, upstream)?;
-                let tool_provides = self.nodes[tool_id.0].provides.clone();
-                let provides = TypeExpr::App {
-                    head: agnes_types::TypeName("Observation".into()),
-                    args: vec![tool_provides],
-                };
-                Ok(self.add(
-                    NodeKind::ToolObserve {
-                        name: name.to_string(),
-                    },
-                    vec![Input::FromNode(tool_id)],
-                    provides,
-                ))
-            }
+            } => self.lower_tool_observe(name, positional, upstream, span),
             Expr::Literal { lit, .. } => {
                 let ty = match lit {
                     Literal::String(_) => "String",
@@ -192,12 +197,14 @@ impl<'a> Lowering<'a> {
                     NodeKind::Literal(lit.clone()),
                     vec![],
                     TypeExpr::Named(agnes_types::TypeName(ty.into())),
+                    span,
                 ))
             }
             Expr::Var { name, .. } => Ok(self.add(
                 NodeKind::Var(name.clone()),
                 vec![],
                 TypeExpr::Named(agnes_types::TypeName("Unknown".into())),
+                span,
             )),
             Expr::List { items, .. } => {
                 let mut inputs: Vec<Input> = Vec::with_capacity(items.len());
@@ -216,7 +223,7 @@ impl<'a> Lowering<'a> {
                     head: agnes_types::TypeName("List".into()),
                     args: vec![elem_ty],
                 };
-                Ok(self.add(NodeKind::List, inputs, provides))
+                Ok(self.add(NodeKind::List, inputs, provides, span))
             }
         }
     }
@@ -226,6 +233,7 @@ impl<'a> Lowering<'a> {
         name: &str,
         positional: &[Expr],
         upstream: Option<NodeId>,
+        span: Span,
     ) -> Result<NodeId, crate::CompileError> {
         let sig = self.reg.tool_signature(name).cloned().ok_or_else(|| {
             crate::CompileError::UnknownDefine {
@@ -274,10 +282,11 @@ impl<'a> Lowering<'a> {
             },
             inputs,
             provides,
+            span,
         ))
     }
 
-    fn lower_pipe(&mut self, steps: &[Expr]) -> Result<NodeId, crate::CompileError> {
+    fn lower_pipe(&mut self, steps: &[Expr], span: Span) -> Result<NodeId, crate::CompileError> {
         // Lower each step in order, threading `prev` so unfilled requires can
         // pick up the previous step's provides. Every step is reified in the
         // Pipe node's inputs so the scheduler evaluates them in order — this
@@ -297,7 +306,7 @@ impl<'a> Lowering<'a> {
             })?;
         let provides = self.nodes[last.0].provides.clone();
         let inputs: Vec<Input> = ids.into_iter().map(Input::FromNode).collect();
-        Ok(self.add(NodeKind::Pipe, inputs, provides))
+        Ok(self.add(NodeKind::Pipe, inputs, provides, span))
     }
 
     /// Shared implementation for `Expr::Finish` / `Expr::Observe`. Lowers the
@@ -310,6 +319,7 @@ impl<'a> Lowering<'a> {
         wrapper_head: &str,
         form_name: &str,
         kind: NodeKind,
+        span: Span,
     ) -> Result<NodeId, crate::CompileError> {
         let inner_id = match value {
             Some(v) => self.lower_expr(v, None)?,
@@ -322,10 +332,14 @@ impl<'a> Lowering<'a> {
             head: agnes_types::TypeName(wrapper_head.into()),
             args: vec![inner_provides],
         };
-        Ok(self.add(kind, vec![Input::FromNode(inner_id)], provides))
+        Ok(self.add(kind, vec![Input::FromNode(inner_id)], provides, span))
     }
 
-    fn lower_par(&mut self, branches: &[Expr]) -> Result<NodeId, crate::CompileError> {
+    fn lower_par(
+        &mut self,
+        branches: &[Expr],
+        span: Span,
+    ) -> Result<NodeId, crate::CompileError> {
         let mut ids = Vec::new();
         for b in branches {
             ids.push(self.lower_expr(b, None)?);
@@ -335,6 +349,7 @@ impl<'a> Lowering<'a> {
             NodeKind::Par,
             inputs,
             TypeExpr::Named(agnes_types::TypeName("Unit".into())),
+            span,
         ))
     }
 
@@ -343,6 +358,7 @@ impl<'a> Lowering<'a> {
         name: &str,
         value: Option<&Expr>,
         upstream: Option<NodeId>,
+        span: Span,
     ) -> Result<NodeId, crate::CompileError> {
         let (input, provides) = match value {
             Some(v) => {
@@ -362,6 +378,143 @@ impl<'a> Lowering<'a> {
             },
             vec![input],
             provides,
+            span,
+        ))
+    }
+
+    /// Lowers `(fmap expr)` — lifts the child expression over an upstream
+    /// Outcome (Observation or Finish). The child `Expr` is stored inline
+    /// in `NodeKind::Fmap` so the runtime can evaluate it with a
+    /// dynamically-threaded upstream (the inner value extracted from the
+    /// Outcome). The child is also lowered into the DAG so we can compute
+    /// its `provides` type; those nodes are orphaned (not reachable from
+    /// the fmap node's inputs) and unused at runtime.
+    fn lower_fmap(
+        &mut self,
+        value: &Expr,
+        upstream: Option<NodeId>,
+        span: Span,
+    ) -> Result<NodeId, crate::CompileError> {
+        let inner_id = upstream.ok_or_else(|| crate::CompileError::UnknownDefine {
+            name: "fmap used outside a pipe".into(),
+        })?;
+        let inner_provides = self.nodes[inner_id.0].provides.clone();
+        let wrapper_head = match &inner_provides {
+            TypeExpr::App { head, args }
+                if args.len() == 1 && (head.0 == "Observation" || head.0 == "Finish") =>
+            {
+                head.clone()
+            }
+            _ => {
+                return Err(crate::CompileError::UnknownDefine {
+                    name: format!(
+                        "fmap requires an Outcome upstream, got {}",
+                        inner_provides
+                    ),
+                });
+            }
+        };
+        // Lower the child to determine its provides type. The resulting DAG
+        // nodes are orphaned — the runtime evaluates the child Expr directly
+        // via eval_expr with the extracted inner value as flowed_in.
+        let child_id = self.lower_expr(value, None)?;
+        let child_provides = self.nodes[child_id.0].provides.clone();
+        let provides = TypeExpr::App {
+            head: wrapper_head,
+            args: vec![child_provides],
+        };
+        Ok(self.add(
+            NodeKind::Fmap {
+                child: Box::new(value.clone()),
+            },
+            vec![Input::FromNode(inner_id)],
+            provides,
+            span,
+        ))
+    }
+
+    /// Lowers `(tool_observe name args...)` — runs a tool and wraps its
+    /// result in `Observation`. Like a tool call with kwargs inputs, but
+    /// the provides is `Observation T` instead of `T`.
+    ///
+    /// Bare form (`(tool_observe)` with no name) wraps the piped upstream
+    /// directly in `Observation`.
+    fn lower_tool_observe(
+        &mut self,
+        name: &str,
+        positional: &[Expr],
+        upstream: Option<NodeId>,
+        span: Span,
+    ) -> Result<NodeId, crate::CompileError> {
+        // Bare form: no tool name, just wrap upstream in Observation.
+        if name.is_empty() && positional.is_empty() {
+            let inner_id = upstream.ok_or_else(|| crate::CompileError::UnknownDefine {
+                name: "bare tool_observe used outside a pipe".into(),
+            })?;
+            let inner_provides = self.nodes[inner_id.0].provides.clone();
+            let provides = TypeExpr::App {
+                head: agnes_types::TypeName("Observation".into()),
+                args: vec![inner_provides],
+            };
+            return Ok(self.add(
+                NodeKind::ToolObserve {
+                    name: String::new(),
+                },
+                vec![Input::FromNode(inner_id)],
+                provides,
+                span,
+            ));
+        }
+
+        // Lower like a tool call with kwargs inputs.
+        let sig = self.reg.tool_signature(name).cloned().ok_or_else(|| {
+            crate::CompileError::UnknownDefine {
+                name: name.to_string(),
+            }
+        })?;
+        let mut inputs: Vec<Input> = Vec::new();
+        let mut filled: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (i, arg) in positional.iter().enumerate() {
+            let (param_name, _) =
+                sig.requires
+                    .get(i)
+                    .ok_or_else(|| crate::CompileError::UnknownDefine {
+                        name: format!("{name}: extra positional argument at index {i}"),
+                    })?;
+            let src = self.lower_expr(arg, None)?;
+            inputs.push(Input::Kw {
+                key: param_name.clone(),
+                source: Box::new(Input::FromNode(src)),
+            });
+            filled.insert(param_name.clone());
+        }
+
+        // Flowed-in upstream fills the sole remaining unfilled require.
+        let unfilled: Vec<&String> = sig
+            .requires
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| !filled.contains(*n))
+            .collect();
+        if unfilled.len() == 1 && let Some(up) = upstream {
+            inputs.push(Input::Kw {
+                key: unfilled[0].clone(),
+                source: Box::new(Input::FromNode(up)),
+            });
+        }
+
+        let provides = TypeExpr::App {
+            head: agnes_types::TypeName("Observation".into()),
+            args: vec![sig.provides.clone()],
+        };
+        Ok(self.add(
+            NodeKind::ToolObserve {
+                name: name.to_string(),
+            },
+            inputs,
+            provides,
+            span,
         ))
     }
 }
