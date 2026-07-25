@@ -6,7 +6,7 @@ mod scheduler;
 
 pub use error::RuntimeError;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use agnes_builtins::{ToolCtx, ToolImpl};
@@ -38,7 +38,8 @@ pub async fn execute(
     dispatch: &HashMap<String, ToolImpl>,
     ctx: &ToolCtx<'_>,
 ) -> Result<Value, RuntimeError> {
-    execute_with(dag, reg, dispatch, ctx, &NoopTracer).await
+    let (value, _) = execute_with(dag, reg, dispatch, ctx, &NoopTracer).await?;
+    Ok(value)
 }
 
 pub async fn execute_with(
@@ -47,6 +48,8 @@ pub async fn execute_with(
     dispatch: &HashMap<String, ToolImpl>,
     ctx: &ToolCtx<'_>,
     tracer: &dyn Tracer,
-) -> Result<Value, RuntimeError> {
-    scheduler::run(dag, reg, dispatch, ctx, tracer).await
+) -> Result<(Value, HashSet<NodeId>), RuntimeError> {
+    let mut visited = HashSet::new();
+    let value = scheduler::run(dag, reg, dispatch, ctx, tracer, &mut visited).await?;
+    Ok((value, visited))
 }

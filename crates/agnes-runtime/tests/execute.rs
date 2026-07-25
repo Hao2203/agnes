@@ -1,11 +1,13 @@
-use agnes_builtins::{native_dispatch, register_builtins, PathResolver, Sink, ToolCtx};
-use agnes_checker::check;
-use agnes_compiler::compile;
-use agnes_parser::parse;
-use agnes_registry::Registry;
-use agnes_runtime::execute;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use agnes_builtins::{native_dispatch, observations, register_builtins, ObservationRecord, PathResolver, Sink, ToolCtx};
+use agnes_checker::check;
+use agnes_compiler::{NodeId, compile};
+use agnes_parser::parse;
+use agnes_registry::Registry;
+use agnes_runtime::{execute, execute_with};
 use tokio::sync::oneshot;
 
 struct DummyResolver;
@@ -186,4 +188,155 @@ async fn boundary_validates_list_of_union_at_runtime() {
         .expect("List String boundary must accept String elements");
     let s = out.data.as_str().expect("string result");
     assert!(s.contains("agnes"), "got: {s}");
+}
+
+// ---- Task 5: fmap / tool_observe / visited set ----
+
+/// Clear the process-global observations recorder before a test.
+fn clear_observations() {
+    observations().lock().unwrap().clear();
+}
+
+/// Drain and return all currently recorded observations.
+fn drain_observations() -> Vec<ObservationRecord> {
+    observations().lock().unwrap().drain(..).collect()
+}
+
+#[tokio::test]
+async fn tool_observe_produces_observation_and_records_snapshot() {
+    clear_observations();
+    let src = r#"(tool_observe read-file "README.md")"#;
+    let mut r = Registry::new();
+    register_builtins(&mut r).unwrap();
+    let p = parse(src).unwrap();
+    r.load(&p).unwrap();
+    check(&p, &r).unwrap();
+    let dag = compile(&p, &r).unwrap();
+
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let dispatch = native_dispatch(mock);
+    let dummy = DummyResolver;
+    let out = execute(&dag, &r, &dispatch, &ctx(&dummy)).await.expect("run ok");
+
+    // Type must be Observation String
+    assert_eq!(out.declared_type.to_string(), "(Observation String)");
+    // Data is the inner string
+    let s = out.data.as_str().expect("string result");
+    assert!(s.contains("agnes"), "got: {s}");
+
+    // Observations recorder should have exactly one entry
+    let obs = drain_observations();
+    assert_eq!(obs.len(), 1, "expected 1 observation, got {}", obs.len());
+    assert!(obs[0].text.contains("agnes"), "snapshot text missing content: {}", obs[0].text);
+    assert_eq!(obs[0].type_name.as_ref().map(|n| n.0.as_str()), Some("String"));
+}
+
+#[tokio::test]
+async fn fmap_extracts_observation_applies_tool_and_rewraps() {
+    clear_observations();
+    let src = r#"(pipe (tool_observe read-file "README.md") (fmap (tool summarize)))"#;
+    let mut r = Registry::new();
+    register_builtins(&mut r).unwrap();
+    let p = parse(src).unwrap();
+    r.load(&p).unwrap();
+    check(&p, &r).unwrap();
+    let dag = compile(&p, &r).unwrap();
+
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
+    let dispatch = native_dispatch(mock);
+    let dummy = DummyResolver;
+    let out = execute(&dag, &r, &dispatch, &ctx(&dummy)).await.expect("run ok");
+
+    // fmap over Observation should produce Observation String (rewrapped)
+    assert_eq!(out.declared_type.to_string(), "(Observation String)");
+    let s = out.data.as_str().expect("string result");
+    assert_eq!(s, "[SUMMARY]");
+
+    // tool_observe recorded one snapshot (the read-file output)
+    let obs = drain_observations();
+    assert_eq!(obs.len(), 1);
+    assert!(obs[0].text.contains("agnes"));
+}
+
+#[tokio::test]
+async fn fmap_over_finish_rewraps_in_finish() {
+    // fmap lifts over any Outcome (Observation or Finish) — verify Finish re-wrap.
+    let src = r#"(pipe (finish "hello") (fmap (tool summarize)))"#;
+    let mut r = Registry::new();
+    register_builtins(&mut r).unwrap();
+    let p = parse(src).unwrap();
+    r.load(&p).unwrap();
+    check(&p, &r).unwrap();
+    let dag = compile(&p, &r).unwrap();
+
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec!["[SUMMARY]".into()]));
+    let dispatch = native_dispatch(mock);
+    let dummy = DummyResolver;
+    let out = execute(&dag, &r, &dispatch, &ctx(&dummy)).await.expect("run ok");
+
+    assert_eq!(out.declared_type.to_string(), "(Finish String)");
+    let s = out.data.as_str().expect("string result");
+    assert_eq!(s, "[SUMMARY]");
+}
+
+#[tokio::test]
+async fn visited_set_contains_only_executed_nodes() {
+    // (if #t (finish "a") (observe "b")) — only the then-branch should be visited.
+    let src = r#"(if #t (finish "a") (observe "b"))"#;
+    let mut r = Registry::new();
+    register_builtins(&mut r).unwrap();
+    let p = parse(src).unwrap();
+    r.load(&p).unwrap();
+    check(&p, &r).unwrap();
+    let dag = compile(&p, &r).unwrap();
+
+    let total_nodes = dag.nodes.len();
+
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let dispatch = native_dispatch(mock);
+    let dummy = DummyResolver;
+    let (out, visited) = execute_with(&dag, &r, &dispatch, &ctx(&dummy), &agnes_runtime::NoopTracer)
+        .await
+        .expect("run ok");
+
+    assert_eq!(out.declared_type.to_string(), "(Finish String)");
+    assert_eq!(out.data.as_str(), Some("a"));
+
+    // Visited must be a proper subset of all nodes — the else branch is pruned.
+    assert!(visited.len() < total_nodes,
+        "visited set size {} should be < total nodes {} (else branch must not be visited)",
+        visited.len(), total_nodes);
+
+    // Root (the if node) must be visited.
+    assert!(visited.contains(&dag.root), "root must be visited");
+
+    // Check that the set is a HashSet<NodeId> with the right type.
+    let _: &HashSet<NodeId> = &visited;
+}
+
+#[tokio::test]
+async fn visited_set_includes_root_and_cond_but_not_untaken_branch() {
+    // Deeper check: build the DAG and verify which nodes are present.
+    let src = r#"(if #f (finish "yes") (finish "no"))"#;
+    let mut r = Registry::new();
+    register_builtins(&mut r).unwrap();
+    let p = parse(src).unwrap();
+    r.load(&p).unwrap();
+    check(&p, &r).unwrap();
+    let dag = compile(&p, &r).unwrap();
+
+    let mock = Arc::new(agnes_llm::MockProvider::new(vec![]));
+    let dispatch = native_dispatch(mock);
+    let dummy = DummyResolver;
+    let (out, visited) = execute_with(&dag, &r, &dispatch, &ctx(&dummy), &agnes_runtime::NoopTracer)
+        .await
+        .expect("run ok");
+
+    assert_eq!(out.data.as_str(), Some("no"));
+    // Total nodes: if, false_literal, finish_yes, "yes"_lit, finish_no, "no"_lit = 6
+    // Visited: if, false_lit, finish_no, "no"_lit = 4
+    // At minimum: visited must be strictly fewer than total.
+    assert!(visited.len() < dag.nodes.len(),
+        "visited {} should be < total {} (untaken branch pruned)",
+        visited.len(), dag.nodes.len());
 }

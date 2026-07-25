@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agnes_ast::{Expr, Literal};
 use agnes_builtins::ToolImpl;
+use agnes_builtins::ObservationRecord;
 use agnes_compiler::{Dag, Input, NodeId, NodeKind};
 use agnes_registry::Registry;
 use agnes_types::{ToolSignature, TypeExpr, TypeName, Value, canonicalize_union};
@@ -20,10 +21,11 @@ pub async fn run(
     dispatch: &HashMap<String, ToolImpl>,
     ctx: &ToolCtx<'_>,
     tracer: &dyn crate::Tracer,
+    visited: &mut HashSet<NodeId>,
 ) -> Result<Value, RuntimeError> {
     let mut cache: HashMap<NodeId, Value> = HashMap::new();
     let mut env: HashMap<String, Value> = HashMap::new();
-    eval_node(dag, dag.root, reg, dispatch, ctx, tracer, &mut cache, &mut env).await
+    eval_node(dag, dag.root, reg, dispatch, ctx, tracer, &mut cache, &mut env, visited).await
 }
 
 fn eval_node<'a>(
@@ -35,11 +37,13 @@ fn eval_node<'a>(
     tracer: &'a dyn crate::Tracer,
     cache: &'a mut HashMap<NodeId, Value>,
     env: &'a mut HashMap<String, Value>,
+    visited: &'a mut HashSet<NodeId>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
         if let Some(v) = cache.get(&id) {
             return Ok(v.clone());
         }
+        visited.insert(id);
         let node = dag.get(id);
         let value = match &node.kind {
             NodeKind::Literal(lit) => Value::typed(lit_to_json(lit), lit_type(lit)),
@@ -53,7 +57,7 @@ fn eval_node<'a>(
             }
             NodeKind::Let { name } => {
                 let src =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 env.insert(name.clone(), src.clone());
                 src
             }
@@ -62,7 +66,7 @@ fn eval_node<'a>(
                 // intermediate steps populate `env` before later steps run.
                 let mut last: Option<Value> = None;
                 for input in &node.inputs {
-                    last = Some(eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env).await?);
+                    last = Some(eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env, visited).await?);
                 }
                 last.ok_or_else(|| RuntimeError::ToolFailed {
                     tool: "<pipe>".into(),
@@ -73,22 +77,22 @@ fn eval_node<'a>(
                 // MVP: evaluate branches sequentially — correctness first;
                 // concurrent join is a follow-up.
                 for input in &node.inputs {
-                    let _ = eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env).await?;
+                    let _ = eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 }
                 Value::typed(JsonValue::Null, "Unit")
             }
             NodeKind::If => {
                 let cond =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 let picked = if cond.data.as_bool().unwrap_or(false) {
                     1
                 } else {
                     2
                 };
-                eval_input(dag, &node.inputs[picked], reg, dispatch, ctx, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[picked], reg, dispatch, ctx, tracer, cache, env, visited).await?
             }
             NodeKind::Match { arms } => {
-                let s = eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+                let s = eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 let mut chosen: Option<usize> = None;
                 for (i, pat) in arms.iter().enumerate() {
                     if lit_matches(pat, &s.data) {
@@ -98,16 +102,16 @@ fn eval_node<'a>(
                 }
                 let idx = chosen.unwrap_or(arms.len());
                 let idx = idx.min(node.inputs.len() - 1);
-                eval_input(dag, &node.inputs[idx], reg, dispatch, ctx, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[idx], reg, dispatch, ctx, tracer, cache, env, visited).await?
             }
             NodeKind::Foreach { .. } => {
                 // MVP simplification: evaluate body once and return that.
-                eval_input(dag, &node.inputs[1], reg, dispatch, ctx, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[1], reg, dispatch, ctx, tracer, cache, env, visited).await?
             }
             NodeKind::Retry { times, .. } => {
                 let mut last_err: Option<RuntimeError> = None;
                 for _ in 0..(*times + 1) {
-                    match eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await
+                    match eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await
                     {
                         Ok(v) => {
                             cache.insert(id, v.clone());
@@ -119,17 +123,17 @@ fn eval_node<'a>(
                 return Err(last_err.unwrap());
             }
             NodeKind::Catch { fallback, .. } => {
-                match eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await {
+                match eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await {
                     Ok(v) => v,
-                    Err(_) => eval_node(dag, *fallback, reg, dispatch, ctx, tracer, cache, env).await?,
+                    Err(_) => eval_node(dag, *fallback, reg, dispatch, ctx, tracer, cache, env, visited).await?,
                 }
             }
             NodeKind::Return => {
-                eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?
+                eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?
             }
             NodeKind::Finish => {
                 let inner =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 Value {
                     data: inner.data,
                     declared_type: TypeExpr::App {
@@ -140,7 +144,7 @@ fn eval_node<'a>(
             }
             NodeKind::Observe => {
                 let inner =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 Value {
                     data: inner.data,
                     declared_type: TypeExpr::App {
@@ -149,27 +153,92 @@ fn eval_node<'a>(
                     },
                 }
             }
-            NodeKind::Fmap { child: _ } => {
-                // Placeholder: fmap evaluates its child expression.
-                // Real fmap semantics (unwrapping upstream Outcome,
-                // applying child, re-wrapping) are implemented in a later task.
-                eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?
-            }
-            NodeKind::ToolObserve { .. } => {
-                // ToolObserve wraps the tool result in Observation.
-                let inner =
-                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+            NodeKind::Fmap { child } => {
+                let upstream_val = eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
+                let (wrapper_head, inner_type) = match &upstream_val.declared_type {
+                    TypeExpr::App { head, args } if args.len() == 1 => {
+                        (head.clone(), args[0].clone())
+                    }
+                    _ => return Err(RuntimeError::ToolFailed {
+                        tool: "<fmap>".into(),
+                        cause: "upstream is not an Outcome".into(),
+                    }),
+                };
+                let inner_val = Value {
+                    data: upstream_val.data.clone(),
+                    declared_type: inner_type,
+                };
+                let result = eval_expr(child, Some(inner_val), reg, dispatch, ctx, env).await?;
                 Value {
-                    data: inner.data,
+                    data: result.data,
                     declared_type: TypeExpr::App {
-                        head: TypeName("Observation".into()),
-                        args: vec![inner.declared_type],
+                        head: wrapper_head,
+                        args: vec![result.declared_type],
                     },
+                }
+            }
+            NodeKind::ToolObserve { name } => {
+                if name.is_empty() {
+                    // Bare tool_observe in pipe: snapshot upstream, wrap in Observation.
+                    let upstream_val = eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env, visited).await?;
+                    let rendered = reg.show_value(&upstream_val);
+                    let type_name = match &upstream_val.declared_type {
+                        TypeExpr::Named(n) => Some(n.clone()),
+                        TypeExpr::App { head, .. } => Some(head.clone()),
+                    };
+                    agnes_builtins::observations().lock().unwrap().push(ObservationRecord {
+                        text: rendered,
+                        type_name,
+                    });
+                    Value {
+                        data: upstream_val.data,
+                        declared_type: TypeExpr::App {
+                            head: TypeName("Observation".into()),
+                            args: vec![upstream_val.declared_type],
+                        },
+                    }
+                } else {
+                    let args = collect_kwargs(dag, &node.inputs, reg, dispatch, ctx, tracer, cache, env, visited).await?;
+                    // Extract inner type from node.provides (Observation T -> T)
+                    let inner_provides = match &node.provides {
+                        TypeExpr::App { args, .. } if args.len() == 1 => args[0].clone(),
+                        _ => node.provides.clone(),
+                    };
+                    // Call the native tool with inner provides for validation
+                    let result = call_native_traced(
+                        id,
+                        &node.kind,
+                        name,
+                        args,
+                        dispatch,
+                        ctx,
+                        reg,
+                        &inner_provides,
+                        tracer,
+                    ).await?;
+                    // Snapshot
+                    let rendered = reg.show_value(&result);
+                    let type_name = match &inner_provides {
+                        TypeExpr::Named(n) => Some(n.clone()),
+                        TypeExpr::App { head, .. } => Some(head.clone()),
+                    };
+                    agnes_builtins::observations().lock().unwrap().push(ObservationRecord {
+                        text: rendered,
+                        type_name,
+                    });
+                    // Wrap in Observation
+                    Value {
+                        data: result.data,
+                        declared_type: TypeExpr::App {
+                            head: TypeName("Observation".into()),
+                            args: vec![result.declared_type],
+                        },
+                    }
                 }
             }
             NodeKind::Tool { name } => {
                 let args =
-                    collect_kwargs(dag, &node.inputs, reg, dispatch, ctx, tracer, cache, env).await?;
+                    collect_kwargs(dag, &node.inputs, reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 call_native_traced(
                     id,
                     &node.kind,
@@ -186,7 +255,7 @@ fn eval_node<'a>(
             NodeKind::List => {
                 let mut elems: Vec<Value> = Vec::with_capacity(node.inputs.len());
                 for input in &node.inputs {
-                    elems.push(eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env).await?);
+                    elems.push(eval_input(dag, input, reg, dispatch, ctx, tracer, cache, env, visited).await?);
                 }
                 let data = JsonValue::Array(elems.iter().map(|v| v.data.clone()).collect());
                 // Prefer the checker-derived provides for declared_type, but if
@@ -227,10 +296,11 @@ fn eval_input<'a>(
     tracer: &'a dyn crate::Tracer,
     cache: &'a mut HashMap<NodeId, Value>,
     env: &'a mut HashMap<String, Value>,
+    visited: &'a mut HashSet<NodeId>,
 ) -> agnes_builtins::BoxFuture<'a, Result<Value, RuntimeError>> {
     Box::pin(async move {
         match input {
-            Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, ctx, tracer, cache, env).await,
+            Input::FromNode(id) => eval_node(dag, *id, reg, dispatch, ctx, tracer, cache, env, visited).await,
             Input::Literal(lit) => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Input::Var(name) => env
                 .get(name)
@@ -240,7 +310,7 @@ fn eval_input<'a>(
                     cause: "unbound variable".into(),
                 }),
             Input::Kw { source, .. } => {
-                eval_input(dag, source, reg, dispatch, ctx, tracer, cache, env).await
+                eval_input(dag, source, reg, dispatch, ctx, tracer, cache, env, visited).await
             }
         }
     })
@@ -255,18 +325,19 @@ async fn collect_kwargs(
     tracer: &dyn crate::Tracer,
     cache: &mut HashMap<NodeId, Value>,
     env: &mut HashMap<String, Value>,
+    visited: &mut HashSet<NodeId>,
 ) -> Result<HashMap<String, Value>, RuntimeError> {
     let mut out = HashMap::new();
     for input in inputs {
         match input {
             Input::Kw { key, source } => {
-                let v = eval_input(dag, source, reg, dispatch, ctx, tracer, cache, env).await?;
+                let v = eval_input(dag, source, reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 out.insert(key.clone(), v);
             }
             other => {
                 // Defensive fallback — Task 7 compiler produces only Kw inputs
                 // for tool/llm nodes, so this branch should not fire in normal use.
-                let v = eval_input(dag, other, reg, dispatch, ctx, tracer, cache, env).await?;
+                let v = eval_input(dag, other, reg, dispatch, ctx, tracer, cache, env, visited).await?;
                 out.insert("_positional".into(), v);
             }
         }
@@ -512,9 +583,31 @@ fn eval_expr<'a>(
                 .await
             }
             Expr::Fmap { value, .. } => {
-                // Placeholder: evaluate the child expression.
-                // Real fmap semantics come in a later task.
-                eval_expr(value, None, reg, dispatch, ctx, env).await
+                let upstream = flowed_in.ok_or_else(|| RuntimeError::ToolFailed {
+                    tool: "<fmap>".into(),
+                    cause: "fmap used without upstream value".into(),
+                })?;
+                let (wrapper_head, inner_type) = match &upstream.declared_type {
+                    TypeExpr::App { head, args } if args.len() == 1 => {
+                        (head.clone(), args[0].clone())
+                    }
+                    _ => return Err(RuntimeError::ToolFailed {
+                        tool: "<fmap>".into(),
+                        cause: "upstream is not an Outcome".into(),
+                    }),
+                };
+                let inner_val = Value {
+                    data: upstream.data.clone(),
+                    declared_type: inner_type,
+                };
+                let result = eval_expr(value, Some(inner_val), reg, dispatch, ctx, env).await?;
+                Ok(Value {
+                    data: result.data,
+                    declared_type: TypeExpr::App {
+                        head: wrapper_head,
+                        args: vec![result.declared_type],
+                    },
+                })
             }
             Expr::ToolObserve {
                 name,
@@ -525,6 +618,16 @@ fn eval_expr<'a>(
                     bind_tool_args(name, positional, flowed_in, reg, dispatch, ctx, env).await?;
                 let provides = tool_provides(reg, name);
                 let inner = call_native(name, kwargs, dispatch, ctx, reg, &provides).await?;
+                // Snapshot the result
+                let rendered = reg.show_value(&inner);
+                let type_name = match &inner.declared_type {
+                    TypeExpr::Named(n) => Some(n.clone()),
+                    TypeExpr::App { head, .. } => Some(head.clone()),
+                };
+                agnes_builtins::observations().lock().unwrap().push(ObservationRecord {
+                    text: rendered,
+                    type_name,
+                });
                 Ok(Value {
                     data: inner.data,
                     declared_type: TypeExpr::App {

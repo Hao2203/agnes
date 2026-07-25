@@ -470,7 +470,8 @@ impl Session {
         // events before the caller emits TurnResult/Observation (ordering).
         drop(tracer);
         let _ = drain_handle.await;
-        Ok(result?)
+        let (value, _visited) = result?;
+        Ok(value)
     }
 }
 
