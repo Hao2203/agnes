@@ -58,6 +58,23 @@ Fix suggestion (paste at top of file):
         body_type: Box<TypeExpr>,
     },
 
+    #[error("fmap requires an Outcome upstream, got {found}")]
+    FmapOnPlainType { found: String },
+
+    #[error("cannot observe a Finish value (got {found}); use fmap to continue an Observation pipe")]
+    ObserveOnFinish { found: String },
+
+    #[error(
+        "cannot finish an Observation value (got {found}); use fmap to continue an Observation pipe, or end with observe"
+    )]
+    FinishOnObservation { found: String },
+
+    #[error("tool_observe requires a plain upstream, got {found}; use fmap instead")]
+    ToolObserveOnOutcome { found: String },
+
+    #[error("bare fmap in a pipe requires an expression; fmap always takes one child expression")]
+    BareFmapWithoutExpression,
+
     #[error(transparent)]
     Registry(#[from] agnes_registry::RegistryError),
 }

@@ -161,3 +161,90 @@ fn unknown_tool_reports() {
     assert!(msg.contains("Unknown tool"), "got: {msg}");
     assert!(msg.contains("no-such-tool"), "got: {msg}");
 }
+
+#[test]
+fn fmap_on_observation_ok() {
+    let r = seed_registry();
+    let src = r#"(pipe (tool_observe read-file "x") (fmap (tool summarize)))"#;
+    let p = parse(src).unwrap();
+    check(&p, &r).expect("fmap on Observation should type-check");
+}
+
+#[test]
+fn fmap_on_plain_upstream_rejected() {
+    let r = seed_registry();
+    let src = r#"(pipe (tool read-file "x") (fmap (tool summarize)))"#;
+    let p = parse(src).unwrap();
+    let err = check(&p, &r).expect_err("must reject fmap on plain type");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("fmap requires an Outcome upstream"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn fmap_on_finish_ok() {
+    let r = seed_registry();
+    let src = r#"(pipe (finish "done") (fmap (tool summarize)))"#;
+    let p = parse(src).unwrap();
+    check(&p, &r).expect("fmap on Finish should type-check");
+}
+
+#[test]
+fn observe_on_finish_rejected() {
+    let r = seed_registry();
+    let src = r#"(pipe (finish "done") observe)"#;
+    let p = parse(src).unwrap();
+    let err = check(&p, &r).expect_err("must reject observe on Finish");
+    let msg = format!("{err}");
+    assert!(msg.contains("cannot observe a Finish"), "got: {msg}");
+}
+
+#[test]
+fn finish_on_observation_rejected() {
+    let r = seed_registry();
+    let src = r#"(pipe (tool_observe read-file "x") finish)"#;
+    let p = parse(src).unwrap();
+    let err = check(&p, &r).expect_err("must reject finish on Observation");
+    let msg = format!("{err}");
+    assert!(msg.contains("cannot finish an Observation"), "got: {msg}");
+}
+
+#[test]
+fn tool_observe_produces_observation_via_define() {
+    let mut r = seed_registry();
+    // Register Observation type so the parser can resolve it in :provides.
+    r.register_type("Observation", None).unwrap();
+    let src = r#"
+        (define test-tool-observe :provides (Observation String)
+          (tool_observe read-file "x"))
+    "#;
+    let p = parse(src).unwrap();
+    check(&p, &r).expect("tool_observe should produce Observation String");
+}
+
+#[test]
+fn tool_observe_on_outcome_rejected() {
+    let r = seed_registry();
+    let src = r#"(pipe (tool_observe read-file "x") (tool_observe summarize))"#;
+    let p = parse(src).unwrap();
+    let err = check(&p, &r).expect_err("must reject tool_observe on Outcome");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("tool_observe requires a plain upstream"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn bare_tool_observe_wraps_upstream() {
+    let mut r = seed_registry();
+    r.register_type("Observation", None).unwrap();
+    let src = r#"
+        (define test-bare-observe :provides (Observation String)
+          (pipe (tool read-file "x") tool_observe))
+    "#;
+    let p = parse(src).unwrap();
+    check(&p, &r).expect("bare tool_observe should wrap upstream in Observation");
+}

@@ -130,30 +130,38 @@ fn check_expr(
             Ok(t)
         }
         Expr::Return { value, .. } => check_expr(value, reg, env, None, None),
-        Expr::Finish { value, .. } => check_wrap(value, "Finish", "finish", reg, env, flowed_in),
+        Expr::Finish { value, .. } => {
+            // Reject if upstream is Observation.
+            if let Some(ref up) = flowed_in {
+                if matches!(up, TypeExpr::App { head, args } if args.len() == 1
+                    && head.0 == "Observation")
+                {
+                    return Err(CheckError::FinishOnObservation {
+                        found: up.to_string(),
+                    });
+                }
+            }
+            check_wrap(value, "Finish", "finish", reg, env, flowed_in)
+        }
         Expr::Observe { value, .. } => {
+            // Reject if upstream is Finish.
+            if let Some(ref up) = flowed_in {
+                if matches!(up, TypeExpr::App { head, args } if args.len() == 1
+                    && head.0 == "Finish")
+                {
+                    return Err(CheckError::ObserveOnFinish {
+                        found: up.to_string(),
+                    });
+                }
+            }
             check_wrap(value, "Observation", "observe", reg, env, flowed_in)
         }
-        Expr::Fmap { value, .. } => {
-            // Placeholder: fmap lifts over an upstream Outcome.
-            // The child is checked with no flowed_in (the inner type comes
-            // from unwrapping the upstream). Full type-checking is done in
-            // a later task; for now, just check the child and return Unknown.
-            let _ = check_expr(value, reg, env, None, None)?;
-            Ok(TypeExpr::Named(TypeName("Unknown".into())))
-        }
+        Expr::Fmap { value, .. } => check_fmap(value, reg, env, flowed_in),
         Expr::ToolObserve {
             name,
             positional,
             ..
-        } => {
-            // Check the inner tool call, then wrap in Observation.
-            let inner = check_tool_call(name, positional, reg, env, flowed_in)?;
-            Ok(TypeExpr::App {
-                head: TypeName("Observation".into()),
-                args: vec![inner],
-            })
-        }
+        } => check_tool_observe(name, positional, reg, env, flowed_in),
         Expr::Literal { lit, .. } => Ok(literal_type(lit)),
         Expr::Var { name, .. } => env
             .get(name)
@@ -220,6 +228,90 @@ fn check_wrap(
     Ok(TypeExpr::App {
         head: TypeName(wrapper_head.into()),
         args: vec![inner],
+    })
+}
+
+/// Type-check `(fmap expr)`. The upstream must be an Outcome
+/// (`Observation T` or `Finish T`). Extract the inner `T`, check `expr`
+/// with `T` as its upstream, and re-wrap the result in the same Outcome.
+fn check_fmap(
+    value: &Box<Expr>,
+    reg: &Registry,
+    env: &mut env::Env,
+    flowed_in: Option<TypeExpr>,
+) -> Result<TypeExpr, CheckError> {
+    // Determine the upstream Outcome head and inner type.
+    let (wrapper_head, inner_type) = match &flowed_in {
+        Some(TypeExpr::App { head, args }) if args.len() == 1
+            && (head.0 == "Observation" || head.0 == "Finish") =>
+        {
+            (head.clone(), args[0].clone())
+        }
+        Some(other) => {
+            return Err(CheckError::FmapOnPlainType {
+                found: other.to_string(),
+            });
+        }
+        None => {
+            return Err(CheckError::FmapOnPlainType {
+                found: "<no upstream>".into(),
+            });
+        }
+    };
+    // Check the expression with the inner type as upstream.
+    let inner_result = check_expr(value, reg, env, Some(inner_type), None)?;
+    // Re-wrap in the same Outcome.
+    Ok(TypeExpr::App {
+        head: wrapper_head,
+        args: vec![inner_result],
+    })
+}
+
+/// Type-check `(tool_observe name args...)`. Behaves like `(tool name args...)`
+/// followed by `observe`: the tool's provides is wrapped in `Observation T`.
+/// The upstream must be plain (not an Outcome).
+fn check_tool_observe(
+    name: &str,
+    positional: &[Expr],
+    reg: &Registry,
+    env: &mut env::Env,
+    flowed_in: Option<TypeExpr>,
+) -> Result<TypeExpr, CheckError> {
+    // Bare tool_observe in pipe tail: empty name, no positional args.
+    // Just wrap the upstream in Observation.
+    if name.is_empty() && positional.is_empty() {
+        let inner = flowed_in.ok_or_else(|| CheckError::UnknownVar {
+            name: "bare tool_observe used outside a pipe".into(),
+        })?;
+        // Reject if upstream is already an Outcome.
+        if matches!(&inner, TypeExpr::App { head, args } if args.len() == 1
+            && (head.0 == "Observation" || head.0 == "Finish"))
+        {
+            return Err(CheckError::ToolObserveOnOutcome {
+                found: inner.to_string(),
+            });
+        }
+        return Ok(TypeExpr::App {
+            head: TypeName("Observation".into()),
+            args: vec![inner],
+        });
+    }
+    // Reject if upstream is an Outcome.
+    if let Some(ref up) = flowed_in {
+        if matches!(up, TypeExpr::App { head, args } if args.len() == 1
+            && (head.0 == "Observation" || head.0 == "Finish"))
+        {
+            return Err(CheckError::ToolObserveOnOutcome {
+                found: up.to_string(),
+            });
+        }
+    }
+    // Type-check like a tool call.
+    let tool_type = check_tool_call(name, positional, reg, env, flowed_in)?;
+    // Wrap in Observation.
+    Ok(TypeExpr::App {
+        head: TypeName("Observation".into()),
+        args: vec![tool_type],
     })
 }
 
