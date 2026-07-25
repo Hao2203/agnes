@@ -3,7 +3,7 @@
 //! real network.
 
 use agnes_builtins::register_builtins;
-use agnes_llm::{MockProvider, Planner, Provider, Role};
+use agnes_llm::{MockProvider, Observation, Planner, Provider, Role};
 use agnes_registry::Registry;
 use agnes_types::TypeName;
 use std::sync::Arc;
@@ -86,11 +86,13 @@ async fn observation_message_uses_xml_wrapper_with_type_name() {
     ]);
     p.begin_user_turn("do it".into());
     let d1 = p.plan_next().await.unwrap();
-    p.push_observation(
+    p.append_observations(
         d1,
-        "the summary".into(),
-        false,
-        Some(TypeName("Summary".into())),
+        vec![Observation {
+            text: "the summary".into(),
+            is_error: false,
+            type_name: Some(TypeName("Summary".into())),
+        }],
     );
     let _d2 = p.plan_next().await.unwrap();
 
@@ -119,7 +121,14 @@ async fn error_observation_uses_error_true_attribute() {
     ]);
     p.begin_user_turn("do it".into());
     let d1 = p.plan_next().await.unwrap();
-    p.push_observation(d1, "parse: unknown tool 'bogus'".into(), true, None);
+    p.append_observations(
+        d1,
+        vec![Observation {
+            text: "parse: unknown tool 'bogus'".into(),
+            is_error: true,
+            type_name: None,
+        }],
+    );
     let _ = p.plan_next().await.unwrap();
 
     let seen = mock.seen();
@@ -145,9 +154,23 @@ async fn message_chain_alternates_roles_after_multiple_iterations() {
     ]);
     p.begin_user_turn("try it".into());
     let d1 = p.plan_next().await.unwrap();
-    p.push_observation(d1, "A".into(), false, None);
+    p.append_observations(
+        d1,
+        vec![Observation {
+            text: "A".into(),
+            is_error: false,
+            type_name: None,
+        }],
+    );
     let d2 = p.plan_next().await.unwrap();
-    p.push_observation(d2, "B".into(), false, None);
+    p.append_observations(
+        d2,
+        vec![Observation {
+            text: "B".into(),
+            is_error: false,
+            type_name: None,
+        }],
+    );
     let _ = p.plan_next().await.unwrap();
 
     let seen = mock.seen();
@@ -229,4 +252,128 @@ async fn old_turns_beyond_six_collapse_into_prior_context() {
         .iter()
         .any(|m| m.content == "nl 1" && matches!(m.role, Role::User));
     assert!(has_nl1_user, "turn 1 should still be in messages verbatim");
+}
+
+#[tokio::test]
+async fn multiple_observations_per_iteration_produce_separate_user_messages() {
+    // A single iteration can emit multiple observations (tool_observe
+    // snapshots plus the final observe). Each one becomes a separate
+    // user message following the assistant DSL message.
+    let (mut p, mock) = planner_with(vec![
+        "```agnes\n(pipe (tool_observe read-file \"a.txt\") (fmap observe))\n```".into(),
+        "```agnes\n(pipe \"done\" finish)\n```".into(),
+    ]);
+    p.begin_user_turn("multi-obs".into());
+    let d1 = p.plan_next().await.unwrap();
+    p.append_observations(
+        d1,
+        vec![
+            Observation {
+                text: "file contents".into(),
+                is_error: false,
+                type_name: Some(TypeName("String".into())),
+            },
+            Observation {
+                text: "fmap result".into(),
+                is_error: false,
+                type_name: Some(TypeName("String".into())),
+            },
+        ],
+    );
+    let _ = p.plan_next().await.unwrap();
+
+    let seen = mock.seen();
+    let msgs2 = &seen[1].messages;
+
+    // Count observation messages — should be two, each user role.
+    let obs_msgs: Vec<_> = msgs2
+        .iter()
+        .filter(|m| m.content.contains("<observation"))
+        .collect();
+    assert_eq!(obs_msgs.len(), 2, "expected two observation messages");
+    for m in &obs_msgs {
+        assert!(
+            matches!(m.role, Role::User),
+            "observation message must have user role"
+        );
+    }
+
+    // Both observations must contain the right content.
+    let all_obs_text: String = obs_msgs.iter().map(|m| m.content.clone()).collect();
+    assert!(all_obs_text.contains("file contents"));
+    assert!(all_obs_text.contains("fmap result"));
+    assert!(all_obs_text.contains("type=\"String\""));
+
+    // The first observation message must immediately follow the assistant
+    // message for that iteration.
+    let first_assistant_idx = msgs2
+        .iter()
+        .position(|m| matches!(m.role, Role::Assistant))
+        .expect("no assistant message");
+    assert!(
+        msgs2[first_assistant_idx + 1]
+            .content
+            .contains("<observation"),
+        "first observation must immediately follow the assistant message"
+    );
+}
+
+#[tokio::test]
+async fn executed_dsl_echoes_instead_of_assistant_dsl() {
+    // When executed_dsl is set on an iteration, the assistant message
+    // content must use the pruned DSL, not the original assistant_dsl.
+    let (mut p, mock) = planner_with(vec![
+        "```agnes\n(if true (pipe \"yes\" finish) (pipe \"no\" finish))\n```".into(),
+        "```agnes\n(pipe \"done\" finish)\n```".into(),
+    ]);
+    p.begin_user_turn("prune test".into());
+    let d1 = p.plan_next().await.unwrap();
+    // Simulate branch pruning: the executed form is just the true branch.
+    p.set_executed_dsl("(pipe \"yes\" finish)".into());
+    p.append_observations(
+        d1,
+        vec![Observation {
+            text: "yes".into(),
+            is_error: false,
+            type_name: Some(TypeName("String".into())),
+        }],
+    );
+    let _ = p.plan_next().await.unwrap();
+
+    let seen = mock.seen();
+    let msgs2 = &seen[1].messages;
+
+    // The first assistant message should contain the pruned DSL.
+    let first_assistant = msgs2
+        .iter()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .expect("no assistant message");
+    assert!(
+        first_assistant.content.contains("(pipe \"yes\" finish)"),
+        "assistant message should echo executed (pruned) DSL, got: {}",
+        first_assistant.content
+    );
+    // And should NOT contain the original (unpruned) if-expression.
+    assert!(
+        !first_assistant.content.contains("(if true"),
+        "assistant message should NOT contain original unpruned DSL"
+    );
+}
+
+#[tokio::test]
+async fn system_prompt_mentions_fmap_and_tool_observe() {
+    let (mut p, mock) = planner_with(vec!["```agnes\n(finish \"hi\")\n```".into()]);
+    p.begin_user_turn("hi".into());
+    let _ = p.plan_next().await.unwrap();
+    let seen = mock.seen();
+    let sys = seen[0].system.as_deref().unwrap_or("");
+
+    assert!(
+        sys.contains("(fmap X)"),
+        "system prompt missing fmap special form"
+    );
+    assert!(
+        sys.contains("(tool_observe"),
+        "system prompt missing tool_observe special form"
+    );
 }

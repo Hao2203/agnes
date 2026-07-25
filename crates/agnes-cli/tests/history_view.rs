@@ -2,10 +2,11 @@ use agnes_cli::history_view::render_history;
 use agnes_llm::{Iteration, Observation, Turn, TurnOutcome};
 use agnes_types::TypeName;
 
-fn iter(dsl: &str, obs: Option<Observation>) -> Iteration {
+fn iter(dsl: &str, obs: Vec<Observation>) -> Iteration {
     Iteration {
         assistant_dsl: dsl.into(),
-        observation: obs,
+        observations: obs,
+        executed_dsl: None,
     }
 }
 
@@ -28,7 +29,7 @@ fn empty_history_prints_nothing() {
 fn single_turn_single_iteration_finished_prints_expected() {
     let turns = vec![Turn {
         user_nl: "read notes".into(),
-        iterations: vec![iter("(pipe \"notes.md\" (tool read-file) finish)", None)],
+        iterations: vec![iter("(pipe \"notes.md\" (tool read-file) finish)", vec![])],
         outcome: TurnOutcome::Finished {
             result: "notes contents".into(),
         },
@@ -49,9 +50,9 @@ fn multi_iteration_turn_shows_observations_between_dsls() {
         iterations: vec![
             iter(
                 "(pipe (tool read-file \"x\") observe)",
-                Some(obs("hello world", false, Some("String"))),
+                vec![obs("hello world", false, Some("String"))],
             ),
-            iter("(pipe \"text\" (tool translate \"ja\") finish)", None),
+            iter("(pipe \"text\" (tool translate \"ja\") finish)", vec![]),
         ],
         outcome: TurnOutcome::Finished {
             result: "こんにちは".into(),
@@ -63,7 +64,7 @@ fn multi_iteration_turn_shows_observations_between_dsls() {
     // Two iterations, one observation.
     assert!(s.contains("iter 0:"));
     assert!(s.contains("iter 1:"));
-    assert!(s.contains("obs (String): hello world"));
+    assert!(s.contains("obs[0] (String): hello world"));
     assert!(s.contains("outcome: Finished: こんにちは"));
 }
 
@@ -74,9 +75,9 @@ fn error_observations_are_flagged() {
         iterations: vec![
             iter(
                 "(pipe (tool bogus) observe)",
-                Some(obs("parse: unknown tool bogus", true, None)),
+                vec![obs("parse: unknown tool bogus", true, None)],
             ),
-            iter("(pipe \"ok\" finish)", None),
+            iter("(pipe \"ok\" finish)", vec![]),
         ],
         outcome: TurnOutcome::Finished {
             result: "ok".into(),
@@ -85,18 +86,38 @@ fn error_observations_are_flagged() {
     let mut out = Vec::new();
     render_history(&turns, &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("obs (error): parse: unknown tool bogus"));
+    assert!(s.contains("obs[0] (error): parse: unknown tool bogus"));
 }
 
 #[test]
 fn turn_limit_exceeded_outcome_is_labelled() {
     let turns = vec![Turn {
         user_nl: "spinny".into(),
-        iterations: vec![iter("(pipe x observe)", Some(obs("x", false, None)))],
+        iterations: vec![iter("(pipe x observe)", vec![obs("x", false, None)])],
         outcome: TurnOutcome::TurnLimitExceeded,
     }];
     let mut out = Vec::new();
     render_history(&turns, &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("outcome: TurnLimitExceeded"));
+}
+
+#[test]
+fn multiple_observations_per_iteration_are_indexed() {
+    let turns = vec![Turn {
+        user_nl: "multi obs".into(),
+        iterations: vec![iter(
+            "(pipe (tool_observe foo) (fmap observe))",
+            vec![
+                obs("tool result", false, Some("Int")),
+                obs("fmap result", false, Some("String")),
+            ],
+        )],
+        outcome: TurnOutcome::TurnLimitExceeded,
+    }];
+    let mut out = Vec::new();
+    render_history(&turns, &mut out).unwrap();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("obs[0] (Int): tool result"));
+    assert!(s.contains("obs[1] (String): fmap result"));
 }

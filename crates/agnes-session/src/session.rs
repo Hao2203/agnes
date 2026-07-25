@@ -3,7 +3,7 @@ use crate::events::{EventSink, SessionEvent, SharedSink, SinkHandle};
 use crate::plan_tree::build_plan_tree;
 use crate::tracer_bridge::ChannelTracer;
 use agnes_builtins::{PathResolver, Sink, ToolCtx, ToolImpl, native_dispatch, register_builtins};
-use agnes_llm::{Planner, Provider, Turn};
+use agnes_llm::{Observation, Planner, Provider, Turn};
 use agnes_registry::Registry;
 use agnes_runtime::execute_with;
 use agnes_types::Value;
@@ -332,7 +332,7 @@ impl Session {
                     // We didn't go through plan_next, but the Planner still
                     // needs to know about this assistant turn. Feed it in
                     // synthetically: append an iteration whose assistant_dsl
-                    // is the raw source. push_observation / record_finish
+                    // is the raw source. append_observations / record_finish
                     // in the branches below will operate on this iteration.
                     self.planner.inject_assistant_dsl(s.clone());
                     s
@@ -363,8 +363,14 @@ impl Session {
                                 is_error: false,
                             })
                             .await;
-                            self.planner
-                                .push_observation(dsl.clone(), text, false, inner_type);
+                            self.planner.append_observations(
+                                dsl.clone(),
+                                vec![Observation {
+                                    text,
+                                    is_error: false,
+                                    type_name: inner_type,
+                                }],
+                            );
                             // Loop continues to next iteration
                             iter += 1;
                         }
@@ -395,7 +401,14 @@ impl Session {
                         is_error: true,
                     })
                     .await;
-                    self.planner.push_observation(dsl, text, true, None);
+                    self.planner.append_observations(
+                        dsl,
+                        vec![Observation {
+                            text,
+                            is_error: true,
+                            type_name: None,
+                        }],
+                    );
                     // Loop continues; do NOT drain writes here — a failed
                     // iteration should not leak writes into the next.
                     let _ = Self::drain_writes();

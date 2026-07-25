@@ -9,7 +9,7 @@ pub fn render_history(turns: &[Turn], out: &mut dyn Write) -> std::io::Result<()
         writeln!(out, "user: {}", t.user_nl)?;
         for (j, it) in t.iterations.iter().enumerate() {
             writeln!(out, "iter {j}: {}", it.assistant_dsl)?;
-            if let Some(obs) = &it.observation {
+            for (k, obs) in it.observations.iter().enumerate() {
                 let label = if obs.is_error {
                     "error".to_string()
                 } else {
@@ -18,7 +18,7 @@ pub fn render_history(turns: &[Turn], out: &mut dyn Write) -> std::io::Result<()
                         .map(|n| n.0.clone())
                         .unwrap_or_else(|| "?".to_string())
                 };
-                writeln!(out, "  obs ({label}): {}", obs.text)?;
+                writeln!(out, "  obs[{k}] ({label}): {}", obs.text)?;
             }
         }
         match &t.outcome {

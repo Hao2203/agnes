@@ -15,13 +15,22 @@ pub struct Turn {
     pub outcome: TurnOutcome,
 }
 
-/// A single (assistant DSL, resulting observation) pair inside a turn.
-/// `observation.is_none()` on the LAST iteration means that DSL was the
-/// terminating one (Finish or implicit).
+/// A single iteration inside a turn: assistant DSL plus any number of
+/// observations generated during execution (tool_observe snapshots, plus
+/// the final `observe` if applicable).
+///
+/// `observations` is empty on the final iteration of a finished turn
+/// (Finish or implicit finish).
 #[derive(Debug, Clone)]
 pub struct Iteration {
     pub assistant_dsl: String,
-    pub observation: Option<Observation>,
+    /// Observations collected during this iteration (tool_observe snapshots
+    /// plus the final observe). Empty for finish/implicit-finish iterations.
+    pub observations: Vec<Observation>,
+    /// Optional pruned DSL for echoing back to the LLM. When present, this
+    /// is the DSL that was actually executed after dead branches were
+    /// pruned. If None, `assistant_dsl` is used as the echo content.
+    pub executed_dsl: Option<String>,
 }
 
 /// What the runtime returned during an iteration (Observation branch) or
@@ -95,8 +104,8 @@ impl Planner {
     }
 
     /// Ask the LLM for the next DSL iteration. Appends `assistant(dsl)`
-    /// to the in-flight iterations (with observation=None until
-    /// `push_observation` or `record_finish` is called).
+    /// to the in-flight iterations (with empty observations until
+    /// `append_observations` or `record_finish` is called).
     pub async fn plan_next(&mut self) -> Result<String, PlannerError> {
         let messages = self.build_messages();
         let request = CompletionRequest {
@@ -134,44 +143,36 @@ impl Planner {
             .expect("plan_next called with no in-flight turn (missing begin_user_turn?)");
         inflight.iterations.push(Iteration {
             assistant_dsl: dsl.clone(),
-            observation: None,
+            observations: Vec::new(),
+            executed_dsl: None,
         });
         Ok(dsl)
     }
 
-    /// Attach an observation to the last in-flight iteration. If the
-    /// last iteration already has an observation (double push), that is
-    /// a caller bug — we panic loudly.
-    pub fn push_observation(
+    /// Append observations to the last in-flight iteration. Used for both
+    /// tool_observe snapshots (multiple per iteration) and the final
+    /// top-level observe. The `_dsl` parameter is kept for call-site
+    /// symmetry with `push_observation` / `record_finish`.
+    pub fn append_observations(
         &mut self,
         _dsl: String,
-        text: String,
-        is_error: bool,
-        type_name: Option<agnes_types::TypeName>,
+        obs: Vec<Observation>,
     ) {
         let inflight = self
             .inflight
             .as_mut()
-            .expect("push_observation with no in-flight turn");
+            .expect("append_observations with no in-flight turn");
         let last = inflight
             .iterations
             .last_mut()
-            .expect("push_observation with no iterations (missing plan_next?)");
-        assert!(
-            last.observation.is_none(),
-            "push_observation called twice on the same iteration"
-        );
-        last.observation = Some(Observation {
-            text,
-            is_error,
-            type_name,
-        });
+            .expect("append_observations with no iterations (missing plan_next?)");
+        last.observations.extend(obs);
     }
 
     /// Inject a pre-computed assistant DSL (from RawDsl input) into the
     /// in-flight turn as if `plan_next` had produced it. Does not call
     /// the provider. Behaves identically to `plan_next` from the caller's
-    /// perspective: the next `push_observation` / `record_finish` will
+    /// perspective: the next `append_observations` / `record_finish` will
     /// attach to this synthetic iteration.
     pub fn inject_assistant_dsl(&mut self, dsl: String) {
         let inflight = self
@@ -180,8 +181,24 @@ impl Planner {
             .expect("inject_assistant_dsl with no in-flight turn");
         inflight.iterations.push(Iteration {
             assistant_dsl: dsl,
-            observation: None,
+            observations: Vec::new(),
+            executed_dsl: None,
         });
+    }
+
+    /// Set the executed (branch-pruned) DSL on the last in-flight
+    /// iteration. This is what will be echoed back to the LLM instead
+    /// of the raw `assistant_dsl`.
+    pub fn set_executed_dsl(&mut self, dsl: String) {
+        let inflight = self
+            .inflight
+            .as_mut()
+            .expect("set_executed_dsl with no in-flight turn");
+        let last = inflight
+            .iterations
+            .last_mut()
+            .expect("set_executed_dsl with no iterations (missing plan_next?)");
+        last.executed_dsl = Some(dsl);
     }
 
     /// Commit the in-flight turn as Finished. Consumes `inflight`.
@@ -201,10 +218,9 @@ impl Planner {
             last.assistant_dsl, dsl,
             "record_finish dsl must match the last iteration's assistant_dsl"
         );
-        assert!(
-            last.observation.is_none(),
-            "record_finish called on an iteration that already has an observation"
-        );
+        // Finish iterations typically have no observations, but we don't
+        // assert it — any collected observations are simply not echoed
+        // further once the turn commits.
         self.history.push(Turn {
             user_nl: inflight.user_nl,
             iterations: inflight.iterations,
@@ -263,11 +279,12 @@ impl Planner {
                 content: turn.user_nl.clone(),
             });
             for it in &turn.iterations {
+                let dsl = it.executed_dsl.as_ref().unwrap_or(&it.assistant_dsl);
                 out.push(Message {
                     role: Role::Assistant,
-                    content: format!("```agnes\n{}\n```", it.assistant_dsl),
+                    content: format!("```agnes\n{}\n```", dsl),
                 });
-                if let Some(obs) = &it.observation {
+                for obs in &it.observations {
                     out.push(Message {
                         role: Role::User,
                         content: wrap_observation(obs),
@@ -281,11 +298,12 @@ impl Planner {
                 content: inflight.user_nl.clone(),
             });
             for it in &inflight.iterations {
+                let dsl = it.executed_dsl.as_ref().unwrap_or(&it.assistant_dsl);
                 out.push(Message {
                     role: Role::Assistant,
-                    content: format!("```agnes\n{}\n```", it.assistant_dsl),
+                    content: format!("```agnes\n{}\n```", dsl),
                 });
-                if let Some(obs) = &it.observation {
+                for obs in &it.observations {
                     out.push(Message {
                         role: Role::User,
                         content: wrap_observation(obs),
@@ -360,6 +378,13 @@ Loop protocol:
 Grammar cheatsheet — these are the SPECIAL FORMS (not tools):
   * `(finish X)` — terminate this turn with `X` as the result.
   * `(observe X)` — return `X` as an observation, continue the loop.
+  * `(fmap X)` — lift expression `X` over an Observation (or Finish).
+    Use after `tool_observe` to keep transforming the observed value
+    without ending the pipe.
+  * `(tool_observe NAME ARGS...)` — run a tool and surface its result
+    to you as an observation, without ending the pipe. The pipe
+    continues with the tool's result wrapped in Observation.
+    `(tool_observe)` as a bare pipe tail snapshots the upstream value.
   * `(pipe e1 e2 ... eN)` — thread each expression's result into the
     next. Bare `finish` / `observe` as a pipe tail is shorthand for
     `(finish <upstream>)` / `(observe <upstream>)`.

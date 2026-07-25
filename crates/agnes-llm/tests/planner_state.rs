@@ -34,7 +34,7 @@ async fn plan_next_appends_assistant_dsl_to_inflight_iterations() {
 }
 
 #[tokio::test]
-async fn push_observation_attaches_to_last_iteration() {
+async fn append_observations_attaches_to_last_iteration() {
     let mut p = planner_with(vec![
         "```agnes\n(pipe (tool summarize \"x\") observe)\n```".into(),
         "```agnes\n(pipe \"done\" finish)\n```".into(),
@@ -42,11 +42,13 @@ async fn push_observation_attaches_to_last_iteration() {
     p.begin_user_turn("...".into());
 
     let dsl1 = p.plan_next().await.unwrap();
-    p.push_observation(
+    p.append_observations(
         dsl1,
-        "the summary".into(),
-        false,
-        Some(TypeName("Summary".into())),
+        vec![Observation {
+            text: "the summary".into(),
+            is_error: false,
+            type_name: Some(TypeName("Summary".into())),
+        }],
     );
 
     // Still not committed.
@@ -72,8 +74,12 @@ async fn record_finish_commits_the_turn_with_finished_outcome() {
     let it: &Iteration = &t.iterations[0];
     assert_eq!(it.assistant_dsl, dsl);
     assert!(
-        it.observation.is_none(),
-        "final iteration has no observation"
+        it.observations.is_empty(),
+        "final iteration has no observations"
+    );
+    assert!(
+        it.executed_dsl.is_none(),
+        "final iteration has no executed_dsl by default"
     );
     match &t.outcome {
         TurnOutcome::Finished { result } => assert_eq!(result, "ok"),
@@ -89,9 +95,23 @@ async fn abandon_pending_turn_stamps_turn_limit_exceeded() {
     ]);
     p.begin_user_turn("won't finish".into());
     let d1 = p.plan_next().await.unwrap();
-    p.push_observation(d1, "a".into(), false, None);
+    p.append_observations(
+        d1,
+        vec![Observation {
+            text: "a".into(),
+            is_error: false,
+            type_name: None,
+        }],
+    );
     let d2 = p.plan_next().await.unwrap();
-    p.push_observation(d2, "b".into(), false, None);
+    p.append_observations(
+        d2,
+        vec![Observation {
+            text: "b".into(),
+            is_error: false,
+            type_name: None,
+        }],
+    );
 
     p.abandon_pending_turn();
     let hist = p.history();
