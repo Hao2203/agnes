@@ -1,10 +1,12 @@
 //! Built-in types, aliases, and tool implementations for MVP.
 
 mod aliases;
+mod observations;
 mod shows;
 mod tools;
 mod types;
 
+pub use observations::{observations, ObservationRecord};
 pub use tools::{BoxFuture, Tool, ToolCtx, ToolFn, ToolImpl, PathResolver, Sink, native_dispatch, writes};
 
 use agnes_registry::{Registry, RegistryError};
