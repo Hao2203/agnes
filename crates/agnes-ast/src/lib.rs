@@ -7,7 +7,7 @@ use std::fmt;
 
 /// Byte-offset span into the original source (inclusive start, exclusive end).
 /// Opaque to downstream crates; parser produces them, error renderers consume them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -223,6 +223,8 @@ impl fmt::Display for TypeExprAst {
         }
     }
 }
+
+pub mod display;
 
 #[cfg(test)]
 mod tests {
