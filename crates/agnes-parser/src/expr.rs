@@ -99,6 +99,8 @@ pub fn parse_expr(v: &lexpr::Value, span: Span) -> Result<Expr, ParseError> {
             span,
             value: Some(Box::new(v)),
         }),
+        "fmap" => parse_fmap(rest, span),
+        "tool_observe" => parse_tool_observe(rest, span),
         other => Err(ParseError {
             span,
             message: format!("unknown expression head `{other}`"),
@@ -136,6 +138,11 @@ fn parse_pipe_steps(items: &[lexpr::Value], span: Span) -> Result<Vec<Expr>, Par
         .map(|i| match i.as_symbol() {
             Some("finish") => Ok(Expr::Finish { span, value: None }),
             Some("observe") => Ok(Expr::Observe { span, value: None }),
+            Some("tool_observe") => Ok(Expr::ToolObserve {
+                span,
+                name: String::new(),
+                positional: vec![],
+            }),
             Some(sym) if sym != "nil" => Ok(Expr::Tool {
                 span,
                 name: sym.to_string(),
@@ -178,6 +185,37 @@ fn parse_tool(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {
         .to_string();
     let positional = parse_exprs(&rest[1..], span)?;
     Ok(Expr::Tool {
+        span,
+        name,
+        positional,
+    })
+}
+
+fn parse_fmap(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {
+    if rest.len() != 1 {
+        return Err(ParseError {
+            span,
+            message: format!("fmap takes exactly one child expression; got {}", rest.len()),
+        });
+    }
+    let inner = parse_expr(&rest[0], span)?;
+    Ok(Expr::Fmap {
+        span,
+        value: Box::new(inner),
+    })
+}
+
+fn parse_tool_observe(rest: &[lexpr::Value], span: Span) -> Result<Expr, ParseError> {
+    let name = rest
+        .first()
+        .and_then(|v| v.as_symbol())
+        .ok_or_else(|| ParseError {
+            span,
+            message: "tool_observe: tool name expected".into(),
+        })?
+        .to_string();
+    let positional = parse_exprs(&rest[1..], span)?;
+    Ok(Expr::ToolObserve {
         span,
         name,
         positional,

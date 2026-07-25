@@ -134,6 +134,26 @@ fn check_expr(
         Expr::Observe { value, .. } => {
             check_wrap(value, "Observation", "observe", reg, env, flowed_in)
         }
+        Expr::Fmap { value, .. } => {
+            // Placeholder: fmap lifts over an upstream Outcome.
+            // The child is checked with no flowed_in (the inner type comes
+            // from unwrapping the upstream). Full type-checking is done in
+            // a later task; for now, just check the child and return Unknown.
+            let _ = check_expr(value, reg, env, None, None)?;
+            Ok(TypeExpr::Named(TypeName("Unknown".into())))
+        }
+        Expr::ToolObserve {
+            name,
+            positional,
+            ..
+        } => {
+            // Check the inner tool call, then wrap in Observation.
+            let inner = check_tool_call(name, positional, reg, env, flowed_in)?;
+            Ok(TypeExpr::App {
+                head: TypeName("Observation".into()),
+                args: vec![inner],
+            })
+        }
         Expr::Literal { lit, .. } => Ok(literal_type(lit)),
         Expr::Var { name, .. } => env
             .get(name)

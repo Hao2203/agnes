@@ -149,6 +149,24 @@ fn eval_node<'a>(
                     },
                 }
             }
+            NodeKind::Fmap => {
+                // Placeholder: fmap evaluates its child expression.
+                // Real fmap semantics (unwrapping upstream Outcome,
+                // applying child, re-wrapping) are implemented in a later task.
+                eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?
+            }
+            NodeKind::ToolObserve { .. } => {
+                // ToolObserve wraps the tool result in Observation.
+                let inner =
+                    eval_input(dag, &node.inputs[0], reg, dispatch, ctx, tracer, cache, env).await?;
+                Value {
+                    data: inner.data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("Observation".into()),
+                        args: vec![inner.declared_type],
+                    },
+                }
+            }
             NodeKind::Tool { name } => {
                 let args =
                     collect_kwargs(dag, &node.inputs, reg, dispatch, ctx, tracer, cache, env).await?;
@@ -492,6 +510,28 @@ fn eval_expr<'a>(
                     env,
                 )
                 .await
+            }
+            Expr::Fmap { value, .. } => {
+                // Placeholder: evaluate the child expression.
+                // Real fmap semantics come in a later task.
+                eval_expr(value, None, reg, dispatch, ctx, env).await
+            }
+            Expr::ToolObserve {
+                name,
+                positional,
+                ..
+            } => {
+                let kwargs =
+                    bind_tool_args(name, positional, flowed_in, reg, dispatch, ctx, env).await?;
+                let provides = tool_provides(reg, name);
+                let inner = call_native(name, kwargs, dispatch, ctx, reg, &provides).await?;
+                Ok(Value {
+                    data: inner.data,
+                    declared_type: TypeExpr::App {
+                        head: TypeName("Observation".into()),
+                        args: vec![inner.declared_type],
+                    },
+                })
             }
             Expr::Literal { lit, .. } => Ok(Value::typed(lit_to_json(lit), lit_type(lit))),
             Expr::Var { name, .. } => {

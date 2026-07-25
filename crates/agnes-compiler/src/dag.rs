@@ -37,6 +37,16 @@ pub enum NodeKind {
     /// `(observe X)` — wraps the child's runtime type in `Observation T`
     /// so the session loop feeds the value back to the planner.
     Observe,
+    /// `(fmap expr)` — functor lift: single input (the child expression).
+    /// Provides is `App { head: wrapper_head, args: [child_provides] }`
+    /// where `wrapper_head` is the upstream Outcome's head (Observation/Finish).
+    Fmap,
+    /// `(tool_observe name args...)` — tool + observe combinator.
+    /// Inputs are kwargs (like a Tool node). Provides is
+    /// `App { head: "Observation", args: [tool_provides] }`.
+    ToolObserve {
+        name: String,
+    },
     Literal(Literal),
     Var(String),
     /// `(list e1 e2 ...)` — inputs are one `Input::FromNode` per element.

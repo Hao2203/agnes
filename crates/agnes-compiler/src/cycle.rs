@@ -79,6 +79,17 @@ fn walk(e: &Expr, out: &mut HashSet<String>) {
                 walk(v, out);
             }
         }
+        Expr::Fmap { value, .. } => walk(value, out),
+        Expr::ToolObserve {
+            name,
+            positional,
+            ..
+        } => {
+            out.insert(name.clone());
+            for e in positional {
+                walk(e, out);
+            }
+        }
         Expr::List { items, .. } => items.iter().for_each(|s| walk(s, out)),
         Expr::Literal { .. } | Expr::Var { .. } => {}
     }

@@ -150,6 +150,37 @@ impl<'a> Lowering<'a> {
                 "observe",
                 NodeKind::Observe,
             ),
+            Expr::Fmap { value, .. } => {
+                // fmap lifts a child expression over an upstream Outcome.
+                // The child is lowered with no upstream (the piped upstream's
+                // inner value gets threaded in by the runtime). The provides
+                // is initially "Unknown" — the checker resolves it to the
+                // proper Outcome-wrapped type based on the pipe context.
+                let child = self.lower_expr(value, None)?;
+                let provides = TypeExpr::Named(agnes_types::TypeName("Unknown".into()));
+                Ok(self.add(NodeKind::Fmap, vec![Input::FromNode(child)], provides))
+            }
+            Expr::ToolObserve {
+                name,
+                positional,
+                ..
+            } => {
+                // tool_observe: run the tool, then wrap the result in Observation.
+                // First lower as a Tool, then add a ToolObserve wrapper node.
+                let tool_id = self.lower_tool(name, positional, upstream)?;
+                let tool_provides = self.nodes[tool_id.0].provides.clone();
+                let provides = TypeExpr::App {
+                    head: agnes_types::TypeName("Observation".into()),
+                    args: vec![tool_provides],
+                };
+                Ok(self.add(
+                    NodeKind::ToolObserve {
+                        name: name.to_string(),
+                    },
+                    vec![Input::FromNode(tool_id)],
+                    provides,
+                ))
+            }
             Expr::Literal { lit, .. } => {
                 let ty = match lit {
                     Literal::String(_) => "String",

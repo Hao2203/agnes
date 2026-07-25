@@ -151,6 +151,22 @@ pub enum Expr {
         span: Span,
         value: Option<Box<Expr>>,
     },
+    /// `(fmap expr)` — functor lift over an Outcome. Extracts the inner
+    /// value from an upstream `Observation T` (or `Finish T`), evaluates
+    /// `expr` with that inner value as the piped upstream, and re-wraps
+    /// the result in the same Outcome, preserving the mode.
+    Fmap {
+        span: Span,
+        value: Box<Expr>,
+    },
+    /// `(tool_observe name args...)` — combinator: run the named tool,
+    /// snapshot the result for LLM feedback, wrap in `Observation T`.
+    /// Non-terminal — the pipe continues via `fmap`.
+    ToolObserve {
+        span: Span,
+        name: String,
+        positional: Vec<Expr>,
+    },
     /// A literal in expression position.
     Literal { span: Span, lit: Literal },
     /// A reference to a bound name (from `let` or a `define` param).
@@ -175,6 +191,8 @@ impl Expr {
             | Expr::Return { span, .. }
             | Expr::Finish { span, .. }
             | Expr::Observe { span, .. }
+            | Expr::Fmap { span, .. }
+            | Expr::ToolObserve { span, .. }
             | Expr::Literal { span, .. }
             | Expr::Var { span, .. }
             | Expr::List { span, .. } => *span,

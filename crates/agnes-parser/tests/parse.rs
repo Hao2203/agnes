@@ -312,6 +312,71 @@ fn positional_tool_call_parses() {
 }
 
 #[test]
+fn parse_fmap_form() {
+    let prog = agnes_parser::parse("(fmap (tool summarize))").unwrap();
+    let main = prog.main.unwrap();
+    match main {
+        agnes_ast::Expr::Fmap { value, .. } => {
+            match *value {
+                agnes_ast::Expr::Tool { name, .. } => assert_eq!(name, "summarize"),
+                other => panic!("expected Tool, got {other:?}"),
+            }
+        }
+        other => panic!("expected Fmap, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tool_observe_form() {
+    let prog = agnes_parser::parse("(tool_observe read-file \"x\")").unwrap();
+    let main = prog.main.unwrap();
+    match main {
+        agnes_ast::Expr::ToolObserve { name, positional, .. } => {
+            assert_eq!(name, "read-file");
+            assert_eq!(positional.len(), 1);
+        }
+        other => panic!("expected ToolObserve, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_pipe_with_fmap() {
+    let prog = agnes_parser::parse(
+        "(pipe (tool_observe read-file \"x\") (fmap (tool summarize)))"
+    ).unwrap();
+    let main = prog.main.unwrap();
+    match main {
+        agnes_ast::Expr::Pipe { steps, .. } => {
+            assert_eq!(steps.len(), 2);
+            assert!(matches!(steps[0], agnes_ast::Expr::ToolObserve { .. }));
+            assert!(matches!(steps[1], agnes_ast::Expr::Fmap { .. }));
+        }
+        other => panic!("expected Pipe, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_bare_tool_observe_in_pipe_tail() {
+    let prog = agnes_parser::parse(
+        "(pipe (tool read-file \"x\") tool_observe)"
+    ).unwrap();
+    let main = prog.main.unwrap();
+    match main {
+        agnes_ast::Expr::Pipe { steps, .. } => {
+            assert_eq!(steps.len(), 2);
+            match &steps[1] {
+                agnes_ast::Expr::ToolObserve { name, positional, .. } => {
+                    assert!(name.is_empty());
+                    assert!(positional.is_empty());
+                }
+                other => panic!("expected ToolObserve, got {other:?}"),
+            }
+        }
+        other => panic!("expected Pipe, got {other:?}"),
+    }
+}
+
+#[test]
 fn keyword_args_are_rejected() {
     // After the refactor :kw value is no longer valid syntax in a tool call.
     // `:path` is a keyword with no preceding positional meaning here, so the
