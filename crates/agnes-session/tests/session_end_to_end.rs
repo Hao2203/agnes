@@ -275,3 +275,107 @@ async fn write_summary_still_emitted_before_turn_result() {
     // Clean up
     let _ = tokio::fs::remove_file(path).await;
 }
+
+#[tokio::test]
+async fn tool_observe_with_fmap_produces_multiple_observations() {
+    let _g = test_lock().lock().unwrap();
+    let path = "test-obs-fmap-multi.tmp";
+    let _ = tokio::fs::write(path, "hello from tool_observe").await;
+
+    // Provider response order:
+    // 1. Planner returns the DSL for iter 0
+    // 2. `summarize` tool called via fmap
+    // 3. Planner returns the DSL for iter 1 (finish)
+    let dsl0 = format!(
+        "```agnes\n(pipe (tool_observe read-file \"{}\") (fmap (tool summarize)) observe)\n```",
+        path
+    );
+    let mut s = Session::new(provider(vec![
+        dsl0.as_str(),
+        "summarized: hello",
+        "```agnes\n(pipe \"done\" finish)\n```",
+    ]))
+    .unwrap();
+    let sink = RecordingSink::default();
+    let shared = sink.shared();
+    let v = s
+        .run_turn(TurnInput::NaturalLanguage("go".into()), Box::new(sink))
+        .await
+        .unwrap();
+    assert_eq!(v.data.as_str(), Some("done"));
+
+    let evs = shared.lock().unwrap().clone();
+    // Two iterations: iter 0 (observation) and iter 1 (finish).
+    let iter_count = evs
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::IterationStart { .. }))
+        .count();
+    assert_eq!(iter_count, 2);
+    // Iteration 0 should have at least one ObservationEmitted.
+    let has_obs0 = evs.iter().any(|e| {
+        matches!(
+            e,
+            SessionEvent::ObservationEmitted {
+                iter: 0,
+                is_error: false,
+                ..
+            }
+        )
+    });
+    assert!(
+        has_obs0,
+        "expected ObservationEmitted for iter 0, got {evs:?}"
+    );
+
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn finish_drains_and_discards_tool_observe_snapshots() {
+    let _g = test_lock().lock().unwrap();
+    let path = "test-finish-discard-snapshots.tmp";
+    let _ = tokio::fs::write(path, "discard me").await;
+
+    // Iter 0: tool_observe read-file + observe (produces Observation, snapshots fed back).
+    // Iter 1: finish (drains and discards any remaining snapshots).
+    let dsl0 = format!(
+        "```agnes\n(pipe (tool_observe read-file \"{}\") observe)\n```",
+        path
+    );
+    let mut s = Session::new(provider(vec![
+        dsl0.as_str(),
+        "```agnes\n(pipe \"done\" finish)\n```",
+    ]))
+    .unwrap();
+    let sink = RecordingSink::default();
+    let shared = sink.shared();
+    let v = s
+        .run_turn(TurnInput::NaturalLanguage("go".into()), Box::new(sink))
+        .await
+        .unwrap();
+    assert_eq!(v.data.as_str(), Some("done"));
+
+    let evs = shared.lock().unwrap().clone();
+    // Two iterations.
+    let iter_count = evs
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::IterationStart { .. }))
+        .count();
+    assert_eq!(iter_count, 2);
+    // Iteration 1 (finish) should NOT emit ObservationEmitted.
+    let obs_iter1 = evs.iter().any(|e| {
+        matches!(
+            e,
+            SessionEvent::ObservationEmitted {
+                iter: 1,
+                ..
+            }
+        )
+    });
+    assert!(
+        !obs_iter1,
+        "finish iteration should not emit observations, got {evs:?}"
+    );
+
+    let _ = tokio::fs::remove_file(path).await;
+}

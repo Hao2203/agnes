@@ -2,12 +2,15 @@ use crate::error::SessionError;
 use crate::events::{EventSink, SessionEvent, SharedSink, SinkHandle};
 use crate::plan_tree::build_plan_tree;
 use crate::tracer_bridge::ChannelTracer;
-use agnes_builtins::{PathResolver, Sink, ToolCtx, ToolImpl, native_dispatch, register_builtins};
+use agnes_ast::Span;
+use agnes_ast::display::render_expr;
+use agnes_builtins::{ObservationRecord, PathResolver, Sink, ToolCtx, ToolImpl, native_dispatch, observations, register_builtins};
+use agnes_compiler::NodeId;
 use agnes_llm::{Observation, Planner, Provider, Turn};
 use agnes_registry::Registry;
 use agnes_runtime::execute_with;
 use agnes_types::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -249,6 +252,14 @@ impl Session {
         )
     }
 
+    /// Drain the process-global observations recorder. Called at the end of
+    /// every iteration so that tool_observe snapshots are fed back to the
+    /// planner and never leak across iterations.
+    fn drain_observations() -> Vec<ObservationRecord> {
+        let mut recorder = observations().lock().unwrap();
+        std::mem::take(&mut *recorder)
+    }
+
     pub async fn run_turn(
         &mut self,
         input: TurnInput,
@@ -351,7 +362,7 @@ impl Session {
             let try_result = self.try_execute(&dsl, sink).await;
 
             match try_result {
-                Ok(value) => {
+                Ok((value, _visited, pruned_dsl)) => {
                     match classify_root(&value) {
                         RootKind::Observation => {
                             let inner_type = extract_inner_type(&value.declared_type);
@@ -363,14 +374,22 @@ impl Session {
                                 is_error: false,
                             })
                             .await;
-                            self.planner.append_observations(
-                                dsl.clone(),
-                                vec![Observation {
-                                    text,
-                                    is_error: false,
-                                    type_name: inner_type,
-                                }],
-                            );
+
+                            // Drain tool_observe snapshots from the global recorder
+                            // and combine with the final observe observation.
+                            let snapshots = Self::drain_observations();
+                            let mut all_obs = vec![Observation {
+                                text: text.clone(),
+                                is_error: false,
+                                type_name: inner_type,
+                            }];
+                            all_obs.extend(snapshots.into_iter().map(|r| Observation {
+                                text: Self::truncate_observation(r.text),
+                                is_error: false,
+                                type_name: r.type_name,
+                            }));
+                            self.planner.append_observations(dsl.clone(), all_obs);
+                            self.planner.set_executed_dsl(pruned_dsl);
                             // Loop continues to next iteration
                             iter += 1;
                         }
@@ -386,6 +405,12 @@ impl Session {
                                 value_type: value.declared_type.to_string(),
                             })
                             .await;
+                            // Drain and discard tool_observe snapshots — finish
+                            // iterations don't feed observations back to the planner.
+                            let _ = Self::drain_observations();
+                            // Set pruned DSL BEFORE record_finish because
+                            // record_finish consumes the in-flight turn.
+                            self.planner.set_executed_dsl(pruned_dsl);
                             self.planner.record_finish(dsl, s);
                             result = Some(Ok(value));
                             // Loop terminates immediately
@@ -412,6 +437,9 @@ impl Session {
                     // Loop continues; do NOT drain writes here — a failed
                     // iteration should not leak writes into the next.
                     let _ = Self::drain_writes();
+                    // Drain and discard tool_observe snapshots — error
+                    // iterations don't feed them back to the planner.
+                    let _ = Self::drain_observations();
                     iter += 1;
                 }
             }
@@ -430,11 +458,13 @@ impl Session {
 
     /// One iteration: parse/check/compile/execute a DSL. Emits DslProduced
     /// (already emitted by caller), PlanReady, NodeStart/NodeEnd via tracer.
+    /// Returns the value, the visited NodeId set, and the branch-pruned DSL
+    /// rendering.
     async fn try_execute(
         &mut self,
         dsl: &str,
         sink: &SinkHandle<'_>,
-    ) -> Result<Value, SessionError> {
+    ) -> Result<(Value, HashSet<NodeId>, String), SessionError> {
         let program = agnes_parser::parse(dsl).map_err(|e| SessionError::Parse(e.to_string()))?;
         let mut turn_registry = Registry::new();
         register_builtins(&mut turn_registry).map_err(|e| SessionError::Check(e.to_string()))?;
@@ -483,8 +513,27 @@ impl Session {
         // events before the caller emits TurnResult/Observation (ordering).
         drop(tracer);
         let _ = drain_handle.await;
-        let (value, _visited) = result?;
-        Ok(value)
+        let (value, visited) = result?;
+
+        // Compute the branch-pruned DSL: map visited NodeIds to their
+        // source Spans via the DAG's node_spans, then render the original
+        // AST expression with only visited spans.
+        let visited_spans: HashSet<Span> = visited
+            .iter()
+            .filter_map(|&node_id| {
+                if node_id.0 < dag.node_spans.len() {
+                    Some(dag.node_spans[node_id.0])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let pruned_dsl = match &program.main {
+            Some(main_expr) => render_expr(main_expr, &visited_spans),
+            None => String::new(),
+        };
+
+        Ok((value, visited, pruned_dsl))
     }
 }
 
