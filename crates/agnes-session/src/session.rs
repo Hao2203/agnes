@@ -377,17 +377,23 @@ impl Session {
 
                             // Drain tool_observe snapshots from the global recorder
                             // and combine with the final observe observation.
+                            // Snapshots come first (they were generated during
+                            // execution, before the final observe), then the
+                            // final observe value.
                             let snapshots = Self::drain_observations();
-                            let mut all_obs = vec![Observation {
+                            let mut all_obs: Vec<Observation> = snapshots
+                                .into_iter()
+                                .map(|r| Observation {
+                                    text: Self::truncate_observation(r.text),
+                                    is_error: false,
+                                    type_name: r.type_name,
+                                })
+                                .collect();
+                            all_obs.push(Observation {
                                 text: text.clone(),
                                 is_error: false,
                                 type_name: inner_type,
-                            }];
-                            all_obs.extend(snapshots.into_iter().map(|r| Observation {
-                                text: Self::truncate_observation(r.text),
-                                is_error: false,
-                                type_name: r.type_name,
-                            }));
+                            });
                             self.planner.append_observations(dsl.clone(), all_obs);
                             self.planner.set_executed_dsl(pruned_dsl);
                             // Loop continues to next iteration

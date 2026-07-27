@@ -517,6 +517,26 @@ fn renders_fmap() {
 }
 
 #[test]
+fn fmap_renders_child_without_child_span_in_visited() {
+    // fmap's child is evaluated via eval_expr (not through the DAG), so
+    // its span is not in visited_spans. The child must still be rendered
+    // rather than producing "(fmap )".
+    let fmap_span = Span { start: 0, end: 10 };
+    let child_span = Span { start: 5, end: 6 };
+
+    let e = Expr::Fmap {
+        span: fmap_span,
+        value: Box::new(Expr::Var {
+            span: child_span,
+            name: "x".into(),
+        }),
+    };
+    // Only the fmap span is visited; the child span is NOT.
+    let out = render_expr(&e, &visited(&[fmap_span]));
+    assert_eq!(out, "(fmap x)", "fmap child must render even when its span is not visited");
+}
+
+#[test]
 fn renders_tool_observe_with_args() {
     let s = dummy_span();
     let e = Expr::ToolObserve {

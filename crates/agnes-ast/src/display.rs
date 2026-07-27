@@ -18,6 +18,13 @@ pub fn render_expr(e: &Expr, visited_spans: &HashSet<Span>) -> String {
     if !visited_spans.contains(&e.span()) {
         return String::new();
     }
+    render_expr_inner(e, visited_spans)
+}
+
+/// Render an expression unconditionally (no top-level span guard).
+/// Used for children of `fmap`, which are evaluated via `eval_expr`
+/// rather than through the DAG, so their spans are not in `visited_spans`.
+fn render_expr_inner(e: &Expr, visited_spans: &HashSet<Span>) -> String {
     match e {
         Expr::Tool {
             name, positional, ..
@@ -79,7 +86,9 @@ pub fn render_expr(e: &Expr, visited_spans: &HashSet<Span>) -> String {
             format!("(match {} {})", scrut_rendered, visited_arms.join(" "))
         }
         Expr::Fmap { value, .. } => {
-            format!("(fmap {})", render_expr(value, visited_spans))
+            // fmap's child is evaluated via eval_expr, not through the DAG,
+            // so its span is not in visited_spans. Render it unconditionally.
+            format!("(fmap {})", render_expr_inner(value, visited_spans))
         }
         Expr::ToolObserve {
             name, positional, ..

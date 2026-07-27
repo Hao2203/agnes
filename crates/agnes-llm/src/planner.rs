@@ -284,10 +284,16 @@ impl Planner {
                     role: Role::Assistant,
                     content: format!("```agnes\n{}\n```", dsl),
                 });
-                for obs in &it.observations {
+                if !it.observations.is_empty() {
+                    let content = it
+                        .observations
+                        .iter()
+                        .map(|obs| wrap_observation(obs))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
                     out.push(Message {
                         role: Role::User,
-                        content: wrap_observation(obs),
+                        content,
                     });
                 }
             }
@@ -303,10 +309,16 @@ impl Planner {
                     role: Role::Assistant,
                     content: format!("```agnes\n{}\n```", dsl),
                 });
-                for obs in &it.observations {
+                if !it.observations.is_empty() {
+                    let content = it
+                        .observations
+                        .iter()
+                        .map(|obs| wrap_observation(obs))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
                     out.push(Message {
                         role: Role::User,
-                        content: wrap_observation(obs),
+                        content,
                     });
                 }
             }

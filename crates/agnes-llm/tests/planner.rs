@@ -255,10 +255,11 @@ async fn old_turns_beyond_six_collapse_into_prior_context() {
 }
 
 #[tokio::test]
-async fn multiple_observations_per_iteration_produce_separate_user_messages() {
+async fn multiple_observations_per_iteration_merged_into_single_user_message() {
     // A single iteration can emit multiple observations (tool_observe
-    // snapshots plus the final observe). Each one becomes a separate
-    // user message following the assistant DSL message.
+    // snapshots plus the final observe). They are merged into a single
+    // user message (after the assistant DSL) to satisfy the Anthropic API
+    // role alternation requirement.
     let (mut p, mock) = planner_with(vec![
         "```agnes\n(pipe (tool_observe read-file \"a.txt\") (fmap observe))\n```".into(),
         "```agnes\n(pipe \"done\" finish)\n```".into(),
@@ -285,26 +286,25 @@ async fn multiple_observations_per_iteration_produce_separate_user_messages() {
     let seen = mock.seen();
     let msgs2 = &seen[1].messages;
 
-    // Count observation messages — should be two, each user role.
+    // Count observation messages — should be one, with user role.
     let obs_msgs: Vec<_> = msgs2
         .iter()
         .filter(|m| m.content.contains("<observation"))
         .collect();
-    assert_eq!(obs_msgs.len(), 2, "expected two observation messages");
-    for m in &obs_msgs {
-        assert!(
-            matches!(m.role, Role::User),
-            "observation message must have user role"
-        );
-    }
+    assert_eq!(obs_msgs.len(), 1, "expected a single merged observation message, got {obs_msgs:#?}");
 
-    // Both observations must contain the right content.
-    let all_obs_text: String = obs_msgs.iter().map(|m| m.content.clone()).collect();
-    assert!(all_obs_text.contains("file contents"));
-    assert!(all_obs_text.contains("fmap result"));
-    assert!(all_obs_text.contains("type=\"String\""));
+    let obs_msg = obs_msgs[0];
+    assert!(
+        matches!(obs_msg.role, Role::User),
+        "observation message must have user role"
+    );
 
-    // The first observation message must immediately follow the assistant
+    // Both observations must be present in the merged message.
+    assert!(obs_msg.content.contains("file contents"));
+    assert!(obs_msg.content.contains("fmap result"));
+    assert!(obs_msg.content.contains("type=\"String\""));
+
+    // The merged observation message must immediately follow the assistant
     // message for that iteration.
     let first_assistant_idx = msgs2
         .iter()
@@ -314,7 +314,7 @@ async fn multiple_observations_per_iteration_produce_separate_user_messages() {
         msgs2[first_assistant_idx + 1]
             .content
             .contains("<observation"),
-        "first observation must immediately follow the assistant message"
+        "merged observation must immediately follow the assistant message"
     );
 }
 
