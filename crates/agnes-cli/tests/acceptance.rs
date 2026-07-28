@@ -27,8 +27,13 @@ impl PathResolver for DummyResolver {
     fn resolve_path<'a>(&'a self, input: &'a str) -> agnes_builtins::BoxFuture<'a, Result<PathBuf, String>> {
         // Special case: the tests use "README.md" which exists at repo root
         if input == "README.md" {
-            // Hardcode the absolute path to README.md since we know it from env
-            let path = PathBuf::from("/home/hao/code/agnes/README.md");
+            // Resolve relative to workspace root (two levels up from this crate)
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let workspace_root = manifest_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("CARGO_MANIFEST_DIR must be under workspace root");
+            let path = workspace_root.join("README.md");
             Box::pin(async move { Ok(path) })
         } else {
             panic!("dummy resolver should not be called in this test");
@@ -84,8 +89,8 @@ async fn run_with(src: &str, responses: Vec<String>) -> Result<String, String> {
 }
 
 async fn seed_readme() -> String {
-    // Mock read-file has a seeded "README.md" entry; using that path avoids
-    // touching disk in tests.
+    // The real read-file tool reads from disk; DummyResolver resolves
+    // "README.md" to the workspace-root README.md via CARGO_MANIFEST_DIR.
     "README.md".to_string()
 }
 
