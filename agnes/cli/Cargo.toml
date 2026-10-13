@@ -1,0 +1,24 @@
+[package]
+name = "agnes-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agnes"
+path = "src/main.rs"
+
+[dependencies]
+agnes-core.workspace = true
+agnes-ports.workspace = true
+agnes-transport-reqwest.workspace = true
+agnes-llm-openai.workspace = true
+agnes-agent.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+jiff.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std"] }
+
+[lints]
+workspace = true
