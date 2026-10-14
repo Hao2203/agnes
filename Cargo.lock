@@ -29,6 +29,7 @@ dependencies = [
  "agnes-ports",
  "agnes-transport-reqwest",
  "anyhow",
+ "async-trait",
  "clap",
  "jiff",
  "tokio",

@@ -1,5 +1,6 @@
-//! Request/response data for one chat-completion round. Pure data — the
-//! port that carries them lives in `agnes-ports`.
+//! Model-call data for one chat-completion round: the prompt the state
+//! machine hands out, and the concrete request/response the port carries.
+//! Pure data — the port itself lives in `agnes-ports`.
 
 use crate::config::ModelName;
 use crate::content::Content;
@@ -7,12 +8,24 @@ use crate::message::{Message, TokenUsage, ToolCall};
 use crate::tool::ToolSpec;
 use agnes_util::NonEmpty;
 
-/// Everything the model needs for one completion round.
+/// The semantic model input for the next completion round: the conversation
+/// so far and the tools offered this round. The host attaches the model name
+/// to build the concrete [`LlmRequest`].
+#[derive(Debug, Clone)]
+pub struct Prompt {
+    /// The model input history — the system prompt, prior turns, tool calls
+    /// and their results, the goal.
+    pub input: Vec<Message>,
+    /// Tool definitions offered this round.
+    pub tools: Vec<ToolSpec>,
+}
+
+/// The concrete request the port carries: the semantic [`Prompt`] plus the
+/// model name the host wires in.
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
     pub model: ModelName,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolSpec>,
+    pub prompt: Prompt,
 }
 
 /// Why the model stopped — carrying the data that distinguishes the case,

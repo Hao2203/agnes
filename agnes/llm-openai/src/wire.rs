@@ -26,11 +26,17 @@ impl ChatCompletionRequest {
         Self {
             model: request.model.as_str().to_owned(),
             messages: request
-                .messages
+                .prompt
+                .input
                 .iter()
                 .map(WireMessage::from_core)
                 .collect(),
-            tools: request.tools.iter().map(WireTool::from_core).collect(),
+            tools: request
+                .prompt
+                .tools
+                .iter()
+                .map(WireTool::from_core)
+                .collect(),
         }
     }
 }
@@ -279,7 +285,7 @@ pub fn extract_error_body(body: &str) -> String {
 mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt};
-    use agnes_core::llm::LlmRequest;
+    use agnes_core::llm::{LlmRequest, Prompt};
     use agnes_core::message::{AssistantMessage, ToolOutput, Transcript};
 
     fn content(text: &str) -> Content {
@@ -290,9 +296,11 @@ mod tests {
     fn empty_request_serializes_without_tools() {
         let request = LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
-            messages: Transcript::new(SystemPrompt::new("sys"), content("hi"), Vec::new())
-                .into_messages(),
-            tools: Vec::new(),
+            prompt: Prompt {
+                input: Transcript::new(SystemPrompt::new("sys"), content("hi"), Vec::new())
+                    .into_messages(),
+                tools: Vec::new(),
+            },
         };
         let json = serde_json::to_value(ChatCompletionRequest::from_core(&request)).unwrap();
         let object = json.as_object().unwrap();

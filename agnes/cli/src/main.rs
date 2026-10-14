@@ -1,3 +1,5 @@
+mod input;
+
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -6,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use jiff::Timestamp;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::AsyncReadExt;
 
 use agnes_agent::tools::{ListDir, ReadFile, Shell, WriteFile};
 use agnes_agent::{Event, Sink};
@@ -15,9 +17,12 @@ use agnes_core::content::Content;
 use agnes_core::context::Context;
 use agnes_core::turn::Outcome;
 use agnes_llm_openai::OpenAiClient;
+use agnes_ports::input::Input;
 use agnes_ports::llm::Llm;
 use agnes_ports::tool::{Tool, ToolRegistry};
 use agnes_transport_reqwest::ReqwestTransport;
+
+use crate::input::{Line, UserInput};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
@@ -128,67 +133,63 @@ async fn real_main() -> anyhow::Result<()> {
             let goal = Content::try_from(goal.trim()).context(
                 "empty task: pass a task argument (`agnes run \"do X\"`) or pipe one in",
             )?;
-            let summary = run_task(
-                &client,
-                &registry,
+            let input = UserInput::new();
+            input::spawn_ctrl_c(&input);
+            input.begin_run();
+            let host = Host {
+                llm: &client,
+                registry: &registry,
                 model,
-                cli.max_turns,
-                goal,
-                Context::new(SystemPrompt::new(SYSTEM_PROMPT)),
-                EventPrinter::default(),
-            )
-            .await?;
+                max_turns: cli.max_turns,
+            };
+            let summary = host
+                .run_task(
+                    goal,
+                    Context::new(SystemPrompt::new(SYSTEM_PROMPT)),
+                    &*input,
+                    EventPrinter::default(),
+                )
+                .await?;
             print_summary(&summary);
         }
         Some(Command::Chat) | None => {
             println!(
                 "interactive session — each line is a task with full session memory; \
-                 /new resets the context, exit leaves"
+                 /new resets the context, Ctrl-C interrupts a running task, exit leaves"
             );
+            let input = UserInput::new();
+            input::spawn_stdin_reader(&input);
+            input::spawn_ctrl_c(&input);
+            let host = Host {
+                llm: &client,
+                registry: &registry,
+                model,
+                max_turns: cli.max_turns,
+            };
             let mut context = Context::new(SystemPrompt::new(SYSTEM_PROMPT));
-            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
             loop {
                 print!("agnes> ");
                 std::io::stdout().flush().ok();
-                let line = match read_line_lossy(&mut reader).await {
-                    Ok(Some(line)) => line,
-                    Ok(None) => break, // EOF (Ctrl-D)
-                    Err(err) => {
-                        eprintln!("error reading input: {err}");
-                        break;
+                match input.next().await {
+                    Line::Exit => break,
+                    Line::Reset => {
+                        context.reset();
+                        println!("(session cleared)");
                     }
-                };
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed == "exit" || trimmed == "quit" {
-                    break;
-                }
-                if trimmed == "/new" {
-                    context.reset();
-                    println!("(session cleared)");
-                    continue;
-                }
-                let Ok(goal) = Content::try_from(trimmed) else {
-                    continue;
-                };
-                match run_task(
-                    &client,
-                    &registry,
-                    model.clone(),
-                    cli.max_turns,
-                    goal,
-                    context.clone(),
-                    EventPrinter::default(),
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        print_summary(&summary);
-                        context = summary.context;
+                    Line::Task(goal) => {
+                        input.begin_run();
+                        let result = host
+                            .run_task(goal, context.clone(), &*input, EventPrinter::default())
+                            .await;
+                        input.end_run();
+                        match result {
+                            Ok(summary) => {
+                                print_summary(&summary);
+                                context = summary.context;
+                            }
+                            Err(err) => eprintln!("error: {err:#}"),
+                        }
                     }
-                    Err(err) => eprintln!("error: {err:#}"),
                 }
             }
         }
@@ -196,34 +197,16 @@ async fn real_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads one line as raw bytes and decodes lossily. Input methods and
-/// backspace editing can leave torn multi-byte sequences in a terminal's
-/// input buffer; decoding those must degrade to replacement characters, not
-/// abort the session.
-async fn read_line_lossy<R>(reader: &mut R) -> anyhow::Result<Option<String>>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    let mut bytes = Vec::new();
-    let n = reader.read_until(b'\n', &mut bytes).await?;
-    if n == 0 {
-        return Ok(None); // EOF
-    }
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
+/// The task for a one-shot `run`: the first line on a terminal, or all of a
+/// piped stdin.
 async fn read_goal_from_stdin() -> anyhow::Result<String> {
     if std::io::stdin().is_terminal() {
         print!("enter task (finish with Enter): ");
         std::io::stdout().flush().ok();
         let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-        Ok(read_line_lossy(&mut reader).await?.unwrap_or_default())
+        Ok(input::read_line_lossy(&mut reader)
+            .await?
+            .unwrap_or_default())
     } else {
         let mut buf = String::new();
         tokio::io::stdin()
@@ -234,30 +217,46 @@ async fn read_goal_from_stdin() -> anyhow::Result<String> {
     }
 }
 
-async fn run_task(
-    llm: &dyn Llm,
-    registry: &Arc<ToolRegistry>,
+/// The fixed wiring every task run needs: the model client, the tool
+/// registry, the model name and the turn budget.
+struct Host<'a> {
+    llm: &'a dyn Llm,
+    registry: &'a Arc<ToolRegistry>,
     model: ModelName,
     max_turns: u32,
-    goal: Content,
-    context: Context,
-    printer: EventPrinter,
-) -> anyhow::Result<agnes_agent::RunSummary> {
-    let budget: TurnBudget = max_turns
-        .to_string()
-        .parse()
-        .context("invalid --max-turns")?;
-    let config = agnes_core::turn::AgentConfig {
-        context,
-        goal,
-        model,
-        tools: registry.specs(),
-        budget,
-    };
-    let mut printer = printer;
-    agnes_agent::run(config, Arc::clone(registry), llm, &mut printer)
+}
+
+impl Host<'_> {
+    async fn run_task(
+        &self,
+        goal: Content,
+        context: Context,
+        input: &dyn Input,
+        printer: EventPrinter,
+    ) -> anyhow::Result<agnes_agent::RunSummary> {
+        let budget: TurnBudget = self
+            .max_turns
+            .to_string()
+            .parse()
+            .context("invalid --max-turns")?;
+        let config = agnes_core::turn::AgentConfig {
+            context,
+            goal,
+            tools: self.registry.specs(),
+            budget,
+        };
+        let mut printer = printer;
+        agnes_agent::run(
+            config,
+            self.model.clone(),
+            Arc::clone(self.registry),
+            self.llm,
+            input,
+            &mut printer,
+        )
         .await
         .map_err(anyhow::Error::new)
+    }
 }
 
 #[derive(Default)]
@@ -289,6 +288,9 @@ impl Sink for EventPrinter {
                     println!("  ✗ failed");
                 }
             }
+            Event::UserMessagesInjected { messages, .. } => {
+                println!("  ▸ injected {} queued message(s)", messages.len());
+            }
             Event::Finished { .. } => {}
         }
     }
@@ -299,6 +301,10 @@ fn print_summary(summary: &agnes_agent::RunSummary) {
         Outcome::Completed { reply } => {
             println!();
             println!("{reply}");
+        }
+        Outcome::Interrupted => {
+            println!();
+            println!("(stopped: interrupted by the user — session kept)");
         }
         Outcome::BudgetExhausted => {
             println!();

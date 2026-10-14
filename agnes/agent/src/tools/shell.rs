@@ -1,6 +1,7 @@
 //! Shell tool: runs `sh -c <command>` in the sandbox root. Opt-in — hosts
 //! construct it only when the user asked for it. Async via `tokio::process`,
-//! with a hard timeout.
+//! with a hard timeout; killing on drop means an interrupted run leaves no
+//! stray process behind.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -63,6 +64,7 @@ impl Tool for Shell {
             .arg("-c")
             .arg(&args.command)
             .current_dir(&self.root)
+            .kill_on_drop(true)
             .output();
         let output = tokio::time::timeout(COMMAND_TIMEOUT, child)
             .await

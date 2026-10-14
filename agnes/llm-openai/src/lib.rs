@@ -74,6 +74,7 @@ mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt, TurnBudget};
     use agnes_core::content::Content;
+    use agnes_core::llm::Prompt;
     use agnes_core::message::Transcript;
     use agnes_core::turn::{Agent, AgentConfig, ModelTurn};
     use std::num::NonZeroU32;
@@ -126,13 +127,15 @@ mod tests {
     fn sample_request() -> LlmRequest {
         LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
-            messages: Transcript::new(
-                SystemPrompt::new("sys"),
-                Content::try_from("do the thing").unwrap(),
-                Vec::new(),
-            )
-            .into_messages(),
-            tools: Vec::new(),
+            prompt: Prompt {
+                input: Transcript::new(
+                    SystemPrompt::new("sys"),
+                    Content::try_from("do the thing").unwrap(),
+                    Vec::new(),
+                )
+                .into_messages(),
+                tools: Vec::new(),
+            },
         }
     }
 
@@ -267,11 +270,15 @@ mod tests {
         let config = AgentConfig {
             context: agnes_core::context::Context::new(SystemPrompt::new("sys")),
             goal: Content::try_from("flip").unwrap(),
-            model: ModelName::from_str("gpt-test").unwrap(),
             tools: Vec::new(),
             budget: TurnBudget::new(NonZeroU32::new(4).unwrap()),
         };
-        let (agent, request) = Agent::new(config).start();
+        let model = ModelName::from_str("gpt-test").unwrap();
+        let (agent, prompt) = Agent::new(config).start();
+        let request = LlmRequest {
+            model: model.clone(),
+            prompt,
+        };
         let response = Llm::complete(&openai, &request).await.unwrap();
         let ModelTurn::NeedTools { agent, batch } = agent.model_responded(response).unwrap() else {
             panic!("expected NeedTools");
@@ -280,11 +287,12 @@ mod tests {
         let results = batch
             .complete(vec![agnes_core::message::ToolOutput::success("ok")])
             .unwrap();
-        let agnes_core::turn::ToolsTurn::NeedModel { agent, request } =
-            agent.tools_resolved(results).unwrap()
+        let agnes_core::turn::ToolsTurn::NeedModel { agent, prompt } =
+            agent.tools_resolved(results, Vec::new()).unwrap()
         else {
             panic!("expected NeedModel");
         };
+        let request = LlmRequest { model, prompt };
         let response = Llm::complete(&openai, &request).await.unwrap();
         let ModelTurn::Done(finished) = agent.model_responded(response).unwrap() else {
             panic!("expected Done");

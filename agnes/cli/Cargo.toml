@@ -16,9 +16,10 @@ agnes-transport-reqwest.workspace = true
 agnes-llm-openai.workspace = true
 agnes-agent.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 jiff.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync"] }
 
 [lints]
 workspace = true
