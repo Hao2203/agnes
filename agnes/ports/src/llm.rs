@@ -9,7 +9,10 @@ pub enum LlmError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     #[error("LLM API error (HTTP {status}): {detail}")]
-    Api { status: u16, detail: String },
+    Api {
+        status: http::StatusCode,
+        detail: String,
+    },
     #[error("malformed LLM response: {detail}")]
     Malformed { detail: String },
 }

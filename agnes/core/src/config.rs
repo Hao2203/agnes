@@ -1,6 +1,7 @@
 //! Boundary types: values that enter the system as free-form strings are
 //! parsed exactly once and carried as newtypes from then on.
 
+use cold_string::ArcColdString;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::str::FromStr;
@@ -17,19 +18,20 @@ pub enum ConfigError {
     ToolNameWhitespace { value: String },
 }
 
-/// Name of the model to request, e.g. `gpt-4o-mini`.
+/// Name of the model to request, e.g. `gpt-4o-mini`. Cloned on every run
+/// and turn; refcounted, so clones are cheap regardless of length.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelName(String);
+pub struct ModelName(ArcColdString);
 
 impl ModelName {
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Display for ModelName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0.as_str())
     }
 }
 
@@ -41,21 +43,21 @@ impl FromStr for ModelName {
         if trimmed.is_empty() {
             return Err(ConfigError::Empty { field: "model" });
         }
-        Ok(Self(trimmed.to_owned()))
+        Ok(Self(ArcColdString::new(trimmed)))
     }
 }
 
-/// The system prompt of an agent run.
+/// The system prompt of an agent run. Cloned when sessions are continued.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemPrompt(String);
+pub struct SystemPrompt(ArcColdString);
 
 impl SystemPrompt {
-    pub fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<ArcColdString>) -> Self {
         Self(value.into())
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 

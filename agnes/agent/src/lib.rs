@@ -1,4 +1,4 @@
-//! Async driver that interprets the [`agnes_core::machine`] effects.
+//! Async driver that interprets the [`agnes_core::turn`] effects.
 //!
 //! The state machine says *what* to do (call the model, run tools); this
 //! crate does it — through the async ports in `agnes-ports` — and reports
@@ -10,12 +10,11 @@ pub mod tools;
 use std::sync::Arc;
 
 use agnes_core::config::{ModelName, SystemPrompt, TurnBudget};
+use agnes_core::content::Content;
 use agnes_core::context::Context;
-use agnes_core::machine::{
-    Agent, AgentConfig, MachineError, ModelTurn, Outcome, ToolBatch, ToolsTurn,
-};
 use agnes_core::message::{TokenUsage, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::tool::ToolName;
+use agnes_core::turn::{Agent, AgentConfig, ModelTurn, Outcome, ToolBatch, ToolsTurn, TurnError};
 use agnes_ports::llm::{Llm, LlmError};
 use agnes_ports::tool::ToolRegistry;
 use jiff::Timestamp;
@@ -25,7 +24,7 @@ pub enum AgentError {
     #[error(transparent)]
     Llm(#[from] LlmError),
     #[error(transparent)]
-    Machine(#[from] MachineError),
+    Turn(#[from] TurnError),
 }
 
 /// Progress notifications emitted while a run executes.
@@ -33,7 +32,7 @@ pub enum AgentError {
 pub enum Event {
     Started {
         at: Timestamp,
-        goal: String,
+        goal: Content,
         model: ModelName,
         tools: Vec<ToolName>,
     },
@@ -123,7 +122,7 @@ pub async fn run(
         let response = llm.complete(&request).await?;
         sink.event(&Event::ModelResponded {
             at: Timestamp::now(),
-            stop: response.stop_reason,
+            stop: response.stop_reason.clone(),
             usage: response.usage,
         });
         match agent.model_responded(response)? {
@@ -172,7 +171,7 @@ async fn execute_batch(
 }
 
 fn finish(
-    finished: Agent<agnes_core::machine::Finished>,
+    finished: Agent<agnes_core::turn::Finished>,
     system: SystemPrompt,
     started_at: Timestamp,
     sink: &mut dyn Sink,
@@ -206,9 +205,10 @@ mod tests {
     use super::*;
     use agnes_core::config::SystemPrompt;
     use agnes_core::llm::{LlmRequest, LlmResponse, StopReason};
-    use agnes_core::message::{AssistantMessage, ToolArguments};
+    use agnes_core::message::ToolArguments;
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
     use agnes_ports::tool::Tool;
+    use agnes_util::NonEmpty;
     use async_trait::async_trait;
     use std::num::NonZeroU32;
     use std::str::FromStr;
@@ -249,7 +249,7 @@ mod tests {
             Self {
                 spec: ToolSpec {
                     name: ToolName::from_str("note").unwrap(),
-                    description: "records a note".to_owned(),
+                    description: "records a note".into(),
                     parameters: JsonSchema::try_from(serde_json::json!({
                         "type": "object",
                         "properties": { "text": { "type": "string" } },
@@ -288,24 +288,33 @@ mod tests {
     fn config(budget: u32) -> AgentConfig {
         AgentConfig {
             context: Context::new(SystemPrompt::new("sys")),
-            goal: "take a note".to_owned(),
+            goal: Content::try_from("take a note").unwrap(),
             model: ModelName::from_str("test-model").unwrap(),
             tools: Vec::new(),
             budget: TurnBudget::new(NonZeroU32::new(budget).unwrap()),
         }
     }
 
-    fn response(stop: StopReason, content: &str, calls: Vec<ToolCall>) -> LlmResponse {
+    fn response(stop_reason: StopReason) -> LlmResponse {
         LlmResponse {
-            assistant: AssistantMessage {
-                content: content.to_owned(),
-                tool_calls: calls,
-            },
+            stop_reason,
             usage: TokenUsage {
                 input: 1,
                 output: 1,
             },
-            stop_reason: stop,
+        }
+    }
+
+    fn completed(text: &str) -> StopReason {
+        StopReason::Completed {
+            content: Content::try_from(text).unwrap(),
+        }
+    }
+
+    fn tool_use(calls: Vec<ToolCall>) -> StopReason {
+        StopReason::ToolUse {
+            content: None,
+            calls: NonEmpty::from_vec(calls).unwrap(),
         }
     }
 
@@ -322,12 +331,8 @@ mod tests {
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
-            response(
-                StopReason::ToolUse,
-                "",
-                vec![call("c1", "note", r#"{"text":"hi"}"#)],
-            ),
-            response(StopReason::Completed, "all done", vec![]),
+            response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
+            response(completed("all done")),
         ]);
 
         let mut sink = Collector(Vec::new());
@@ -338,7 +343,7 @@ mod tests {
         assert_eq!(
             summary.outcome,
             Outcome::Completed {
-                reply: "all done".to_owned()
+                reply: Content::try_from("all done").unwrap()
             }
         );
         assert_eq!(summary.turns_used, 2);
@@ -371,7 +376,7 @@ mod tests {
         assert!(matches!(
             events[2],
             Event::ModelResponded {
-                stop: StopReason::ToolUse,
+                stop: StopReason::ToolUse { .. },
                 ..
             }
         ));
@@ -387,7 +392,7 @@ mod tests {
         assert!(matches!(
             events[6],
             Event::ModelResponded {
-                stop: StopReason::Completed,
+                stop: StopReason::Completed { .. },
                 ..
             }
         ));
@@ -417,14 +422,14 @@ mod tests {
         let registry = ToolRegistry::build(vec![Arc::new(AlwaysFails {
             spec: ToolSpec {
                 name: ToolName::from_str("boom").unwrap(),
-                description: String::new(),
+                description: "".into(),
                 parameters: JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
             },
         }) as Arc<dyn Tool>])
         .unwrap();
         let llm = ScriptedLlm::new(vec![
-            response(StopReason::ToolUse, "", vec![call("c1", "boom", "{}")]),
-            response(StopReason::Completed, "gave up", vec![]),
+            response(tool_use(vec![call("c1", "boom", "{}")])),
+            response(completed("gave up")),
         ]);
 
         let mut sink = Collector(Vec::new());
@@ -445,7 +450,7 @@ mod tests {
         impl Llm for Broken {
             async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
                 Err(LlmError::Api {
-                    status: 503,
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
                     detail: "down".to_owned(),
                 })
             }
@@ -460,7 +465,8 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            AgentError::Llm(LlmError::Api { status: 503, .. })
+            AgentError::Llm(LlmError::Api { status, .. })
+                if status == http::StatusCode::SERVICE_UNAVAILABLE
         ));
     }
 }

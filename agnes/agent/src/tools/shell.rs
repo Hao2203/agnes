@@ -29,7 +29,7 @@ impl Shell {
             spec: ToolSpec {
                 name: "run_shell".parse().expect("valid tool name"),
                 description: "Run a shell command (`sh -c`) in the working directory and return combined stdout/stderr plus the exit code."
-                    .to_owned(),
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

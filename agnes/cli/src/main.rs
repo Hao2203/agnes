@@ -11,8 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use agnes_agent::tools::{ListDir, ReadFile, Shell, WriteFile};
 use agnes_agent::{Event, Sink};
 use agnes_core::config::{ApiKey, BaseUrl, ModelName, SystemPrompt, TurnBudget};
+use agnes_core::content::Content;
 use agnes_core::context::Context;
-use agnes_core::machine::Outcome;
+use agnes_core::turn::Outcome;
 use agnes_llm_openai::OpenAiClient;
 use agnes_ports::llm::Llm;
 use agnes_ports::tool::{Tool, ToolRegistry};
@@ -124,15 +125,15 @@ async fn real_main() -> anyhow::Result<()> {
                 Some(task) => task,
                 None => read_goal_from_stdin().await?,
             };
-            if goal.trim().is_empty() {
-                bail!("empty task: pass a task argument (`agnes run \"do X\"`) or pipe one in");
-            }
+            let goal = Content::try_from(goal.trim()).context(
+                "empty task: pass a task argument (`agnes run \"do X\"`) or pipe one in",
+            )?;
             let summary = run_task(
                 &client,
                 &registry,
                 model,
                 cli.max_turns,
-                goal.trim().to_owned(),
+                goal,
                 Context::new(SystemPrompt::new(SYSTEM_PROMPT)),
                 EventPrinter::default(),
             )
@@ -157,24 +158,27 @@ async fn real_main() -> anyhow::Result<()> {
                         break;
                     }
                 };
-                let goal = line.trim();
-                if goal.is_empty() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-                if goal == "exit" || goal == "quit" {
+                if trimmed == "exit" || trimmed == "quit" {
                     break;
                 }
-                if goal == "/new" {
+                if trimmed == "/new" {
                     context.reset();
                     println!("(session cleared)");
                     continue;
                 }
+                let Ok(goal) = Content::try_from(trimmed) else {
+                    continue;
+                };
                 match run_task(
                     &client,
                     &registry,
                     model.clone(),
                     cli.max_turns,
-                    goal.to_owned(),
+                    goal,
                     context.clone(),
                     EventPrinter::default(),
                 )
@@ -235,7 +239,7 @@ async fn run_task(
     registry: &Arc<ToolRegistry>,
     model: ModelName,
     max_turns: u32,
-    goal: String,
+    goal: Content,
     context: Context,
     printer: EventPrinter,
 ) -> anyhow::Result<agnes_agent::RunSummary> {
@@ -243,7 +247,7 @@ async fn run_task(
         .to_string()
         .parse()
         .context("invalid --max-turns")?;
-    let config = agnes_core::machine::AgentConfig {
+    let config = agnes_core::turn::AgentConfig {
         context,
         goal,
         model,
@@ -273,7 +277,7 @@ impl Sink for EventPrinter {
                 println!("→ model call (turn {turn})");
             }
             Event::ModelResponded { stop, .. } => {
-                if *stop == agnes_core::llm::StopReason::ToolUse {
+                if matches!(stop, agnes_core::llm::StopReason::ToolUse { .. }) {
                     println!("← tool calls requested");
                 }
             }

@@ -65,7 +65,7 @@ fn spec(
 ) -> ToolSpec {
     ToolSpec {
         name: ToolName::from_str(name).expect("built-in tool names are valid"),
-        description: description.to_owned(),
+        description: description.into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": properties,

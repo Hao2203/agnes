@@ -8,7 +8,10 @@ license.workspace = true
 [dependencies]
 agnes-core.workspace = true
 agnes-ports.workspace = true
+agnes-util.workspace = true
+anyhow.workspace = true
 async-trait.workspace = true
+http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

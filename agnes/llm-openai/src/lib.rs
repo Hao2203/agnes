@@ -6,7 +6,7 @@ pub mod wire;
 
 use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_core::llm::{LlmRequest, LlmResponse};
-use agnes_ports::http::{HttpMethod, HttpRequest, HttpTransport};
+use agnes_ports::http::{HttpTransport, TransportError};
 use agnes_ports::llm::{Llm, LlmError};
 use async_trait::async_trait;
 
@@ -26,24 +26,27 @@ impl<T: HttpTransport> OpenAiClient<T> {
         }
     }
 
-    fn build_request(&self, request: &LlmRequest) -> HttpRequest {
-        HttpRequest {
-            method: HttpMethod::Post,
-            url: self.base_url.join("/chat/completions"),
-            headers: vec![
-                (
-                    "Authorization".to_owned(),
-                    format!("Bearer {}", self.api_key.expose()),
-                ),
-                ("Content-Type".to_owned(), "application/json".to_owned()),
-            ],
-            body: serde_json::to_string(&wire::ChatCompletionRequest::from_core(request))
-                .expect("request serialization cannot fail"),
-        }
+    fn build_request(&self, request: &LlmRequest) -> Result<http::Request<String>, LlmError> {
+        let body = serde_json::to_string(&wire::ChatCompletionRequest::from_core(request))
+            .expect("request serialization cannot fail");
+        http::Request::builder()
+            .method(http::Method::POST)
+            .uri(self.base_url.join("/chat/completions"))
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", self.api_key.expose()),
+            )
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .map_err(|e| LlmError::Transport(TransportError::Request(anyhow::Error::new(e))))
     }
 
-    fn parse_response(&self, status: u16, body: &str) -> Result<LlmResponse, LlmError> {
-        if !(200..300).contains(&status) {
+    fn parse_response(
+        &self,
+        status: http::StatusCode,
+        body: &str,
+    ) -> Result<LlmResponse, LlmError> {
+        if !status.is_success() {
             return Err(LlmError::Api {
                 status,
                 detail: wire::extract_error_body(body),
@@ -60,9 +63,9 @@ impl<T: HttpTransport> OpenAiClient<T> {
 #[async_trait]
 impl<T: HttpTransport> Llm for OpenAiClient<T> {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let http_request = self.build_request(request);
+        let http_request = self.build_request(request)?;
         let http_response = self.transport.send(http_request).await?;
-        self.parse_response(http_response.status, &http_response.body)
+        self.parse_response(http_response.status(), http_response.body())
     }
 }
 
@@ -70,35 +73,45 @@ impl<T: HttpTransport> Llm for OpenAiClient<T> {
 mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt, TurnBudget};
-    use agnes_core::machine::{Agent, AgentConfig, ModelTurn};
+    use agnes_core::content::Content;
     use agnes_core::message::Transcript;
-    use agnes_ports::http::{HttpResponse, TransportError};
+    use agnes_core::turn::{Agent, AgentConfig, ModelTurn};
     use std::num::NonZeroU32;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
     /// Records the last request and replies with a canned response.
     struct FakeTransport {
-        status: Mutex<u16>,
+        status: Mutex<http::StatusCode>,
         body: Mutex<String>,
     }
 
     impl FakeTransport {
         fn new(status: u16, body: &str) -> Self {
             Self {
-                status: Mutex::new(status),
+                status: Mutex::new(http::StatusCode::from_u16(status).unwrap()),
                 body: Mutex::new(body.to_owned()),
             }
         }
     }
 
+    fn response(status: http::StatusCode, body: &str) -> http::Response<String> {
+        http::Response::builder()
+            .status(status)
+            .body(body.to_owned())
+            .unwrap()
+    }
+
     #[async_trait]
     impl HttpTransport for FakeTransport {
-        async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, TransportError> {
-            Ok(HttpResponse {
-                status: *self.status.lock().unwrap(),
-                body: self.body.lock().unwrap().clone(),
-            })
+        async fn send(
+            &self,
+            _request: http::Request<String>,
+        ) -> Result<http::Response<String>, TransportError> {
+            Ok(response(
+                *self.status.lock().unwrap(),
+                &self.body.lock().unwrap(),
+            ))
         }
     }
 
@@ -113,27 +126,33 @@ mod tests {
     fn sample_request() -> LlmRequest {
         LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
-            messages: Transcript::new(SystemPrompt::new("sys"), "do the thing", Vec::new())
-                .into_messages(),
+            messages: Transcript::new(
+                SystemPrompt::new("sys"),
+                Content::try_from("do the thing").unwrap(),
+                Vec::new(),
+            )
+            .into_messages(),
             tools: Vec::new(),
         }
     }
 
     #[tokio::test]
     async fn sends_bearer_and_json_headers() {
-        let captured: Arc<Mutex<Option<HttpRequest>>> = Arc::new(Mutex::new(None));
+        let captured: Arc<Mutex<Option<http::Request<String>>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&captured);
 
-        struct Capture(Arc<Mutex<Option<HttpRequest>>>);
+        struct Capture(Arc<Mutex<Option<http::Request<String>>>>);
         #[async_trait]
         impl HttpTransport for Capture {
-            async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            async fn send(
+                &self,
+                request: http::Request<String>,
+            ) -> Result<http::Response<String>, TransportError> {
                 *self.0.lock().unwrap() = Some(request);
-                Ok(HttpResponse {
-                    status: 200,
-                    body: r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#
-                        .to_owned(),
-                })
+                Ok(response(
+                    http::StatusCode::OK,
+                    r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+                ))
             }
         }
 
@@ -145,18 +164,17 @@ mod tests {
         Llm::complete(&openai, &sample_request()).await.unwrap();
 
         let request = captured.lock().unwrap().take().unwrap();
-        assert_eq!(request.url, "https://api.example.com/v1/chat/completions");
-        assert!(
-            request
-                .headers
-                .iter()
-                .any(|(k, v)| k == "Authorization" && v == "Bearer sk-test")
+        assert_eq!(
+            request.uri().to_string(),
+            "https://api.example.com/v1/chat/completions"
         );
-        assert!(
-            request
-                .headers
-                .iter()
-                .any(|(k, v)| k == "Content-Type" && v == "application/json")
+        assert_eq!(
+            request.headers().get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
+        );
+        assert_eq!(
+            request.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
         );
     }
 
@@ -168,7 +186,10 @@ mod tests {
                "usage":{"prompt_tokens":3,"completion_tokens":2}}"#,
         ));
         let response = Llm::complete(&openai, &sample_request()).await.unwrap();
-        assert_eq!(response.assistant.content, "hello");
+        let agnes_core::llm::StopReason::Completed { content } = &response.stop_reason else {
+            panic!("expected Completed");
+        };
+        assert_eq!(content.as_str(), "hello");
         assert_eq!(response.usage.input, 3);
     }
 
@@ -179,7 +200,10 @@ mod tests {
             r#"{"error":{"message":"invalid api key"}}"#,
         ));
         let err = Llm::complete(&openai, &sample_request()).await.unwrap_err();
-        assert!(matches!(err, LlmError::Api { status: 401, .. }));
+        let LlmError::Api { status, .. } = &err else {
+            panic!("expected Api error");
+        };
+        assert_eq!(*status, http::StatusCode::UNAUTHORIZED);
         assert!(err.to_string().contains("invalid api key"));
     }
 
@@ -201,14 +225,17 @@ mod tests {
         }
         #[async_trait]
         impl HttpTransport for Queued {
-            async fn send(&self, _request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            async fn send(
+                &self,
+                _request: http::Request<String>,
+            ) -> Result<http::Response<String>, TransportError> {
                 let (status, body) = self
                     .turns
                     .lock()
                     .unwrap()
                     .next()
                     .expect("scripted transport ran dry");
-                Ok(HttpResponse { status, body })
+                Ok(response(http::StatusCode::from_u16(status).unwrap(), &body))
             }
         }
 
@@ -239,7 +266,7 @@ mod tests {
 
         let config = AgentConfig {
             context: agnes_core::context::Context::new(SystemPrompt::new("sys")),
-            goal: "flip".to_owned(),
+            goal: Content::try_from("flip").unwrap(),
             model: ModelName::from_str("gpt-test").unwrap(),
             tools: Vec::new(),
             budget: TurnBudget::new(NonZeroU32::new(4).unwrap()),
@@ -253,7 +280,7 @@ mod tests {
         let results = batch
             .complete(vec![agnes_core::message::ToolOutput::success("ok")])
             .unwrap();
-        let agnes_core::machine::ToolsTurn::NeedModel { agent, request } =
+        let agnes_core::turn::ToolsTurn::NeedModel { agent, request } =
             agent.tools_resolved(results).unwrap()
         else {
             panic!("expected NeedModel");
@@ -264,7 +291,7 @@ mod tests {
         };
         assert!(matches!(
             finished.outcome(),
-            agnes_core::machine::Outcome::Completed { .. }
+            agnes_core::turn::Outcome::Completed { .. }
         ));
     }
 }

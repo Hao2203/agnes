@@ -2,49 +2,51 @@
 //!
 //! [`Message`] is an enum so protocol violations — a tool result without a
 //! preceding call, a system message mid-conversation — are hard to express.
-//! [`AssistantMessage`] is separate so an [`crate::llm::LlmResponse`] can
-//! never carry a non-assistant message.
 
 use crate::config::SystemPrompt;
+use crate::content::Content;
+use agnes_util::NonEmpty;
+use cold_string::ArcColdString;
 use serde::de::DeserializeOwned;
 use std::fmt;
 
-/// Identifier of a tool call, assigned by the model.
+/// Identifier of a tool call, assigned by the model. Cloned for every tool
+/// result written back into the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCallId(String);
+pub struct ToolCallId(ArcColdString);
 
 impl ToolCallId {
-    pub fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<ArcColdString>) -> Self {
         Self(value.into())
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Display for ToolCallId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0.as_str())
     }
 }
 
 /// Raw JSON arguments of a tool call, not yet parsed against the tool's
 /// schema. Parsing happens inside the tool (parse at the boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolArguments(String);
+pub struct ToolArguments(ArcColdString);
 
 impl ToolArguments {
-    pub fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<ArcColdString>) -> Self {
         Self(value.into())
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     pub fn parse<T: DeserializeOwned>(&self) -> serde_json::Result<T> {
-        serde_json::from_str(&self.0)
+        serde_json::from_str(self.0.as_str())
     }
 }
 
@@ -56,22 +58,22 @@ pub struct ToolCall {
 }
 
 /// Output of a tool run. Failures are reported *as* output so the model can
-/// see them and react.
+/// see them and react. Cloned into the transcript once per result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
-    pub content: String,
+    pub content: ArcColdString,
     pub is_error: bool,
 }
 
 impl ToolOutput {
-    pub fn success(content: impl Into<String>) -> Self {
+    pub fn success(content: impl Into<ArcColdString>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
         }
     }
 
-    pub fn error(content: impl Into<String>) -> Self {
+    pub fn error(content: impl Into<ArcColdString>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
@@ -101,11 +103,17 @@ impl fmt::Display for TokenUsage {
     }
 }
 
-/// A message produced by the model.
+/// A message produced by the model: either pure text, or tool calls with
+/// optional commentary text alongside.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssistantMessage {
-    pub content: String,
-    pub tool_calls: Vec<ToolCall>,
+pub enum AssistantMessage {
+    /// A pure text reply.
+    Text(Content),
+    /// Tool calls — always at least one — with any accompanying text.
+    ToolCalls {
+        content: Option<Content>,
+        calls: NonEmpty<ToolCall>,
+    },
 }
 
 /// One entry of the conversation.
@@ -115,7 +123,7 @@ pub enum Message {
         content: SystemPrompt,
     },
     User {
-        content: String,
+        content: Content,
     },
     Assistant(AssistantMessage),
     ToolResult {
@@ -135,13 +143,11 @@ pub struct Transcript {
 impl Transcript {
     /// Starts a conversation: system prompt, prior turns (when continuing a
     /// session), then the new goal.
-    pub fn new(system: SystemPrompt, goal: impl Into<String>, history: Vec<Message>) -> Self {
+    pub fn new(system: SystemPrompt, goal: Content, history: Vec<Message>) -> Self {
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(Message::System { content: system });
         messages.extend(history);
-        messages.push(Message::User {
-            content: goal.into(),
-        });
+        messages.push(Message::User { content: goal });
         Self { messages }
     }
 
@@ -173,13 +179,21 @@ mod tests {
     use super::*;
     use serde::Deserialize;
 
+    fn content(text: &str) -> Content {
+        Content::try_from(text).unwrap()
+    }
+
     #[test]
     fn transcript_starts_with_system_and_goal() {
-        let t = Transcript::new(SystemPrompt::new("be brief"), "list files", Vec::new());
+        let t = Transcript::new(
+            SystemPrompt::new("be brief"),
+            content("list files"),
+            Vec::new(),
+        );
         assert_eq!(t.messages().len(), 2);
         assert!(matches!(t.messages()[0], Message::System { .. }));
         assert!(
-            matches!(t.messages()[1], Message::User { ref content } if content == "list files")
+            matches!(t.messages()[1], Message::User { ref content } if content.as_str() == "list files")
         );
     }
 
@@ -187,23 +201,22 @@ mod tests {
     fn history_slots_in_between_system_and_goal() {
         let prior = vec![
             Message::User {
-                content: "first task".to_owned(),
+                content: content("first task"),
             },
-            Message::Assistant(AssistantMessage {
-                content: "done".to_owned(),
-                tool_calls: vec![],
-            }),
+            Message::Assistant(AssistantMessage::Text(content("done"))),
         ];
         let history =
-            Transcript::new(SystemPrompt::new("sys"), "second task", prior).into_history();
+            Transcript::new(SystemPrompt::new("sys"), content("second task"), prior).into_history();
         assert_eq!(history.len(), 3); // user, assistant, user — system dropped
-        let round = Transcript::new(SystemPrompt::new("sys"), "third", history.clone());
+        let round = Transcript::new(SystemPrompt::new("sys"), content("third"), history.clone());
         assert_eq!(round.messages().len(), 5);
         assert!(matches!(round.messages()[0], Message::System { .. }));
         assert!(
-            matches!(round.messages()[3], Message::User { ref content } if content == "second task")
+            matches!(round.messages()[3], Message::User { ref content } if content.as_str() == "second task")
         );
-        assert!(matches!(round.messages()[4], Message::User { ref content } if content == "third"));
+        assert!(
+            matches!(round.messages()[4], Message::User { ref content } if content.as_str() == "third")
+        );
     }
 
     #[test]

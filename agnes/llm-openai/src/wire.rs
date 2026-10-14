@@ -1,11 +1,13 @@
 //! Wire types for the OpenAI chat-completions API and mapping to core types.
 
+use agnes_core::content::Content;
 use agnes_core::llm::{LlmRequest, LlmResponse, StopReason};
 use agnes_core::message::{
     AssistantMessage, Message, TokenUsage, ToolArguments, ToolCall, ToolCallId,
 };
 use agnes_core::tool::{ToolName, ToolSpec};
 use agnes_ports::llm::LlmError;
+use agnes_util::NonEmpty;
 use serde::Deserialize;
 use serde_json::Value;
 use std::str::FromStr;
@@ -62,19 +64,24 @@ impl WireMessage {
                 content: content.as_str().to_owned(),
             },
             Message::User { content } => Self::User {
-                content: content.clone(),
+                content: content.as_str().to_owned(),
             },
-            Message::Assistant(assistant) => Self::Assistant {
-                content: assistant.content.clone(),
-                tool_calls: assistant
-                    .tool_calls
-                    .iter()
-                    .map(WireToolCall::from_core)
-                    .collect(),
+            Message::Assistant(assistant) => match assistant {
+                AssistantMessage::Text(content) => Self::Assistant {
+                    content: content.as_str().to_owned(),
+                    tool_calls: Vec::new(),
+                },
+                AssistantMessage::ToolCalls { content, calls } => Self::Assistant {
+                    content: content
+                        .as_ref()
+                        .map(|content| content.as_str().to_owned())
+                        .unwrap_or_default(),
+                    tool_calls: calls.iter().map(WireToolCall::from_core).collect(),
+                },
             },
             Message::ToolResult { call_id, output } => Self::ToolResult {
                 tool_call_id: call_id.as_str().to_owned(),
-                content: output.content.clone(),
+                content: output.content.as_str().to_owned(),
             },
         }
     }
@@ -120,7 +127,7 @@ impl WireTool {
             kind: "function",
             function: WireFunctionSpec {
                 name: spec.name.as_str().to_owned(),
-                description: spec.description.clone(),
+                description: spec.description.as_str().to_owned(),
                 parameters: spec.parameters.get().clone(),
             },
         }
@@ -187,37 +194,51 @@ impl ChatCompletionResponse {
             .ok_or_else(|| LlmError::Malformed {
                 detail: "response contains no choices".to_owned(),
             })?;
-        let stop_reason = match choice.finish_reason.as_str() {
-            "stop" => StopReason::Completed,
-            "tool_calls" => StopReason::ToolUse,
-            "length" => StopReason::LengthExceeded,
+        let WireChoice {
+            message,
+            finish_reason,
+        } = choice;
+        let WireAssistantMessage {
+            content: raw_content,
+            tool_calls: raw_calls,
+        } = message;
+        let content = raw_content.and_then(|text| Content::try_from(text).ok());
+
+        let stop_reason = match finish_reason.as_str() {
+            "stop" => StopReason::Completed {
+                content: content.ok_or_else(|| LlmError::Malformed {
+                    detail: "finish_reason `stop` without any content".to_owned(),
+                })?,
+            },
+            "tool_calls" => {
+                let calls = raw_calls
+                    .into_iter()
+                    .map(|call| {
+                        Ok(ToolCall {
+                            id: ToolCallId::new(call.id),
+                            name: ToolName::from_str(&call.function.name).map_err(|e| {
+                                LlmError::Malformed {
+                                    detail: e.to_string(),
+                                }
+                            })?,
+                            arguments: ToolArguments::new(call.function.arguments),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LlmError>>()?;
+                let calls = NonEmpty::from_vec(calls).map_err(|_| LlmError::Malformed {
+                    detail: "finish_reason `tool_calls` without any tool calls".to_owned(),
+                })?;
+                StopReason::ToolUse { content, calls }
+            }
+            "length" => StopReason::LengthExceeded { content },
             other => {
                 return Err(LlmError::Malformed {
                     detail: format!("unknown finish_reason `{other}`"),
                 });
             }
         };
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .into_iter()
-            .map(|call| {
-                Ok(ToolCall {
-                    id: ToolCallId::new(call.id),
-                    name: ToolName::from_str(&call.function.name).map_err(|e| {
-                        LlmError::Malformed {
-                            detail: e.to_string(),
-                        }
-                    })?,
-                    arguments: ToolArguments::new(call.function.arguments),
-                })
-            })
-            .collect::<Result<Vec<_>, LlmError>>()?;
         Ok(LlmResponse {
-            assistant: AssistantMessage {
-                content: choice.message.content.unwrap_or_default(),
-                tool_calls,
-            },
+            stop_reason,
             usage: self
                 .usage
                 .map(|u| TokenUsage {
@@ -225,7 +246,6 @@ impl ChatCompletionResponse {
                     output: u.completion_tokens,
                 })
                 .unwrap_or_default(),
-            stop_reason,
         })
     }
 }
@@ -260,13 +280,18 @@ mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::llm::LlmRequest;
-    use agnes_core::message::{ToolOutput, Transcript};
+    use agnes_core::message::{AssistantMessage, ToolOutput, Transcript};
+
+    fn content(text: &str) -> Content {
+        Content::try_from(text).unwrap()
+    }
 
     #[test]
     fn empty_request_serializes_without_tools() {
         let request = LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
-            messages: Transcript::new(SystemPrompt::new("sys"), "hi", Vec::new()).into_messages(),
+            messages: Transcript::new(SystemPrompt::new("sys"), content("hi"), Vec::new())
+                .into_messages(),
             tools: Vec::new(),
         };
         let json = serde_json::to_value(ChatCompletionRequest::from_core(&request)).unwrap();
@@ -290,15 +315,29 @@ mod tests {
     }
 
     #[test]
-    fn assistant_without_content_omits_empty_fields() {
-        let message = Message::Assistant(AssistantMessage {
-            content: String::new(),
-            tool_calls: vec![],
+    fn assistant_text_omits_tool_calls() {
+        let message = Message::Assistant(AssistantMessage::Text(content("hello")));
+        let json = serde_json::to_value(WireMessage::from_core(&message)).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"], "hello");
+        assert!(json.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn assistant_tool_calls_omit_missing_content() {
+        let message = Message::Assistant(AssistantMessage::ToolCalls {
+            content: None,
+            calls: NonEmpty::from_iter([ToolCall {
+                id: ToolCallId::new("call-1"),
+                name: ToolName::from_str("read_file").unwrap(),
+                arguments: ToolArguments::new("{}"),
+            }])
+            .unwrap(),
         });
         let json = serde_json::to_value(WireMessage::from_core(&message)).unwrap();
         assert_eq!(json["role"], "assistant");
         assert!(json.get("content").is_none());
-        assert!(json.get("tool_calls").is_none());
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "read_file");
     }
 
     #[test]
@@ -321,7 +360,6 @@ mod tests {
         }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         let response = parsed.into_core().unwrap();
-        assert_eq!(response.stop_reason, StopReason::ToolUse);
         assert_eq!(
             response.usage,
             TokenUsage {
@@ -329,12 +367,78 @@ mod tests {
                 output: 7
             }
         );
-        assert_eq!(response.assistant.content, "");
-        assert_eq!(response.assistant.tool_calls.len(), 1);
-        assert_eq!(response.assistant.tool_calls[0].id.as_str(), "call_abc");
+        let StopReason::ToolUse { content, calls } = &response.stop_reason else {
+            panic!("expected ToolUse");
+        };
+        assert!(content.is_none());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.first().id.as_str(), "call_abc");
+        assert_eq!(calls.first().arguments.as_str(), r#"{"path":"x"}"#);
+    }
+
+    #[test]
+    fn commentary_alongside_tool_calls_is_kept() {
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "content": "let me check",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        let response = parsed.into_core().unwrap();
+        let StopReason::ToolUse { content, calls } = &response.stop_reason else {
+            panic!("expected ToolUse");
+        };
+        assert_eq!(content.as_ref().map(Content::as_str), Some("let me check"));
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn stop_without_content_is_malformed() {
+        let body =
+            r#"{ "choices": [{ "message": { "content": null }, "finish_reason": "stop" }] }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        assert!(matches!(
+            parsed.into_core(),
+            Err(LlmError::Malformed { .. })
+        ));
+
+        let body =
+            r#"{ "choices": [{ "message": { "content": "   " }, "finish_reason": "stop" }] }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        assert!(matches!(
+            parsed.into_core(),
+            Err(LlmError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_calls_finish_without_calls_is_malformed() {
+        let body =
+            r#"{ "choices": [{ "message": { "content": null }, "finish_reason": "tool_calls" }] }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        assert!(matches!(
+            parsed.into_core(),
+            Err(LlmError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn length_without_content_is_allowed() {
+        let body =
+            r#"{ "choices": [{ "message": { "content": null }, "finish_reason": "length" }] }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        let response = parsed.into_core().unwrap();
         assert_eq!(
-            response.assistant.tool_calls[0].arguments.as_str(),
-            r#"{"path":"x"}"#
+            response.stop_reason,
+            StopReason::LengthExceeded { content: None }
         );
     }
 

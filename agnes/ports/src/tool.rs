@@ -87,7 +87,7 @@ mod tests {
             Self {
                 spec: ToolSpec {
                     name: ToolName::from_str(name).unwrap(),
-                    description: "echoes its arguments".to_owned(),
+                    description: "echoes its arguments".into(),
                     parameters: serde_json::json!({"type": "object"}).try_into().unwrap(),
                 },
             }

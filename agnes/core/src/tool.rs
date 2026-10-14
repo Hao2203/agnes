@@ -2,22 +2,25 @@
 //! [`agnes_ports::tool::Tool`] port and registry live in `agnes-ports`.
 
 use crate::config::ConfigError;
+use cold_string::ArcColdString;
 use std::fmt;
 use std::str::FromStr;
 
-/// Name of a tool. Non-empty, no whitespace.
+/// Name of a tool. Non-empty, no whitespace. Used as a map key and cloned
+/// whenever specs are snapshotted; refcounted and one word wide, so both
+/// uses stay cheap.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ToolName(String);
+pub struct ToolName(ArcColdString);
 
 impl ToolName {
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Display for ToolName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0.as_str())
     }
 }
 
@@ -34,7 +37,7 @@ impl FromStr for ToolName {
                 value: trimmed.to_owned(),
             });
         }
-        Ok(Self(trimmed.to_owned()))
+        Ok(Self(ArcColdString::new(trimmed)))
     }
 }
 
@@ -64,11 +67,12 @@ impl JsonSchema {
     }
 }
 
-/// The contract a model sees: name, description, parameter schema.
+/// The contract a model sees: name, description, parameter schema. Cloned
+/// whenever specs are snapshotted for a request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub name: ToolName,
-    pub description: String,
+    pub description: ArcColdString,
     pub parameters: JsonSchema,
 }
 

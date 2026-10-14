@@ -1,4 +1,4 @@
-//! The agent as a type-state machine.
+//! The agent run, progressing one turn at a time as a type-state machine.
 //!
 //! Each state is a distinct type carrying its own data; transitions consume
 //! the current state and return the next one together with the effect to
@@ -8,15 +8,15 @@
 //! [`Finished`] has no transitions at all.
 
 use crate::config::{ModelName, TurnBudget};
+use crate::content::Content;
 use crate::context::Context;
 use crate::llm::{LlmRequest, LlmResponse, StopReason};
 use crate::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolOutput, Transcript};
 use crate::tool::ToolSpec;
+use agnes_util::NonEmpty;
 
 #[derive(Debug, thiserror::Error)]
-pub enum MachineError {
-    #[error("model signalled tool use without any tool calls")]
-    EmptyToolUse,
+pub enum TurnError {
     #[error("tool results do not match the pending calls: expected {expected}, got {got}")]
     ResultMismatch { expected: usize, got: usize },
 }
@@ -27,7 +27,7 @@ pub enum MachineError {
 #[derive(Debug)]
 pub struct AgentConfig {
     pub context: Context,
-    pub goal: String,
+    pub goal: Content,
     pub model: ModelName,
     pub tools: Vec<ToolSpec>,
     pub budget: TurnBudget,
@@ -43,7 +43,7 @@ pub struct Agent<S> {
 #[derive(Debug)]
 pub struct Ready {
     context: Context,
-    goal: String,
+    goal: Content,
     model: ModelName,
     tools: Vec<ToolSpec>,
     budget: TurnBudget,
@@ -82,56 +82,55 @@ pub struct Finished {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Completed { reply: String },
+    Completed { reply: Content },
     BudgetExhausted,
     LengthExceeded,
 }
 
 /// The tool calls awaiting execution, handed out by [`ModelTurn::NeedTools`].
+/// Always holds at least one call.
 #[derive(Debug)]
 pub struct ToolBatch {
-    calls: Vec<ToolCall>,
+    calls: NonEmpty<ToolCall>,
 }
 
 impl ToolBatch {
     pub fn calls(&self) -> &[ToolCall] {
-        &self.calls
+        self.calls.as_ref()
     }
 
-    /// Pairs results with the pending calls; the counts must match.
-    pub fn complete(self, outputs: Vec<ToolOutput>) -> Result<ToolResults, MachineError> {
+    /// Pairs each pending call with its result; the counts must match.
+    pub fn complete(self, outputs: Vec<ToolOutput>) -> Result<ToolResults, TurnError> {
         if outputs.len() != self.calls.len() {
-            return Err(MachineError::ResultMismatch {
+            return Err(TurnError::ResultMismatch {
                 expected: self.calls.len(),
                 got: outputs.len(),
             });
         }
         Ok(ToolResults {
-            calls: self.calls,
-            outputs,
+            pairs: NonEmpty::from_iter(self.calls.iter().cloned().zip(outputs))
+                .expect("a non-empty batch with matching counts yields at least one pair"),
         })
     }
 }
 
-/// One result per pending call, in call order. Constructible only via
-/// [`ToolBatch::complete`].
+/// One result per pending call, in call order; the pairing is structural.
+/// Constructible only via [`ToolBatch::complete`].
 #[derive(Debug)]
 pub struct ToolResults {
-    calls: Vec<ToolCall>,
-    outputs: Vec<ToolOutput>,
+    pairs: NonEmpty<(ToolCall, ToolOutput)>,
 }
 
 impl ToolResults {
     pub fn iter(&self) -> impl Iterator<Item = (&ToolCall, &ToolOutput)> {
-        self.calls.iter().zip(&self.outputs)
+        self.pairs.iter().map(|(call, output)| (call, output))
     }
 
+    /// Number of results; always at least one — a [`ToolResults`] is only
+    /// produced for a [`ToolBatch`], which holds at least one call.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.calls.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
+        self.pairs.len()
     }
 }
 
@@ -202,7 +201,7 @@ impl Agent<Ready> {
 
 impl Agent<AwaitingModel> {
     /// Feeds a model response back into the machine.
-    pub fn model_responded(self, response: LlmResponse) -> Result<ModelTurn, MachineError> {
+    pub fn model_responded(self, response: LlmResponse) -> Result<ModelTurn, TurnError> {
         let AwaitingModel {
             mut transcript,
             model,
@@ -212,18 +211,14 @@ impl Agent<AwaitingModel> {
             usage,
         } = self.state;
         let usage = usage.saturating_add(response.usage);
-        let AssistantMessage {
-            content,
-            tool_calls,
-        } = response.assistant;
         match response.stop_reason {
-            StopReason::ToolUse => {
-                if tool_calls.is_empty() {
-                    return Err(MachineError::EmptyToolUse);
-                }
-                transcript.push(Message::Assistant(AssistantMessage {
+            StopReason::ToolUse { content, calls } => {
+                let batch = ToolBatch {
+                    calls: calls.clone(),
+                };
+                transcript.push(Message::Assistant(AssistantMessage::ToolCalls {
                     content,
-                    tool_calls: tool_calls.clone(),
+                    calls,
                 }));
                 Ok(ModelTurn::NeedTools {
                     agent: Agent {
@@ -236,29 +231,24 @@ impl Agent<AwaitingModel> {
                             usage,
                         },
                     },
-                    batch: ToolBatch { calls: tool_calls },
+                    batch,
                 })
             }
-            StopReason::Completed => {
-                let reply = content.clone();
-                transcript.push(Message::Assistant(AssistantMessage {
-                    content,
-                    tool_calls,
-                }));
+            StopReason::Completed { content } => {
+                transcript.push(Message::Assistant(AssistantMessage::Text(content.clone())));
                 Ok(ModelTurn::Done(Agent {
                     state: Finished {
                         transcript,
                         usage,
                         turns_used,
-                        outcome: Outcome::Completed { reply },
+                        outcome: Outcome::Completed { reply: content },
                     },
                 }))
             }
-            StopReason::LengthExceeded => {
-                transcript.push(Message::Assistant(AssistantMessage {
-                    content,
-                    tool_calls,
-                }));
+            StopReason::LengthExceeded { content } => {
+                if let Some(content) = content {
+                    transcript.push(Message::Assistant(AssistantMessage::Text(content)));
+                }
                 Ok(ModelTurn::Done(Agent {
                     state: Finished {
                         transcript,
@@ -283,7 +273,7 @@ impl Agent<AwaitingModel> {
 impl Agent<AwaitingTools> {
     /// Feeds tool results back into the machine and produces the next model
     /// request — or finishes when the turn budget is spent.
-    pub fn tools_resolved(self, results: ToolResults) -> Result<ToolsTurn, MachineError> {
+    pub fn tools_resolved(self, results: ToolResults) -> Result<ToolsTurn, TurnError> {
         let AwaitingTools {
             mut transcript,
             model,
@@ -361,29 +351,34 @@ mod tests {
     use std::num::NonZeroU32;
     use std::str::FromStr;
 
+    fn content(text: &str) -> Content {
+        Content::try_from(text).unwrap()
+    }
+
     fn config(budget: u32) -> AgentConfig {
         AgentConfig {
             context: Context::new(SystemPrompt::new("be brief")),
-            goal: "flip the flag".to_owned(),
+            goal: content("flip the flag"),
             model: ModelName::from_str("test-model").unwrap(),
             tools: Vec::new(),
             budget: TurnBudget::new(NonZeroU32::new(budget).unwrap()),
         }
     }
 
-    fn response(
-        stop_reason: StopReason,
-        content: &str,
-        calls: Vec<ToolCall>,
-        usage: TokenUsage,
-    ) -> LlmResponse {
-        LlmResponse {
-            assistant: AssistantMessage {
-                content: content.to_owned(),
-                tool_calls: calls,
-            },
-            usage,
-            stop_reason,
+    fn response(stop_reason: StopReason, usage: TokenUsage) -> LlmResponse {
+        LlmResponse { stop_reason, usage }
+    }
+
+    fn completed(text: &str) -> StopReason {
+        StopReason::Completed {
+            content: content(text),
+        }
+    }
+
+    fn tool_use(calls: Vec<ToolCall>) -> StopReason {
+        StopReason::ToolUse {
+            content: None,
+            calls: NonEmpty::from_vec(calls).unwrap(),
         }
     }
 
@@ -419,17 +414,14 @@ mod tests {
             SystemPrompt::new("be brief"),
             vec![
                 Message::User {
-                    content: "earlier task".to_owned(),
+                    content: content("earlier task"),
                 },
-                Message::Assistant(AssistantMessage {
-                    content: "earlier reply".to_owned(),
-                    tool_calls: vec![],
-                }),
+                Message::Assistant(AssistantMessage::Text(content("earlier reply"))),
             ],
         );
         let config = AgentConfig {
             context,
-            goal: "next task".to_owned(),
+            goal: content("next task"),
             ..config(4)
         };
         let (_agent, request) = Agent::new(config).start();
@@ -437,11 +429,11 @@ mod tests {
         assert_eq!(request.messages.len(), 4);
         assert!(matches!(request.messages[0], Message::System { .. }));
         assert!(
-            matches!(request.messages[1], Message::User { ref content } if content == "earlier task")
+            matches!(request.messages[1], Message::User { ref content } if content.as_str() == "earlier task")
         );
         assert!(matches!(request.messages[2], Message::Assistant(_)));
         assert!(
-            matches!(request.messages[3], Message::User { ref content } if content == "next task")
+            matches!(request.messages[3], Message::User { ref content } if content.as_str() == "next task")
         );
     }
 
@@ -453,12 +445,7 @@ mod tests {
             output: 5,
         };
         let ModelTurn::NeedTools { agent, batch } = agent
-            .model_responded(response(
-                StopReason::ToolUse,
-                "",
-                vec![call("c1", "flag")],
-                usage1,
-            ))
+            .model_responded(response(tool_use(vec![call("c1", "flag")]), usage1))
             .unwrap()
         else {
             panic!("expected NeedTools");
@@ -477,7 +464,7 @@ mod tests {
             output: 8,
         };
         let ModelTurn::Done(finished) = agent
-            .model_responded(response(StopReason::Completed, "done it", vec![], usage2))
+            .model_responded(response(completed("done it"), usage2))
             .unwrap()
         else {
             panic!("expected Done");
@@ -485,7 +472,7 @@ mod tests {
         assert_eq!(
             finished.outcome(),
             &Outcome::Completed {
-                reply: "done it".to_owned()
+                reply: content("done it")
             }
         );
         assert_eq!(finished.turns_used(), 2);
@@ -505,9 +492,7 @@ mod tests {
         let (agent, _request) = Agent::new(config(1)).start();
         let ModelTurn::NeedTools { agent, batch } = agent
             .model_responded(response(
-                StopReason::ToolUse,
-                "",
-                vec![call("c1", "flag")],
+                tool_use(vec![call("c1", "flag")]),
                 TokenUsage::default(),
             ))
             .unwrap()
@@ -522,27 +507,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_without_calls_is_malformed() {
-        let (agent, _request) = Agent::new(config(4)).start();
-        let err = agent
-            .model_responded(response(
-                StopReason::ToolUse,
-                "",
-                vec![],
-                TokenUsage::default(),
-            ))
-            .unwrap_err();
-        assert!(matches!(err, MachineError::EmptyToolUse));
-    }
-
-    #[test]
     fn result_count_must_match_batch() {
         let (agent, _request) = Agent::new(config(4)).start();
         let ModelTurn::NeedTools { agent: _, batch } = agent
             .model_responded(response(
-                StopReason::ToolUse,
-                "",
-                vec![call("c1", "flag"), call("c2", "flag")],
+                tool_use(vec![call("c1", "flag"), call("c2", "flag")]),
                 TokenUsage::default(),
             ))
             .unwrap()
@@ -552,7 +521,7 @@ mod tests {
         let err = batch.complete(vec![output(true)]).unwrap_err();
         assert!(matches!(
             err,
-            MachineError::ResultMismatch {
+            TurnError::ResultMismatch {
                 expected: 2,
                 got: 1
             }
@@ -564,9 +533,9 @@ mod tests {
         let (agent, _request) = Agent::new(config(4)).start();
         let ModelTurn::Done(finished) = agent
             .model_responded(response(
-                StopReason::LengthExceeded,
-                "partial",
-                vec![],
+                StopReason::LengthExceeded {
+                    content: Some(content("partial")),
+                },
                 TokenUsage::default(),
             ))
             .unwrap()

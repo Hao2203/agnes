@@ -8,6 +8,7 @@
 //! [`Context`] through `RunSummary`.
 
 use crate::config::SystemPrompt;
+use crate::content::Content;
 use crate::message::{Message, Transcript};
 
 /// The system prompt and the ordered prior turns of a session.
@@ -54,7 +55,7 @@ impl Context {
 
     /// Consumes the context into a [`Transcript`] for one agent run: system
     /// prompt, prior turns, then the new goal.
-    pub fn into_transcript(self, goal: impl Into<String>) -> Transcript {
+    pub fn into_transcript(self, goal: Content) -> Transcript {
         Transcript::new(self.system, goal, self.messages)
     }
 }
@@ -64,25 +65,26 @@ mod tests {
     use super::*;
     use crate::message::AssistantMessage;
 
+    fn content(text: &str) -> Content {
+        Content::try_from(text).unwrap()
+    }
+
     #[test]
     fn into_transcript_appends_goal_after_prior_turns() {
         let context = Context::from_parts(
             SystemPrompt::new("sys"),
             vec![
                 Message::User {
-                    content: "first".to_owned(),
+                    content: content("first"),
                 },
-                Message::Assistant(AssistantMessage {
-                    content: "reply".to_owned(),
-                    tool_calls: vec![],
-                }),
+                Message::Assistant(AssistantMessage::Text(content("reply"))),
             ],
         );
-        let transcript = context.into_transcript("second");
+        let transcript = context.into_transcript(content("second"));
         assert_eq!(transcript.messages().len(), 4);
         assert!(matches!(transcript.messages()[0], Message::System { .. }));
         assert!(
-            matches!(transcript.messages()[3], Message::User { ref content } if content == "second")
+            matches!(transcript.messages()[3], Message::User { ref content } if content.as_str() == "second")
         );
     }
 
@@ -90,7 +92,7 @@ mod tests {
     fn reset_keeps_system_drops_turns() {
         let mut context = Context::new(SystemPrompt::new("sys"));
         context.messages.push(Message::User {
-            content: "old".to_owned(),
+            content: content("old"),
         });
         assert_eq!(context.len(), 1);
         context.reset();

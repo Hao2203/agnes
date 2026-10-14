@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use agnes_ports::http::{HttpMethod, HttpRequest, HttpResponse, HttpTransport, TransportError};
+use agnes_ports::http::{HttpTransport, TransportError};
 use async_trait::async_trait;
 
-/// Blocking-free transport with per-request total and connect timeouts.
+/// Async transport with per-request total and connect timeouts.
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
@@ -30,29 +30,43 @@ impl Default for ReqwestTransport {
 
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
-    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let method = match request.method {
-            HttpMethod::Get => reqwest::Method::GET,
-            HttpMethod::Post => reqwest::Method::POST,
-        };
-        let mut req = self.client.request(method, &request.url);
-        for (name, value) in &request.headers {
-            req = req.header(name, value);
+    async fn send(
+        &self,
+        request: http::Request<String>,
+    ) -> Result<http::Response<String>, TransportError> {
+        let (parts, body) = request.into_parts();
+        let mut builder = self
+            .client
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers);
+        if !body.is_empty() {
+            builder = builder.body(body);
         }
-        if request.method == HttpMethod::Post {
-            req = req.body(request.body);
+        let response = builder.send().await.map_err(transport_error)?;
+
+        let mut builder = http::Response::builder().status(response.status());
+        if let Some(headers) = builder.headers_mut() {
+            *headers = response.headers().clone();
         }
-        let response = req
-            .send()
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-        Ok(HttpResponse { status, body })
+        let body = response.text().await.map_err(transport_error)?;
+        builder.body(body).map_err(transport_error_from_http)
     }
+}
+
+/// Classifies a reqwest failure: connection- and body-level problems map to
+/// [`TransportError::Io`], the rest keep their full error chain in
+/// [`TransportError::Request`].
+fn transport_error(error: reqwest::Error) -> TransportError {
+    let io_like = error.is_connect() || error.is_timeout() || error.is_body() || error.is_decode();
+    if io_like {
+        TransportError::Io(std::io::Error::other(error))
+    } else {
+        TransportError::Request(anyhow::Error::new(error))
+    }
+}
+
+fn transport_error_from_http(error: http::Error) -> TransportError {
+    TransportError::Request(anyhow::Error::new(error))
 }
 
 #[cfg(test)]
@@ -102,6 +116,29 @@ mod tests {
         })
     }
 
+    fn post(url: String, body: &str) -> http::Request<String> {
+        http::Request::builder()
+            .method(http::Method::POST)
+            .uri(url)
+            .header(http::header::AUTHORIZATION, "Bearer sk-test")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(body.to_owned())
+            .unwrap()
+    }
+
+    /// Test transports bypass environment proxies so results are hermetic;
+    /// the production constructors keep honoring `HTTP(S)_PROXY`.
+    fn test_transport() -> ReqwestTransport {
+        ReqwestTransport {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        }
+    }
+
     #[tokio::test]
     async fn posts_body_and_returns_status_and_body() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -114,25 +151,16 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\nok",
         );
 
-        let transport = ReqwestTransport::new(Duration::from_secs(10));
-        let response = transport
-            .send(HttpRequest {
-                method: HttpMethod::Post,
-                url,
-                headers: vec![
-                    ("Authorization".to_owned(), "Bearer sk-test".to_owned()),
-                    ("Content-Type".to_owned(), "application/json".to_owned()),
-                ],
-                body: r#"{"model":"gpt-test"}"#.to_owned(),
-            })
+        let response = test_transport()
+            .send(post(url, r#"{"model":"gpt-test"}"#))
             .await
             .unwrap();
 
         let request_body = server.join().unwrap();
         assert!(request_body.contains(r#"{"model":"gpt-test"}"#));
-        assert!(response.is_success());
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, "ok");
+        assert!(response.status().is_success());
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.body(), "ok");
     }
 
     #[tokio::test]
@@ -147,19 +175,23 @@ mod tests {
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: 19\r\n\r\n{\"error\":\"bad key\"}",
         );
 
-        let transport = ReqwestTransport::default();
-        let response = transport
-            .send(HttpRequest {
-                method: HttpMethod::Post,
-                url,
-                headers: vec![],
-                body: "{}".to_owned(),
-            })
-            .await
-            .unwrap();
+        let response = test_transport().send(post(url, "{}")).await.unwrap();
 
         server.join().unwrap();
-        assert_eq!(response.status, 401);
-        assert!(response.body.contains("bad key"));
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        assert!(response.body().contains("bad key"));
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_an_io_error() {
+        // Port 1 on localhost refuses connections.
+        let err = test_transport()
+            .send(post(
+                "http://127.0.0.1:1/v1/chat/completions".to_owned(),
+                "{}",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Io(_)));
     }
 }

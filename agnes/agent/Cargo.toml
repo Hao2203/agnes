@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 agnes-core.workspace = true
 agnes-ports.workspace = true
+agnes-util.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 thiserror.workspace = true
@@ -16,6 +17,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "time"] }
 
 [dev-dependencies]
+http.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 
