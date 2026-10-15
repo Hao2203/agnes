@@ -87,7 +87,7 @@ impl WireMessage {
             },
             Message::ToolResult { call_id, output } => Self::ToolResult {
                 tool_call_id: call_id.as_str().to_owned(),
-                content: output.content.as_str().to_owned(),
+                content: output.content.as_ref().to_owned(),
             },
         }
     }
@@ -133,7 +133,7 @@ impl WireTool {
             kind: "function",
             function: WireFunctionSpec {
                 name: spec.name.as_str().to_owned(),
-                description: spec.description.as_str().to_owned(),
+                description: spec.description.as_ref().to_owned(),
                 parameters: spec.parameters.get().clone(),
             },
         }

@@ -24,7 +24,8 @@ agnes-transport-reqwest = { path = "agnes/transport-reqwest" }
 agnes-llm-openai = { path = "agnes/llm-openai" }
 agnes-agent = { path = "agnes/agent" }
 async-trait = "0.1"
-cold-string = "0.5"
+secrecy = "0.10"
+url = "2"
 http = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

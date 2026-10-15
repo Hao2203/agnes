@@ -31,7 +31,7 @@ impl<T: HttpTransport> OpenAiClient<T> {
             .expect("request serialization cannot fail");
         http::Request::builder()
             .method(http::Method::POST)
-            .uri(self.base_url.join("/chat/completions"))
+            .uri(self.base_url.join("chat/completions").as_str())
             .header(
                 http::header::AUTHORIZATION,
                 format!("Bearer {}", self.api_key.expose()),

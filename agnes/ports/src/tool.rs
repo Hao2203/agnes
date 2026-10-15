@@ -137,7 +137,7 @@ mod tests {
 
         let ok = registry.execute(&call("echo", r#"{"x":1}"#)).await;
         assert!(!ok.is_error);
-        assert_eq!(ok.content, r#"{"x":1}"#);
+        assert_eq!(&*ok.content, r#"{"x":1}"#);
 
         let missing = registry.execute(&call("nope", "{}")).await;
         assert!(missing.is_error);

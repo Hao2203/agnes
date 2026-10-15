@@ -2,25 +2,24 @@
 //! [`agnes_ports::tool::Tool`] port and registry live in `agnes-ports`.
 
 use crate::config::ConfigError;
-use cold_string::ArcColdString;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Name of a tool. Non-empty, no whitespace. Used as a map key and cloned
-/// whenever specs are snapshotted; refcounted and one word wide, so both
-/// uses stay cheap.
+/// whenever specs are snapshotted; refcounted, so both uses stay cheap.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ToolName(ArcColdString);
+pub struct ToolName(Arc<str>);
 
 impl ToolName {
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 }
 
 impl fmt::Display for ToolName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -37,7 +36,7 @@ impl FromStr for ToolName {
                 value: trimmed.to_owned(),
             });
         }
-        Ok(Self(ArcColdString::new(trimmed)))
+        Ok(Self(Arc::from(trimmed)))
     }
 }
 
@@ -72,7 +71,7 @@ impl JsonSchema {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub name: ToolName,
-    pub description: ArcColdString,
+    pub description: Arc<str>,
     pub parameters: JsonSchema,
 }
 

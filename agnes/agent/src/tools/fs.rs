@@ -285,11 +285,11 @@ mod tests {
             .run(&ToolArguments::new(r#"{"path": "sub/a.txt"}"#))
             .await
             .unwrap();
-        assert_eq!(out.content, "hello");
+        assert_eq!(&*out.content, "hello");
 
         let list = ListDir::new(dir.path());
         let out = list.run(&ToolArguments::new("{}")).await.unwrap();
-        assert_eq!(out.content, "sub/");
+        assert_eq!(&*out.content, "sub/");
     }
 
     #[tokio::test]

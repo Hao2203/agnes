@@ -6,47 +6,47 @@
 use crate::config::SystemPrompt;
 use crate::content::Content;
 use agnes_util::NonEmpty;
-use cold_string::ArcColdString;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::sync::Arc;
 
 /// Identifier of a tool call, assigned by the model. Cloned for every tool
 /// result written back into the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCallId(ArcColdString);
+pub struct ToolCallId(Arc<str>);
 
 impl ToolCallId {
-    pub fn new(value: impl Into<ArcColdString>) -> Self {
-        Self(value.into())
+    pub fn new(value: impl AsRef<str>) -> Self {
+        Self(Arc::from(value.as_ref()))
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 }
 
 impl fmt::Display for ToolCallId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.as_str())
     }
 }
 
 /// Raw JSON arguments of a tool call, not yet parsed against the tool's
 /// schema. Parsing happens inside the tool (parse at the boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolArguments(ArcColdString);
+pub struct ToolArguments(Arc<str>);
 
 impl ToolArguments {
-    pub fn new(value: impl Into<ArcColdString>) -> Self {
+    pub fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 
     pub fn parse<T: DeserializeOwned>(&self) -> serde_json::Result<T> {
-        serde_json::from_str(self.0.as_str())
+        serde_json::from_str(&self.0)
     }
 }
 
@@ -61,19 +61,19 @@ pub struct ToolCall {
 /// see them and react. Cloned into the transcript once per result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
-    pub content: ArcColdString,
+    pub content: Arc<str>,
     pub is_error: bool,
 }
 
 impl ToolOutput {
-    pub fn success(content: impl Into<ArcColdString>) -> Self {
+    pub fn success(content: impl Into<Arc<str>>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
         }
     }
 
-    pub fn error(content: impl Into<ArcColdString>) -> Self {
+    pub fn error(content: impl Into<Arc<str>>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
