@@ -14,8 +14,8 @@ use agnes_core::content::Content;
 use agnes_core::context::Context;
 use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_core::message::{TokenUsage, ToolCall, ToolCallId, ToolOutput};
+use agnes_core::task::{Agent, AgentConfig, ModelTurn, Outcome, ToolBatch, ToolsTurn, TurnError};
 use agnes_core::tool::ToolName;
-use agnes_core::turn::{Agent, AgentConfig, ModelTurn, Outcome, ToolBatch, ToolsTurn, TurnError};
 use agnes_io::input::Input;
 use agnes_io::llm::{Llm, LlmError};
 use agnes_io::tool::ToolRegistry;
@@ -240,7 +240,7 @@ fn interrupted_output() -> ToolOutput {
 }
 
 fn finish(
-    finished: Agent<agnes_core::turn::Finished>,
+    finished: Agent<agnes_core::task::Finished>,
     system: SystemPrompt,
     started_at: Timestamp,
     sink: &mut dyn Sink,

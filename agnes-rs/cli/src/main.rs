@@ -15,7 +15,7 @@ use agnes_agent::{Event, Sink};
 use agnes_core::config::{ApiKey, BaseUrl, ModelName, SystemPrompt, TurnBudget};
 use agnes_core::content::Content;
 use agnes_core::context::Context;
-use agnes_core::turn::Outcome;
+use agnes_core::task::Outcome;
 use agnes_io::input::Input;
 use agnes_io::llm::Llm;
 use agnes_io::tool::{Tool, ToolRegistry};
@@ -239,7 +239,7 @@ impl Host<'_> {
             .to_string()
             .parse()
             .context("invalid --max-turns")?;
-        let config = agnes_core::turn::AgentConfig {
+        let config = agnes_core::task::AgentConfig {
             context,
             goal,
             tools: self.registry.specs(),

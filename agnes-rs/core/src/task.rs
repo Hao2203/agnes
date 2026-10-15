@@ -147,6 +147,17 @@ impl ToolResults {
     }
 }
 
+/// Consumes the results into owned pairs, in call order. The pairs share a
+/// single allocation, so each is copied out as it is yielded.
+impl IntoIterator for ToolResults {
+    type Item = (ToolCall, ToolOutput);
+    type IntoIter = std::vec::IntoIter<(ToolCall, ToolOutput)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.pairs.to_vec().into_iter()
+    }
+}
+
 /// What to do after a model response.
 #[derive(Debug)]
 pub enum ModelTurn {
@@ -371,10 +382,10 @@ impl Agent<AwaitingTools> {
 
 /// Appends one tool result per pending call, in call order.
 fn absorb(transcript: &mut Transcript, results: ToolResults) {
-    for (call, output) in results.iter() {
+    for (call, output) in results {
         transcript.push(Message::ToolResult {
-            call_id: call.id.clone(),
-            output: output.clone(),
+            call_id: call.id,
+            output,
         });
     }
 }
@@ -592,6 +603,28 @@ mod tests {
                 got: 1
             }
         ));
+    }
+
+    #[test]
+    fn into_iter_yields_owned_pairs_in_call_order() {
+        let (agent, _prompt) = Agent::new(config(4)).start();
+        let ModelTurn::NeedTools { agent: _, batch } = agent
+            .model_responded(response(
+                tool_use(vec![call("c1", "flag"), call("c2", "flag")]),
+                TokenUsage::default(),
+            ))
+            .unwrap()
+        else {
+            panic!("expected NeedTools");
+        };
+        let results = batch.complete(vec![output(true), output(false)]).unwrap();
+
+        let pairs: Vec<(ToolCall, ToolOutput)> = results.into_iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0.id.as_str(), "c1");
+        assert!(!pairs[0].1.is_error);
+        assert_eq!(pairs[1].0.id.as_str(), "c2");
+        assert!(pairs[1].1.is_error);
     }
 
     #[test]

@@ -76,7 +76,7 @@ mod tests {
     use agnes_core::content::Content;
     use agnes_core::llm::Prompt;
     use agnes_core::message::Transcript;
-    use agnes_core::turn::{Agent, AgentConfig, ModelTurn};
+    use agnes_core::task::{Agent, AgentConfig, ModelTurn};
     use std::num::NonZeroU32;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
@@ -287,7 +287,7 @@ mod tests {
         let results = batch
             .complete(vec![agnes_core::message::ToolOutput::success("ok")])
             .unwrap();
-        let agnes_core::turn::ToolsTurn::NeedModel { agent, prompt } =
+        let agnes_core::task::ToolsTurn::NeedModel { agent, prompt } =
             agent.tools_resolved(results, Vec::new()).unwrap()
         else {
             panic!("expected NeedModel");
@@ -299,7 +299,7 @@ mod tests {
         };
         assert!(matches!(
             finished.outcome(),
-            agnes_core::turn::Outcome::Completed { .. }
+            agnes_core::task::Outcome::Completed { .. }
         ));
     }
 }
