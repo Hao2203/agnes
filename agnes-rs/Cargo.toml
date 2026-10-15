@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "agnes/core",
-    "agnes/util",
-    "agnes/io",
-    "agnes/transport-reqwest",
-    "agnes/llm-openai",
-    "agnes/agent",
-    "agnes/cli",
+    "core",
+    "util",
+    "io",
+    "transport-reqwest",
+    "llm-openai",
+    "agent",
+    "cli",
 ]
 
 [workspace.package]
@@ -17,12 +17,12 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-agnes-core = { path = "agnes/core" }
-agnes-util = { path = "agnes/util" }
-agnes-io = { path = "agnes/io" }
-agnes-transport-reqwest = { path = "agnes/transport-reqwest" }
-agnes-llm-openai = { path = "agnes/llm-openai" }
-agnes-agent = { path = "agnes/agent" }
+agnes-core = { path = "core" }
+agnes-util = { path = "util" }
+agnes-io = { path = "io" }
+agnes-transport-reqwest = { path = "transport-reqwest" }
+agnes-llm-openai = { path = "llm-openai" }
+agnes-agent = { path = "agent" }
 async-trait = "0.1"
 secrecy = "0.10"
 url = "2"
