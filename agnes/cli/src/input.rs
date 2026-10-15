@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agnes_core::content::Content;
-use agnes_ports::input::Input;
+use agnes_io::input::Input;
 use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Notify, watch};

@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "agnes/core",
     "agnes/util",
-    "agnes/ports",
+    "agnes/io",
     "agnes/transport-reqwest",
     "agnes/llm-openai",
     "agnes/agent",
@@ -19,7 +19,7 @@ license = "MIT"
 [workspace.dependencies]
 agnes-core = { path = "agnes/core" }
 agnes-util = { path = "agnes/util" }
-agnes-ports = { path = "agnes/ports" }
+agnes-io = { path = "agnes/io" }
 agnes-transport-reqwest = { path = "agnes/transport-reqwest" }
 agnes-llm-openai = { path = "agnes/llm-openai" }
 agnes-agent = { path = "agnes/agent" }

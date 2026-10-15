@@ -1,4 +1,4 @@
-//! Async tool port and the registry the driver consults.
+//! Async tool seam and the registry the driver consults.
 
 use agnes_core::message::{ToolArguments, ToolCall, ToolOutput};
 use agnes_core::tool::{ToolError, ToolName, ToolSpec};

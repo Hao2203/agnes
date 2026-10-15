@@ -6,7 +6,7 @@ use agnes_core::message::{
     AssistantMessage, Message, TokenUsage, ToolArguments, ToolCall, ToolCallId,
 };
 use agnes_core::tool::{ToolName, ToolSpec};
-use agnes_ports::llm::LlmError;
+use agnes_io::llm::LlmError;
 use agnes_util::NonEmpty;
 use serde::Deserialize;
 use serde_json::Value;

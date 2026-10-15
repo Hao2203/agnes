@@ -16,10 +16,10 @@ use agnes_core::config::{ApiKey, BaseUrl, ModelName, SystemPrompt, TurnBudget};
 use agnes_core::content::Content;
 use agnes_core::context::Context;
 use agnes_core::turn::Outcome;
+use agnes_io::input::Input;
+use agnes_io::llm::Llm;
+use agnes_io::tool::{Tool, ToolRegistry};
 use agnes_llm_openai::OpenAiClient;
-use agnes_ports::input::Input;
-use agnes_ports::llm::Llm;
-use agnes_ports::tool::{Tool, ToolRegistry};
 use agnes_transport_reqwest::ReqwestTransport;
 
 use crate::input::{Line, UserInput};

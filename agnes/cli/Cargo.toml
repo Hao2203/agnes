@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 agnes-core.workspace = true
-agnes-ports.workspace = true
+agnes-io.workspace = true
 agnes-transport-reqwest.workspace = true
 agnes-llm-openai.workspace = true
 agnes-agent.workspace = true

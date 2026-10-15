@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use agnes_core::message::{ToolArguments, ToolOutput};
 use agnes_core::tool::{ToolError, ToolSpec};
-use agnes_ports::tool::Tool;
+use agnes_io::tool::Tool;
 use async_trait::async_trait;
 
 /// Largest combined output handed back to the model, in characters.

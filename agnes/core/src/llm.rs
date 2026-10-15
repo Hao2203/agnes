@@ -1,6 +1,6 @@
 //! Model-call data for one chat-completion round: the prompt the state
-//! machine hands out, and the concrete request/response the port carries.
-//! Pure data — the port itself lives in `agnes-ports`.
+//! machine hands out, and the concrete request/response the seam carries.
+//! Pure data — the seam itself lives in `agnes-io`.
 
 use crate::config::ModelName;
 use crate::content::Content;
@@ -20,7 +20,7 @@ pub struct Prompt {
     pub tools: Vec<ToolSpec>,
 }
 
-/// The concrete request the port carries: the semantic [`Prompt`] plus the
+/// The concrete request the seam carries: the semantic [`Prompt`] plus the
 /// model name the host wires in.
 #[derive(Debug, Clone)]
 pub struct LlmRequest {

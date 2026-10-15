@@ -1,7 +1,7 @@
 //! Async driver that interprets the [`agnes_core::turn`] effects.
 //!
 //! The state machine says *what* to do (call the model, run tools); this
-//! crate does it — through the async ports in `agnes-ports` — and reports
+//! crate does it — through the async I/O seams in `agnes-io` — and reports
 //! [`Event`]s along the way. The runtime itself (tokio, smol, …) is chosen
 //! by the host's executor and transport, never by this crate.
 
@@ -16,9 +16,9 @@ use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_core::message::{TokenUsage, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::{Agent, AgentConfig, ModelTurn, Outcome, ToolBatch, ToolsTurn, TurnError};
-use agnes_ports::input::Input;
-use agnes_ports::llm::{Llm, LlmError};
-use agnes_ports::tool::ToolRegistry;
+use agnes_io::input::Input;
+use agnes_io::llm::{Llm, LlmError};
+use agnes_io::tool::ToolRegistry;
 use jiff::Timestamp;
 
 #[derive(Debug, thiserror::Error)]
@@ -276,8 +276,8 @@ mod tests {
     use agnes_core::llm::{LlmRequest, LlmResponse, StopReason};
     use agnes_core::message::ToolArguments;
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
-    use agnes_ports::input::{Input, NoInput};
-    use agnes_ports::tool::Tool;
+    use agnes_io::input::{Input, NoInput};
+    use agnes_io::tool::Tool;
     use agnes_util::NonEmpty;
     use async_trait::async_trait;
     use std::collections::VecDeque;

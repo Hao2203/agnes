@@ -1,4 +1,4 @@
-//! OpenAI-format adapter for the async [`agnes_ports::llm::Llm`] port.
+//! OpenAI-format adapter for the async [`agnes_io::llm::Llm`] seam.
 //!
 //! Generic over [`HttpTransport`]: pair it with `agnes-transport-reqwest`
 //! (tokio) today or any other async transport tomorrow.
@@ -6,8 +6,8 @@ pub mod wire;
 
 use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_core::llm::{LlmRequest, LlmResponse};
-use agnes_ports::http::{HttpTransport, TransportError};
-use agnes_ports::llm::{Llm, LlmError};
+use agnes_io::http::{HttpTransport, TransportError};
+use agnes_io::llm::{Llm, LlmError};
 use async_trait::async_trait;
 
 /// Client for any OpenAI-compatible chat-completions API.

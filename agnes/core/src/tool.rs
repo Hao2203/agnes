@@ -1,5 +1,5 @@
 //! Tool vocabulary: names, specs, and errors. Pure data — the async
-//! [`agnes_ports::tool::Tool`] port and registry live in `agnes-ports`.
+//! [`agnes_io::tool::Tool`] seam and registry live in `agnes-io`.
 
 use crate::config::ConfigError;
 use std::fmt;

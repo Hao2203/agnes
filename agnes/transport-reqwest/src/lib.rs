@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use agnes_ports::http::{HttpTransport, TransportError};
+use agnes_io::http::{HttpTransport, TransportError};
 use async_trait::async_trait;
 
 /// Async transport with per-request total and connect timeouts.

@@ -7,7 +7,7 @@ name = "agnes-agent"
 version = "0.1.0"
 dependencies = [
  "agnes-core",
- "agnes-ports",
+ "agnes-io",
  "agnes-util",
  "async-trait",
  "http",
@@ -25,8 +25,8 @@ version = "0.1.0"
 dependencies = [
  "agnes-agent",
  "agnes-core",
+ "agnes-io",
  "agnes-llm-openai",
- "agnes-ports",
  "agnes-transport-reqwest",
  "anyhow",
  "async-trait",
@@ -48,22 +48,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agnes-llm-openai"
-version = "0.1.0"
-dependencies = [
- "agnes-core",
- "agnes-ports",
- "agnes-util",
- "anyhow",
- "async-trait",
- "http",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "agnes-ports"
+name = "agnes-io"
 version = "0.1.0"
 dependencies = [
  "agnes-core",
@@ -76,10 +61,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agnes-llm-openai"
+version = "0.1.0"
+dependencies = [
+ "agnes-core",
+ "agnes-io",
+ "agnes-util",
+ "anyhow",
+ "async-trait",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agnes-transport-reqwest"
 version = "0.1.0"
 dependencies = [
- "agnes-ports",
+ "agnes-io",
  "anyhow",
  "async-trait",
  "http",

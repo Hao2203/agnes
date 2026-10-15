@@ -1,4 +1,4 @@
-//! Async port to a chat-completion model.
+//! Async I/O seam to a chat-completion model.
 
 use crate::http::TransportError;
 use agnes_core::llm::{LlmRequest, LlmResponse};
@@ -17,8 +17,8 @@ pub enum LlmError {
     Malformed { detail: String },
 }
 
-/// Port to a chat-completion model. Implementations do the async I/O; the
-/// state machine and driver stay runtime-agnostic.
+/// Async I/O seam to a chat-completion model. Implementations do the async
+/// I/O; the state machine and driver stay runtime-agnostic.
 #[async_trait]
 pub trait Llm: Send + Sync {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;

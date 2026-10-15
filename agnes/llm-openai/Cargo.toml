@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 agnes-core.workspace = true
-agnes-ports.workspace = true
+agnes-io.workspace = true
 agnes-util.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use agnes_core::message::{ToolArguments, ToolOutput};
 use agnes_core::tool::{ToolError, ToolName, ToolSpec};
-use agnes_ports::tool::Tool;
+use agnes_io::tool::Tool;
 use async_trait::async_trait;
 
 /// Largest tool output handed back to the model, in characters.
