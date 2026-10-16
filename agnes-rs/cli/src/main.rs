@@ -7,15 +7,17 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
-use jiff::Timestamp;
 use tokio::io::AsyncReadExt;
 
 use agnes_agent::tools::{ListDir, ReadFile, Shell, WriteFile};
-use agnes_agent::{Event, Sink};
-use agnes_core::config::{ApiKey, BaseUrl, ModelName, SystemPrompt, TurnBudget};
+use agnes_agent::{Event, Sink, StandardRequestBuilder};
+use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
-use agnes_core::context::Context;
-use agnes_core::task::Outcome;
+use agnes_core::context::{Context, Environment};
+use agnes_core::event::Event as CoreEvent;
+use agnes_core::llm::StopReason;
+use agnes_core::message::MessageDelta;
+use agnes_core::turn::Outcome;
 use agnes_io::input::Input;
 use agnes_io::llm::Llm;
 use agnes_io::tool::{Tool, ToolRegistry};
@@ -26,7 +28,7 @@ use crate::input::{Line, UserInput};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
-const DEFAULT_MAX_TURNS: u32 = 32;
+const DEFAULT_MAX_STEPS: u32 = 32;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const SYSTEM_PROMPT: &str = "You are agnes, a terminal coding assistant. Use the provided tools \
      to inspect and modify files in the working directory. Be concise.";
@@ -53,9 +55,9 @@ struct Cli {
     #[arg(long, global = true, env = "AGNES_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
-    /// Maximum number of model turns per task
-    #[arg(long, global = true, default_value_t = DEFAULT_MAX_TURNS)]
-    max_turns: u32,
+    /// Maximum number of model round trips (steps) per task
+    #[arg(long, global = true, default_value_t = DEFAULT_MAX_STEPS)]
+    max_steps: u32,
 
     /// Offer the run_shell tool to the model
     #[arg(long, global = true)]
@@ -136,19 +138,15 @@ async fn real_main() -> anyhow::Result<()> {
             let input = UserInput::new();
             input::spawn_ctrl_c(&input);
             input.begin_run();
+            let printer = EventPrinter::new(model.clone());
             let host = Host {
                 llm: &client,
                 registry: &registry,
                 model,
-                max_turns: cli.max_turns,
+                max_steps: cli.max_steps,
             };
             let summary = host
-                .run_task(
-                    goal,
-                    Context::new(SystemPrompt::new(SYSTEM_PROMPT)),
-                    &*input,
-                    EventPrinter::default(),
-                )
+                .run_task(goal, session_context(&registry), &*input, printer)
                 .await?;
             print_summary(&summary);
         }
@@ -164,9 +162,9 @@ async fn real_main() -> anyhow::Result<()> {
                 llm: &client,
                 registry: &registry,
                 model,
-                max_turns: cli.max_turns,
+                max_steps: cli.max_steps,
             };
-            let mut context = Context::new(SystemPrompt::new(SYSTEM_PROMPT));
+            let mut context = session_context(&registry);
             loop {
                 print!("agnes> ");
                 std::io::stdout().flush().ok();
@@ -179,13 +177,22 @@ async fn real_main() -> anyhow::Result<()> {
                     Line::Task(goal) => {
                         input.begin_run();
                         let result = host
-                            .run_task(goal, context.clone(), &*input, EventPrinter::default())
+                            .run_task(
+                                goal,
+                                context.clone(),
+                                &*input,
+                                EventPrinter::new(host.model.clone()),
+                            )
                             .await;
                         input.end_run();
                         match result {
                             Ok(summary) => {
                                 print_summary(&summary);
                                 context = summary.context;
+                                // 没来得及生效的插话排回队列，下一行接着跑
+                                for message in summary.pending_user_messages {
+                                    input.push(crate::input::Line::Task(message));
+                                }
                             }
                             Err(err) => eprintln!("error: {err:#}"),
                         }
@@ -195,6 +202,15 @@ async fn real_main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A fresh session: the system prompt plus the tools this host offers, which
+/// are recorded on the context as its environment.
+fn session_context(registry: &ToolRegistry) -> Context {
+    Context::new(
+        SystemPrompt::new(SYSTEM_PROMPT),
+        Environment::new(registry.specs()),
+    )
 }
 
 /// The task for a one-shot `run`: the first line on a terminal, or all of a
@@ -218,12 +234,12 @@ async fn read_goal_from_stdin() -> anyhow::Result<String> {
 }
 
 /// The fixed wiring every task run needs: the model client, the tool
-/// registry, the model name and the turn budget.
+/// registry, the model name and the step budget.
 struct Host<'a> {
     llm: &'a dyn Llm,
     registry: &'a Arc<ToolRegistry>,
     model: ModelName,
-    max_turns: u32,
+    max_steps: u32,
 }
 
 impl Host<'_> {
@@ -234,24 +250,24 @@ impl Host<'_> {
         input: &dyn Input,
         printer: EventPrinter,
     ) -> anyhow::Result<agnes_agent::RunSummary> {
-        let budget: TurnBudget = self
-            .max_turns
+        let budget: StepBudget = self
+            .max_steps
             .to_string()
             .parse()
             .context("invalid --max-turns")?;
-        let config = agnes_core::task::AgentConfig {
+        let config = agnes_core::turn::AgentConfig {
             context,
             goal,
-            tools: self.registry.specs(),
             budget,
         };
+        let requests = StandardRequestBuilder::new(self.model.clone());
         let mut printer = printer;
         agnes_agent::run(
             config,
-            self.model.clone(),
             Arc::clone(self.registry),
             self.llm,
             input,
+            &requests,
             &mut printer,
         )
         .await
@@ -259,46 +275,76 @@ impl Host<'_> {
     }
 }
 
-#[derive(Default)]
 struct EventPrinter {
-    started_at: Option<Timestamp>,
+    model: ModelName,
+}
+
+impl EventPrinter {
+    fn new(model: ModelName) -> Self {
+        Self { model }
+    }
+
+    /// Renders one event from the context log.
+    fn recorded(&self, event: &CoreEvent) {
+        match event {
+            CoreEvent::TurnStart => println!("─ turn ─"),
+            CoreEvent::MessageStart { .. } => println!("→ model call"),
+            CoreEvent::MessageUpdate { delta, .. } => print_delta(delta),
+            CoreEvent::MessageEnd { stop, .. } => {
+                if matches!(stop, StopReason::ToolUse { .. }) {
+                    println!("← tool calls requested");
+                }
+            }
+            CoreEvent::ToolExecutionStart { call, .. } => {
+                println!("  ⚒ {} {}", call.name, call.arguments.as_str());
+            }
+            CoreEvent::ToolExecutionEnd { is_error, .. } => {
+                if *is_error {
+                    println!("  ✗ failed");
+                }
+            }
+            // messages are rendered by the summary; the injected marker is
+            // handled above; step/turn closes carry no extra news
+            CoreEvent::Message(_)
+            | CoreEvent::UserMessagesInjected { .. }
+            | CoreEvent::StepStart { .. }
+            | CoreEvent::StepEnd { .. }
+            | CoreEvent::TurnEnd { .. } => {}
+        }
+    }
 }
 
 impl Sink for EventPrinter {
     fn event(&mut self, event: &Event) {
         match event {
-            Event::Started { model, tools, .. } => {
-                self.started_at = Some(Timestamp::now());
+            Event::Started { tools, .. } => {
                 let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
-                println!("* model {model}, tools: [{}]", names.join(", "));
+                println!("* model {}, tools: [{}]", self.model, names.join(", "));
             }
-            Event::ModelRequested { turn, .. } => {
-                println!("→ model call (turn {turn})");
-            }
-            Event::ModelResponded { stop, .. } => {
-                if matches!(stop, agnes_core::llm::StopReason::ToolUse { .. }) {
-                    println!("← tool calls requested");
+            Event::Recorded { event, .. } => match event {
+                CoreEvent::UserMessagesInjected { messages, .. } => {
+                    println!("  ▸ injected {} queued message(s)", messages.len());
                 }
-            }
-            Event::ToolStarted { call, .. } => {
-                println!("  ⚒ {} {}", call.name, call.arguments.as_str());
-            }
-            Event::ToolFinished { is_error, .. } => {
-                if *is_error {
-                    println!("  ✗ failed");
-                }
-            }
-            Event::UserMessagesInjected { messages, .. } => {
-                println!("  ▸ injected {} queued message(s)", messages.len());
-            }
+                other => self.recorded(other),
+            },
             Event::Finished { .. } => {}
         }
     }
 }
 
+/// Streamed text is written through as it arrives; other fragments wait for
+/// the assembled message. Streaming adapters are not wired up yet, so this
+/// fires only once they are.
+fn print_delta(delta: &MessageDelta) {
+    if let MessageDelta::Text(text) = delta {
+        print!("{text}");
+        std::io::stdout().flush().ok();
+    }
+}
+
 fn print_summary(summary: &agnes_agent::RunSummary) {
     match &summary.outcome {
-        Outcome::Completed { reply } => {
+        Outcome::Answered { reply } => {
             println!();
             println!("{reply}");
         }
@@ -308,7 +354,7 @@ fn print_summary(summary: &agnes_agent::RunSummary) {
         }
         Outcome::BudgetExhausted => {
             println!();
-            println!("(stopped: turn budget exhausted — raise --max-turns)");
+            println!("(stopped: step budget exhausted — raise --max-turns)");
         }
         Outcome::LengthExceeded => {
             println!();
@@ -317,7 +363,11 @@ fn print_summary(summary: &agnes_agent::RunSummary) {
     }
     let seconds = summary.duration().as_secs();
     println!(
-        "[{seconds}s, turn {}, {}]",
-        summary.turns_used, summary.usage
+        "[{seconds}s, {} step(s), {}]",
+        summary.steps_used, summary.usage
     );
+    // 单次 run：没生效的插话已经无处可去，提示一下别静默丢失
+    for message in &summary.pending_user_messages {
+        eprintln!("note: unused queued message: {message}");
+    }
 }

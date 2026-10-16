@@ -72,11 +72,10 @@ impl<T: HttpTransport> Llm for OpenAiClient<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::config::{ModelName, SystemPrompt, TurnBudget};
+    use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::content::Content;
     use agnes_core::llm::Prompt;
-    use agnes_core::message::Transcript;
-    use agnes_core::task::{Agent, AgentConfig, ModelTurn};
+    use agnes_core::message::Message;
     use std::num::NonZeroU32;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
@@ -128,12 +127,14 @@ mod tests {
         LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
             prompt: Prompt {
-                input: Transcript::new(
-                    SystemPrompt::new("sys"),
-                    Content::try_from("do the thing").unwrap(),
-                    Vec::new(),
-                )
-                .into_messages(),
+                input: vec![
+                    Message::System {
+                        content: SystemPrompt::new("sys"),
+                    },
+                    Message::User {
+                        content: Content::try_from("do the thing").unwrap(),
+                    },
+                ],
                 tools: Vec::new(),
             },
         }
@@ -267,39 +268,67 @@ mod tests {
             ApiKey::new("sk-test").unwrap(),
         );
 
-        let config = AgentConfig {
-            context: agnes_core::context::Context::new(SystemPrompt::new("sys")),
+        let config = agnes_core::turn::AgentConfig {
+            context: agnes_core::context::Context::new(
+                SystemPrompt::new("sys"),
+                agnes_core::context::Environment::default(),
+            ),
             goal: Content::try_from("flip").unwrap(),
-            tools: Vec::new(),
-            budget: TurnBudget::new(NonZeroU32::new(4).unwrap()),
+            budget: agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
         };
         let model = ModelName::from_str("gpt-test").unwrap();
-        let (agent, prompt) = Agent::new(config).start();
-        let request = LlmRequest {
+        let mut turn = agnes_core::turn::Turn::start(config);
+        let mut request = build(&turn, &model);
+        while turn.poll_actions().is_some() {}
+
+        let response = Llm::complete(&openai, &request).await.unwrap();
+        turn.handle(agnes_core::turn::Input::ModelResponded(response));
+        let mut call: Option<agnes_core::message::ToolCall> = None;
+        while let Some(action) = turn.poll_actions() {
+            match action {
+                agnes_core::turn::Action::CallModel => {
+                    request = build(&turn, &model);
+                }
+                agnes_core::turn::Action::RunTool(run) => call = Some(run),
+                _ => {}
+            }
+        }
+        assert!(
+            matches!(
+                &call,
+                Some(tool) if tool.id.as_str() == "call_1" && tool.name.as_str() == "flag"
+            ),
+            "第一个响应应该派发 flag 调用"
+        );
+
+        let call = call.unwrap();
+        turn.handle(agnes_core::turn::Input::ToolStarted(call.id.clone()));
+        turn.handle(agnes_core::turn::Input::ToolFinished {
+            call_id: call.id.clone(),
+            output: agnes_core::message::ToolOutput::success("ok"),
+        });
+        while let Some(action) = turn.poll_actions() {
+            if let agnes_core::turn::Action::CallModel = action {
+                request = build(&turn, &model);
+            }
+        }
+
+        let response = Llm::complete(&openai, &request).await.unwrap();
+        turn.handle(agnes_core::turn::Input::ModelResponded(response));
+        while turn.poll_actions().is_some() {}
+        assert_eq!(
+            turn.outcome(),
+            Some(&agnes_core::turn::Outcome::Answered {
+                reply: Content::try_from("flipped it").unwrap()
+            })
+        );
+    }
+
+    /// 在见到 `Action::CallModel` 的当下，用会话状态构造具体请求。
+    fn build(turn: &agnes_core::turn::Turn, model: &ModelName) -> LlmRequest {
+        LlmRequest {
             model: model.clone(),
-            prompt,
-        };
-        let response = Llm::complete(&openai, &request).await.unwrap();
-        let ModelTurn::NeedTools { agent, batch } = agent.model_responded(response).unwrap() else {
-            panic!("expected NeedTools");
-        };
-        assert_eq!(batch.calls().len(), 1);
-        let results = batch
-            .complete(vec![agnes_core::message::ToolOutput::success("ok")])
-            .unwrap();
-        let agnes_core::task::ToolsTurn::NeedModel { agent, prompt } =
-            agent.tools_resolved(results, Vec::new()).unwrap()
-        else {
-            panic!("expected NeedModel");
-        };
-        let request = LlmRequest { model, prompt };
-        let response = Llm::complete(&openai, &request).await.unwrap();
-        let ModelTurn::Done(finished) = agent.model_responded(response).unwrap() else {
-            panic!("expected Done");
-        };
-        assert!(matches!(
-            finished.outcome(),
-            agnes_core::task::Outcome::Completed { .. }
-        ));
+            prompt: Prompt::from_context(turn.context()),
+        }
     }
 }

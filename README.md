@@ -10,6 +10,9 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 ## 特性
 
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
+- 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
+  `turn_end`）全程记入 `Context` 的事件日志，消息本身也是事件，
+  完整顺序随时可复原
 - 端口与适配器分离：`core` 无 I/O、无异步，替换运行时只需更换适配器
 - 边界处一次性解析：模型名、URL、API key、工具名等都是强类型
 - 秘密保护：API key 由 `secrecy` 承载，调试输出不泄露明文
@@ -129,9 +132,10 @@ util ← core ← io ← agent ← cli
 ### 关键设计
 
 - **类型状态机**：`Agent<Ready>` → `Agent<AwaitingModel>` →
-  `Agent<AwaitingTools>` → `Agent<Finished>`。每次转移消耗当前状态并
-  返回下一个状态与效果（`ModelTurn` / `ToolsTurn`）；上层驱动器解释
-  效果、组装 `LlmRequest` 并调用模型。
+  `Agent<AwaitingTools>` → `Agent<Finished>`；一个 task 由多轮
+  `turn` 组成（`Turn<Generating>` → `Turn<Executing>` →
+  `Turn<Ended>`）。每次转移消耗当前状态、把发生的事写进 `Context`
+  （消息与生命周期事件），并返回下一个状态与该转移产生的 `Events`。
 - **端口与适配器**：`Llm`、`Tool`、`HttpTransport`、`Input` 都是
   `async_trait` 端口；`OpenAiClient<T: HttpTransport>` 不绑定具体传输。
 - **非法状态不可表示**：`StopReason::ToolUse` 携带非空的
@@ -139,9 +143,16 @@ util ← core ← io ← agent ← cli
   承载，错误类型不携带字符串载荷。
 - **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型；
   只有模型或传输错误会中止运行。
-- **会话记忆**：`Context` 保存系统提示与历史消息，
-  `RunSummary.context` 可直接传回下一次运行；`/new` 调用
-  `Context::reset()`。
+- **Context 即账本**：系统提示、环境（tools）以及一条按发生顺序记录
+  的事件日志；消息也是事件（`Event::Message`），因此任意时刻的完整顺序
+  都能从 `Context::events()` 复原。`RunSummary.context` 可直接传回
+  下一次运行；`/new` 调用 `Context::reset()` 清空日志。
+- **转换者由宿主决定**：`core` 不组装提示词；驱动器在每次模型调用前用
+  宿主的 `RequestBuilder` 把 `Context` 转成 `LlmRequest`，提示词怎么构造
+  完全由实现决定（`Prompt::from_context` 是标准投影，
+  `StandardRequestBuilder` 是现成实现）。
+- **两阶段可中断**：等待模型消息与等待工具执行都能被打断，且都会以
+  `turn_end` 收尾——工具阶段必须补齐每个调用的结果。
 
 ## 开发
 

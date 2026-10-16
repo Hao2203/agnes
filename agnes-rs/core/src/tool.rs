@@ -1,19 +1,45 @@
 //! Tool vocabulary: names, specs, and errors. Pure data — the async
 //! [`agnes_io::tool::Tool`] seam and registry live in `agnes-io`.
+//!
+//! Names may be short and are cloned on every spec snapshot, so they wrap
+//! `ArcColdString` (inline when short, refcounted when long). Descriptions are
+//! prose that can never be inline, so they stay on the standard `Arc<str>`.
+//! Both representations are internal; the public surface speaks `&str`.
 
 use crate::config::ConfigError;
+use cold_string::ArcColdString;
+use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
 /// Name of a tool. Non-empty, no whitespace. Used as a map key and cloned
-/// whenever specs are snapshotted; refcounted, so both uses stay cheap.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ToolName(Arc<str>);
+/// whenever specs are snapshotted; short names are stored inline and longer
+/// ones are refcounted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ToolName(ArcColdString);
 
 impl ToolName {
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for ToolName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ToolName").field(&self.as_str()).finish()
+    }
+}
+
+impl PartialOrd for ToolName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ToolName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
     }
 }
 
@@ -36,7 +62,7 @@ impl FromStr for ToolName {
                 value: trimmed.to_owned(),
             });
         }
-        Ok(Self(Arc::from(trimmed)))
+        Ok(Self(ArcColdString::new(trimmed)))
     }
 }
 
@@ -67,7 +93,9 @@ impl JsonSchema {
 }
 
 /// The contract a model sees: name, description, parameter schema. Cloned
-/// whenever specs are snapshotted for a request.
+/// whenever specs are snapshotted for a request. The description is prose
+/// that can never be inline, so it stays on the standard `Arc<str>`; the
+/// name carries its own internal representation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub name: ToolName,

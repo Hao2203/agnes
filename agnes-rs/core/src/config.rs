@@ -1,6 +1,12 @@
 //! Boundary types: values that enter the system as free-form strings are
 //! parsed exactly once and carried as newtypes from then on.
+//!
+//! Internal string representations stay internal: newtypes wrap their storage
+//! (`ArcColdString` for strings that may be short, `Arc<str>` for ones that
+//! certainly cannot be inlined) and the public surface only carries `&str`,
+//! `String`, and these newtypes.
 
+use cold_string::ArcColdString;
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::num::NonZeroU32;
@@ -20,20 +26,26 @@ pub enum ConfigError {
         #[source]
         source: url::ParseError,
     },
-    #[error("turn budget must be a positive integer: {value}")]
-    BadTurnBudget { value: String },
+    #[error("step budget must be a positive integer: {value}")]
+    BadStepBudget { value: String },
     #[error("tool name must not contain whitespace: {value}")]
     ToolNameWhitespace { value: String },
 }
 
 /// Name of the model to request, e.g. `gpt-4o-mini`. Cloned on every run
-/// and turn; refcounted, so clones are cheap regardless of length.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelName(Arc<str>);
+/// and turn; short names are stored inline and longer ones are refcounted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ModelName(ArcColdString);
 
 impl ModelName {
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for ModelName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ModelName").field(&self.as_str()).finish()
     }
 }
 
@@ -51,21 +63,28 @@ impl FromStr for ModelName {
         if trimmed.is_empty() {
             return Err(ConfigError::Empty { field: "model" });
         }
-        Ok(Self(Arc::from(trimmed)))
+        Ok(Self(ArcColdString::new(trimmed)))
     }
 }
 
-/// The system prompt of an agent run. Cloned when sessions are continued.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemPrompt(Arc<str>);
+/// The system prompt of an agent run. Cloned when sessions are continued;
+/// short prompts are stored inline and longer ones are refcounted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SystemPrompt(ArcColdString);
 
 impl SystemPrompt {
     pub fn new(value: impl AsRef<str>) -> Self {
-        Self(Arc::from(value.as_ref()))
+        Self(ArcColdString::new(value.as_ref()))
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for SystemPrompt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SystemPrompt").field(&self.as_str()).finish()
     }
 }
 
@@ -154,28 +173,33 @@ impl FromStr for BaseUrl {
     }
 }
 
-/// Upper bound on model turns; guarantees the agent loop terminates.
+/// 上限：一个 turn 最多启动多少个 step（模型往返）；保证 agent 循环终止。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TurnBudget(NonZeroU32);
+pub struct StepBudget(NonZeroU32);
 
-impl TurnBudget {
+impl StepBudget {
     pub fn new(value: NonZeroU32) -> Self {
         Self(value)
     }
 
-    pub fn max_turns(&self) -> u32 {
+    pub fn max_steps(&self) -> u32 {
         self.0.get()
+    }
+
+    /// 已经启动 `started` 个 step，还能启动下一个吗？
+    pub fn allows(&self, started: u32) -> bool {
+        started < self.0.get()
     }
 }
 
-impl FromStr for TurnBudget {
+impl FromStr for StepBudget {
     type Err = ConfigError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.trim()
             .parse::<NonZeroU32>()
             .map(Self)
-            .map_err(|_| ConfigError::BadTurnBudget {
+            .map_err(|_| ConfigError::BadStepBudget {
                 value: s.to_owned(),
             })
     }
@@ -240,9 +264,18 @@ mod tests {
     }
 
     #[test]
-    fn turn_budget_rejects_zero_and_garbage() {
-        assert_eq!("8".parse::<TurnBudget>().unwrap().max_turns(), 8);
-        assert!("0".parse::<TurnBudget>().is_err());
-        assert!("many".parse::<TurnBudget>().is_err());
+    fn step_budget_rejects_zero_and_garbage() {
+        assert_eq!("8".parse::<StepBudget>().unwrap().max_steps(), 8);
+        assert!("0".parse::<StepBudget>().is_err());
+        assert!("many".parse::<StepBudget>().is_err());
+    }
+
+    #[test]
+    fn step_budget_covers_the_steps_it_allows() {
+        let budget = "3".parse::<StepBudget>().unwrap();
+        assert!(budget.allows(0));
+        assert!(budget.allows(1));
+        assert!(budget.allows(2));
+        assert!(!budget.allows(3));
     }
 }

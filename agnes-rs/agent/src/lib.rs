@@ -1,22 +1,25 @@
-//! Async driver that interprets the [`agnes_core::turn`] effects.
+//! 驱动器：事件循环，解释 [`agnes_core::turn`] 状态机产生的动作。
 //!
-//! The state machine says *what* to do (call the model, run tools); this
-//! crate does it — through the async I/O seams in `agnes-io` — and reports
-//! [`Event`]s along the way. The runtime itself (tokio, smol, …) is chosen
-//! by the host's executor and transport, never by this crate.
+//! 机器只接收输入、消费事件、更新状态、产生待执行的动作；这个 crate 做
+//! IO —— 通过 `agnes-io` 的异步接缝 —— 并把结果作为
+//! [`agnes_core::turn::Input`] 喂回机器，一路用 [`Event`] 上报发生的事。
+//! 运行时（tokio、smol、…）由宿主的执行器与传输层选择，与本 crate 无关。
+//!
+//! 驱动从不自己组装提示词：[`RequestBuilder`] 是宿主的转换者，
+//! 在每次模型调用前由它把 Context 变成请求。
 
 pub mod tools;
 
 use std::sync::Arc;
 
-use agnes_core::config::{ModelName, SystemPrompt, TurnBudget};
+use agnes_core::config::ModelName;
 use agnes_core::content::Content;
 use agnes_core::context::Context;
-use agnes_core::llm::{LlmRequest, LlmResponse};
-use agnes_core::message::{TokenUsage, ToolCall, ToolCallId, ToolOutput};
-use agnes_core::task::{Agent, AgentConfig, ModelTurn, Outcome, ToolBatch, ToolsTurn, TurnError};
+use agnes_core::llm::{LlmRequest, Prompt, RequestBuilder};
+use agnes_core::message::{TokenUsage, ToolCall};
 use agnes_core::tool::ToolName;
-use agnes_io::input::Input;
+use agnes_core::turn::{Action, Input, Outcome, Turn};
+use agnes_io::input::Input as InputPort;
 use agnes_io::llm::{Llm, LlmError};
 use agnes_io::tool::ToolRegistry;
 use jiff::Timestamp;
@@ -25,42 +28,43 @@ use jiff::Timestamp;
 pub enum AgentError {
     #[error(transparent)]
     Llm(#[from] LlmError),
-    #[error(transparent)]
-    Turn(#[from] TurnError),
 }
 
-/// Progress notifications emitted while a run executes.
+/// 标准转换者：Context 的标准投影（[`Prompt::from_context`]）加模型名。
+/// 对提示词有想法的宿主自己实现 [`RequestBuilder`]。
+#[derive(Debug, Clone)]
+pub struct StandardRequestBuilder {
+    model: ModelName,
+}
+
+impl StandardRequestBuilder {
+    pub fn new(model: ModelName) -> Self {
+        Self { model }
+    }
+}
+
+impl RequestBuilder for StandardRequestBuilder {
+    fn build(&self, context: &Context) -> LlmRequest {
+        LlmRequest {
+            model: self.model.clone(),
+            prompt: Prompt::from_context(context),
+        }
+    }
+}
+
+/// 运行期间的上报：run 级生命周期事件，或 Context 日志上的一条事件。
 #[derive(Debug, Clone)]
 pub enum Event {
     Started {
         at: Timestamp,
         goal: Content,
-        model: ModelName,
         tools: Vec<ToolName>,
     },
-    ModelRequested {
+    /// Agent 循环里发生的一条事件 —— turn/step 生命周期或消息，
+    /// 按发生顺序转发。
+    Recorded {
         at: Timestamp,
-        turn: u32,
-    },
-    ModelResponded {
-        at: Timestamp,
-        stop: agnes_core::llm::StopReason,
-        usage: TokenUsage,
-    },
-    ToolStarted {
-        at: Timestamp,
-        call: ToolCall,
-    },
-    ToolFinished {
-        at: Timestamp,
-        call_id: ToolCallId,
-        is_error: bool,
-    },
-    /// User messages typed while the run was working, injected into the
-    /// transcript after the tool results.
-    UserMessagesInjected {
-        at: Timestamp,
-        messages: Vec<Content>,
+        event: agnes_core::event::Event,
     },
     Finished {
         at: Timestamp,
@@ -68,7 +72,7 @@ pub enum Event {
     },
 }
 
-/// Receives [`Event`]s. Any `FnMut(&Event)` is a `Sink`.
+/// 接收 [`Event`]s。任何 `FnMut(&Event)` 都是个 `Sink`。
 pub trait Sink {
     fn event(&mut self, event: &Event);
 }
@@ -79,16 +83,19 @@ impl<F: FnMut(&Event)> Sink for F {
     }
 }
 
-/// Result of a completed run. `context` is the updated session context —
-/// system prompt plus every turn of the run (goals, replies, tool calls and
-/// results). Feed it back into the next task's [`AgentConfig::context`] to
-/// continue a session.
+/// 一次完整 turn 的结果。
+///
+/// `context` 是收场后的会话 —— 系统提示、环境、完整的有序日志；
+/// 喂回下一个 [`agnes_core::turn::AgentConfig`] 即可延续会话。
+/// `pending_user_messages` 是没来得及生效的插话（比如最终答复期间
+/// 敲进来的），宿主接着用。
 #[derive(Debug, Clone)]
 pub struct RunSummary {
     pub outcome: Outcome,
-    pub turns_used: u32,
+    pub steps_used: u32,
     pub usage: TokenUsage,
     pub context: Context,
+    pub pending_user_messages: Vec<Content>,
     pub started_at: Timestamp,
     pub finished_at: Timestamp,
 }
@@ -99,184 +106,173 @@ impl RunSummary {
     }
 }
 
-/// What one race between a model call and the user's stop request yielded.
-enum ModelStep {
-    /// The user interrupted; the in-flight request was abandoned.
-    Interrupted,
-    Responded(LlmResponse),
-}
-
-/// Drives the agent loop to completion: model call → (tools → model call)*
-/// → outcome. Tool failures never abort the run — they are surfaced to the
-/// model as error outputs; only transport/model errors abort. Messages the
-/// user types while the run works are injected after the next tool batch;
-/// an interruption ends the run with [`Outcome::Interrupted`].
+/// 事件循环：把机器产生的动作执行掉，把 IO 的结果喂回机器。
 ///
-/// The machine hands out prompts; this driver owns the model wiring, turning
-/// each prompt into a concrete [`LlmRequest`].
+/// 控制：中途打断以 [`Input::Interrupted`] 喂回 —— 模型响应与工具执行
+/// 在两个等待阶段都随时可断，in-flight 的 future 就地丢弃。
+/// 工具失败不中止 run —— 它是给模型的错误输出；只有传输/模型错误终止。
+/// 用户运行中的插话由机器缓存、在下一个 step 边界生效；没生效的
+/// 随 [`RunSummary::pending_user_messages`] 还给宿主。
 pub async fn run(
-    config: AgentConfig,
-    model: ModelName,
+    config: agnes_core::turn::AgentConfig,
     registry: Arc<ToolRegistry>,
     llm: &dyn Llm,
-    input: &dyn Input,
+    input: &dyn InputPort,
+    requests: &dyn RequestBuilder,
     sink: &mut dyn Sink,
 ) -> Result<RunSummary, AgentError> {
     let started_at = Timestamp::now();
-    let system = config.context.system().clone();
     let goal = config.goal.clone();
-    let tools = config.tools.iter().map(|spec| spec.name.clone()).collect();
+    let tools = config
+        .context
+        .environment()
+        .tools()
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
     sink.event(&Event::Started {
         at: started_at,
         goal,
-        model: model.clone(),
         tools,
     });
 
-    let (agent, prompt) = Agent::new(config).start();
-    let mut agent = agent;
-    let mut request = LlmRequest {
-        model: model.clone(),
-        prompt,
-    };
-    loop {
-        sink.event(&Event::ModelRequested {
-            at: Timestamp::now(),
-            turn: agent.turns_used(),
-        });
-        let step = tokio::select! {
-            biased;
-            () = input.interrupted() => ModelStep::Interrupted,
-            response = llm.complete(&request) => ModelStep::Responded(response?),
-        };
-        let response = match step {
-            ModelStep::Interrupted => return finish(agent.interrupted(), system, started_at, sink),
-            ModelStep::Responded(response) => response,
-        };
-        sink.event(&Event::ModelResponded {
-            at: Timestamp::now(),
-            stop: response.stop_reason.clone(),
-            usage: response.usage,
-        });
-        match agent.model_responded(response)? {
-            ModelTurn::NeedTools {
-                agent: waiting,
-                batch,
-            } => {
-                let (outputs, interrupted) = execute_batch(&registry, &batch, input, sink).await;
-                let results = batch.complete(outputs)?;
-                if interrupted {
-                    return finish(waiting.interrupted(results), system, started_at, sink);
-                }
-                let user_messages = input.drain();
-                if !user_messages.is_empty() {
-                    sink.event(&Event::UserMessagesInjected {
-                        at: Timestamp::now(),
-                        messages: user_messages.clone(),
-                    });
-                }
-                match waiting.tools_resolved(results, user_messages)? {
-                    ToolsTurn::NeedModel {
-                        agent: next,
-                        prompt,
-                    } => {
-                        agent = next;
-                        request = LlmRequest {
-                            model: model.clone(),
-                            prompt,
-                        };
-                    }
-                    ToolsTurn::Done(finished) => return finish(finished, system, started_at, sink),
+    let mut turn = Turn::start(config);
+    let mut pending_model: Option<LlmRequest> = None;
+    let mut pending_tool: Option<ToolCall> = None;
+    interpret(
+        &mut turn,
+        requests,
+        &mut pending_model,
+        &mut pending_tool,
+        sink,
+    );
+
+    while turn.outcome().is_none() {
+        // 运行中的插话随时进缓存；生效时机由机器按 step 边界决定。
+        for content in input.drain() {
+            turn.handle(Input::UserMessage(content));
+        }
+        interpret(
+            &mut turn,
+            requests,
+            &mut pending_model,
+            &mut pending_tool,
+            sink,
+        );
+        if turn.outcome().is_some() {
+            break;
+        }
+
+        // turn 开着却没有待执行的 IO —— 只可能是驱动器状态坏了。
+        match (pending_tool.take(), pending_model.take()) {
+            (Some(call), _) => {
+                turn.handle(Input::ToolStarted(call.id.clone()));
+                interpret(
+                    &mut turn,
+                    requests,
+                    &mut pending_model,
+                    &mut pending_tool,
+                    sink,
+                );
+                let raced = tokio::select! {
+                    biased;
+                    () = input.interrupted() => None,
+                    output = registry.execute(&call) => Some(output),
+                };
+                turn.handle(match raced {
+                    Some(output) => Input::ToolFinished {
+                        call_id: call.id.clone(),
+                        output,
+                    },
+                    None => Input::Interrupted,
+                });
+            }
+            (None, Some(request)) => {
+                let raced = tokio::select! {
+                    biased;
+                    () = input.interrupted() => None,
+                    response = llm.complete(&request) => Some(response),
+                };
+                match raced {
+                    None => turn.handle(Input::Interrupted),
+                    Some(Ok(response)) => turn.handle(Input::ModelResponded(response)),
+                    Some(Err(err)) => return Err(AgentError::Llm(err)),
                 }
             }
-            ModelTurn::Done(finished) => return finish(finished, system, started_at, sink),
+            (None, None) => unreachable!("开着的 turn 一定有待执行的 IO"),
         }
     }
-}
 
-/// Runs the batch call by call, racing every execution against the user's
-/// stop request. On interruption the call in flight is dropped (its result
-/// is lost) and it — together with every call after it — is recorded as a
-/// synthetic error output, so the batch still pairs one result per call.
-async fn execute_batch(
-    registry: &ToolRegistry,
-    batch: &ToolBatch,
-    input: &dyn Input,
-    sink: &mut dyn Sink,
-) -> (Vec<ToolOutput>, bool) {
-    let mut outputs = Vec::with_capacity(batch.calls().len());
-    let mut interrupted = false;
-    for call in batch.calls() {
-        let output = if interrupted {
-            interrupted_output()
-        } else {
-            sink.event(&Event::ToolStarted {
-                at: Timestamp::now(),
-                call: call.clone(),
-            });
-            tokio::select! {
-                biased;
-                () = input.interrupted() => {
-                    interrupted = true;
-                    interrupted_output()
-                }
-                output = registry.execute(call) => output,
-            }
-        };
-        sink.event(&Event::ToolFinished {
-            at: Timestamp::now(),
-            call_id: call.id.clone(),
-            is_error: output.is_error,
-        });
-        outputs.push(output);
-    }
-    (outputs, interrupted)
-}
+    // turn 收场时入队的报告事件在这里补报。
+    interpret(
+        &mut turn,
+        requests,
+        &mut pending_model,
+        &mut pending_tool,
+        sink,
+    );
 
-/// Output recorded for a call that never ran — or whose run was cut off —
-/// because the user interrupted the agent.
-fn interrupted_output() -> ToolOutput {
-    ToolOutput::error("not run: the user interrupted the agent")
-}
-
-fn finish(
-    finished: Agent<agnes_core::task::Finished>,
-    system: SystemPrompt,
-    started_at: Timestamp,
-    sink: &mut dyn Sink,
-) -> Result<RunSummary, AgentError> {
     let finished_at = Timestamp::now();
+    let outcome = turn.outcome().expect("循环只在 turn 收场后退出").clone();
+    let steps_used = turn.steps_used();
+    let usage = turn.usage();
+    let pending_user_messages = turn.take_unapplied_user_messages();
+    let context = turn.into_context();
     let summary = RunSummary {
-        outcome: finished.outcome().clone(),
-        turns_used: finished.turns_used(),
-        usage: finished.usage(),
-        context: Context::from_parts(system, finished.into_transcript().into_history()),
+        outcome: outcome.clone(),
+        steps_used,
+        usage,
+        context,
+        pending_user_messages,
         started_at,
         finished_at,
     };
     sink.event(&Event::Finished {
         at: finished_at,
-        outcome: summary.outcome.clone(),
+        outcome,
     });
     Ok(summary)
 }
 
-/// Default cap on model turns per task; hosts may pass their own.
-pub const DEFAULT_TURN_BUDGET: u32 = 32;
+/// 执行一批动作：上报事件、构造模型请求、拾起下一个工具调用。
+fn interpret(
+    turn: &mut Turn,
+    requests: &dyn RequestBuilder,
+    pending_model: &mut Option<LlmRequest>,
+    pending_tool: &mut Option<ToolCall>,
+    sink: &mut dyn Sink,
+) {
+    while let Some(action) = turn.poll_actions() {
+        match action {
+            Action::Report(event) => sink.event(&Event::Recorded {
+                at: Timestamp::now(),
+                event,
+            }),
+            Action::CallModel => *pending_model = Some(requests.build(turn.context())),
+            Action::RunTool(call) => *pending_tool = Some(call),
+        }
+    }
+}
 
-/// Convenience constructor used by hosts: builds the turn budget newtype.
-pub fn turn_budget(max_turns: u32) -> Option<TurnBudget> {
-    Some(TurnBudget::new(std::num::NonZeroU32::new(max_turns)?))
+/// 宿主可用的默认 step 预算。
+pub const DEFAULT_STEP_BUDGET: u32 = 32;
+
+/// 便捷构造：把最大 step 数变成预算 newtype；0 返回 None。
+pub fn step_budget(max_steps: u32) -> Option<agnes_core::config::StepBudget> {
+    Some(agnes_core::config::StepBudget::new(
+        std::num::NonZeroU32::new(max_steps)?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agnes_core::config::SystemPrompt;
-    use agnes_core::llm::{LlmRequest, LlmResponse, StopReason};
-    use agnes_core::message::ToolArguments;
+    use agnes_core::context::Environment;
+    use agnes_core::llm::{LlmResponse, StopReason};
+    use agnes_core::message::{Message, ToolArguments, ToolOutput};
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
-    use agnes_io::input::{Input, NoInput};
+    use agnes_io::input::NoInput;
     use agnes_io::tool::Tool;
     use agnes_util::NonEmpty;
     use async_trait::async_trait;
@@ -286,8 +282,7 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::watch;
 
-    /// Model that replays a fixed script of responses and records every
-    /// request it sees.
+    /// 回放一段响应脚本、记录收到的每个请求的模型。
     struct ScriptedLlm {
         responses: Mutex<std::vec::IntoIter<LlmResponse>>,
         requests: Mutex<Vec<LlmRequest>>,
@@ -319,7 +314,7 @@ mod tests {
         }
     }
 
-    /// Tool that records its arguments and echoes them back.
+    /// 记参数的工具，总是成功。
     struct Recorder {
         spec: ToolSpec,
         calls: Mutex<Vec<String>>,
@@ -356,7 +351,7 @@ mod tests {
         }
     }
 
-    /// Sink that collects every event for assertions.
+    /// 收集所有事件的 Sink。
     struct Collector(Vec<Event>);
 
     impl Sink for Collector {
@@ -365,17 +360,24 @@ mod tests {
         }
     }
 
-    fn config(budget: u32) -> AgentConfig {
-        AgentConfig {
-            context: Context::new(SystemPrompt::new("sys")),
+    fn config_with(tools: Vec<ToolSpec>, budget: u32) -> agnes_core::turn::AgentConfig {
+        agnes_core::turn::AgentConfig {
+            context: Context::new(SystemPrompt::new("sys"), Environment::new(tools)),
             goal: Content::try_from("take a note").unwrap(),
-            tools: Vec::new(),
-            budget: TurnBudget::new(NonZeroU32::new(budget).unwrap()),
+            budget: agnes_core::config::StepBudget::new(NonZeroU32::new(budget).unwrap()),
         }
+    }
+
+    fn config(budget: u32) -> agnes_core::turn::AgentConfig {
+        config_with(Vec::new(), budget)
     }
 
     fn model() -> ModelName {
         ModelName::from_str("test-model").unwrap()
+    }
+
+    fn standard(model: ModelName) -> StandardRequestBuilder {
+        StandardRequestBuilder::new(model)
     }
 
     fn response(stop_reason: StopReason) -> LlmResponse {
@@ -394,19 +396,55 @@ mod tests {
         }
     }
 
-    fn tool_use(calls: Vec<ToolCall>) -> StopReason {
+    fn tool_use(calls: Vec<agnes_core::message::ToolCall>) -> StopReason {
         StopReason::ToolUse {
             content: None,
             calls: NonEmpty::from_vec(calls).unwrap(),
         }
     }
 
-    fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
-        ToolCall {
-            id: ToolCallId::new(id),
+    fn call(id: &str, name: &str, arguments: &str) -> agnes_core::message::ToolCall {
+        agnes_core::message::ToolCall {
+            id: agnes_core::message::ToolCallId::new(id),
             name: ToolName::from_str(name).unwrap(),
             arguments: ToolArguments::new(arguments),
         }
+    }
+
+    /// 驱动上报的运行时事件，按序。
+    fn recorded(events: &[Event]) -> Vec<agnes_core::event::Event> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Recorded { event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 事件种类，按序。
+    fn shape(events: &[agnes_core::event::Event]) -> Vec<&'static str> {
+        use agnes_core::event::Event as CoreEvent;
+        events
+            .iter()
+            .map(|event| match event {
+                CoreEvent::TurnStart => "turn_start",
+                CoreEvent::StepStart { .. } => "step_start",
+                CoreEvent::MessageStart { .. } => "message_start",
+                CoreEvent::MessageUpdate { .. } => "message_update",
+                CoreEvent::Message(_) => "message",
+                CoreEvent::MessageEnd { .. } => "message_end",
+                CoreEvent::ToolExecutionStart { .. } => "tool_start",
+                CoreEvent::ToolExecutionEnd { .. } => "tool_end",
+                CoreEvent::StepEnd { .. } => "step_end",
+                CoreEvent::UserMessagesInjected { .. } => "user_injected",
+                CoreEvent::TurnEnd { .. } => "turn_end",
+            })
+            .collect()
+    }
+
+    fn messages_of(context: &Context) -> Vec<&Message> {
+        context.messages().collect()
     }
 
     #[tokio::test]
@@ -421,10 +459,10 @@ mod tests {
         let mut sink = Collector(Vec::new());
         let summary = run(
             config(8),
-            model(),
             Arc::new(registry),
             &llm,
             &NoInput,
+            &standard(model()),
             &mut sink,
         )
         .await
@@ -432,11 +470,11 @@ mod tests {
 
         assert_eq!(
             summary.outcome,
-            Outcome::Completed {
+            Outcome::Answered {
                 reply: Content::try_from("all done").unwrap()
             }
         );
-        assert_eq!(summary.turns_used, 2);
+        assert_eq!(summary.steps_used, 2);
         assert_eq!(
             summary.usage,
             TokenUsage {
@@ -448,48 +486,46 @@ mod tests {
             recorder.calls.lock().unwrap().clone(),
             vec![r#"{"text":"hi"}"#.to_owned()]
         );
-        // user goal, assistant (tool call), tool result, assistant (final)
-        assert_eq!(summary.context.len(), 4);
-        assert!(matches!(
-            summary.context.messages()[0],
-            agnes_core::message::Message::User { .. }
-        ));
-        assert!(matches!(
-            summary.context.messages()[3],
-            agnes_core::message::Message::Assistant(_)
-        ));
+
+        // 会话消息：goal、工具调用、工具结果、最终答复
+        let messages = messages_of(&summary.context);
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(messages[0], Message::User { .. }));
+        assert!(matches!(messages[3], Message::Assistant(_)));
         assert_eq!(summary.context.system().as_str(), "sys");
 
+        // 驱动按顺序上报了整个生命周期
         let events = &sink.0;
         assert!(matches!(events[0], Event::Started { .. }));
-        assert!(matches!(events[1], Event::ModelRequested { turn: 1, .. }));
+        assert_eq!(
+            shape(&recorded(events)),
+            vec![
+                "message",
+                "turn_start",
+                "step_start",
+                "message_start",
+                "message",
+                "message_end",
+                "tool_start",
+                "tool_end",
+                "message",
+                "step_end",
+                "step_start",
+                "message_start",
+                "message",
+                "message_end",
+                "step_end",
+                "turn_end"
+            ]
+        );
         assert!(matches!(
-            events[2],
-            Event::ModelResponded {
-                stop: StopReason::ToolUse { .. },
-                ..
-            }
+            events.last(),
+            Some(Event::Finished { outcome, .. })
+                if matches!(outcome, Outcome::Answered { .. })
         ));
-        assert!(matches!(&events[3], Event::ToolStarted { call, .. } if call.id.as_str() == "c1"));
-        assert!(matches!(
-            events[4],
-            Event::ToolFinished {
-                is_error: false,
-                ..
-            }
-        ));
-        assert!(matches!(events[5], Event::ModelRequested { turn: 2, .. }));
-        assert!(matches!(
-            events[6],
-            Event::ModelResponded {
-                stop: StopReason::Completed { .. },
-                ..
-            }
-        ));
-        assert!(matches!(
-            &events[7],
-            Event::Finished { outcome, .. } if matches!(outcome, Outcome::Completed { .. })
-        ));
+        // 上报的事件就是 Context 日志里的那些
+        assert_eq!(recorded(events).len(), summary.context.events().len());
+        assert!(summary.pending_user_messages.is_empty());
     }
 
     #[tokio::test]
@@ -525,19 +561,19 @@ mod tests {
         let mut sink = Collector(Vec::new());
         let summary = run(
             config(8),
-            model(),
             Arc::new(registry),
             &llm,
             &NoInput,
+            &standard(model()),
             &mut sink,
         )
         .await
         .unwrap();
-        assert!(matches!(summary.outcome, Outcome::Completed { .. }));
-        assert!(matches!(
-            sink.0[4],
-            Event::ToolFinished { is_error: true, .. }
-        ));
+        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(recorded(&sink.0).iter().any(|event| matches!(
+            event,
+            agnes_core::event::Event::ToolExecutionEnd { is_error: true, .. }
+        )));
     }
 
     #[tokio::test]
@@ -554,10 +590,10 @@ mod tests {
         }
         let err = run(
             config(4),
-            model(),
             Arc::new(ToolRegistry::default()),
             &Broken,
             &NoInput,
+            &standard(model()),
             &mut Collector(Vec::new()),
         )
         .await
@@ -569,7 +605,61 @@ mod tests {
         ));
     }
 
-    /// Input the test drives directly: a message queue plus a stop channel.
+    /// 对提示词有想法的转换者：丢掉环境里的工具，先垫一条指令。
+    struct PrimingRequests {
+        model: ModelName,
+    }
+
+    impl RequestBuilder for PrimingRequests {
+        fn build(&self, context: &Context) -> LlmRequest {
+            let mut prompt = Prompt::from_context(context);
+            prompt.tools.clear();
+            prompt.input.insert(
+                0,
+                Message::User {
+                    content: Content::try_from("<system> be extra brief").unwrap(),
+                },
+            );
+            LlmRequest {
+                model: self.model.clone(),
+                prompt,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_request_builder_shapes_what_the_model_sees() {
+        let recorder = Arc::new(Recorder::new());
+        let registry =
+            Arc::new(ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap());
+        let llm = ScriptedLlm::new(vec![response(completed("ok"))]);
+
+        let mut sink = Collector(Vec::new());
+        let summary = run(
+            config_with(registry.specs(), 4),
+            Arc::clone(&registry),
+            &llm,
+            &NoInput,
+            &PrimingRequests { model: model() },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 1);
+        // 标准投影本会带上 recorder；这个转换者把工具丢掉，改为垫话
+        assert!(requests[0].prompt.tools.is_empty());
+        assert!(matches!(
+            &requests[0].prompt.input[0],
+            Message::User { content } if content.as_str() == "<system> be extra brief"
+        ));
+        // 环境仍在会话里，未被破坏
+        assert_eq!(summary.context.environment().tools().len(), 1);
+    }
+
+    /// 测试直接驱动的输入：消息队列 + 停止通道。
     struct FakeInput {
         messages: Mutex<VecDeque<Content>>,
         stop: watch::Sender<bool>,
@@ -596,7 +686,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Input for FakeInput {
+    impl InputPort for FakeInput {
         fn drain(&self) -> Vec<Content> {
             self.messages.lock().unwrap().drain(..).collect()
         }
@@ -611,8 +701,7 @@ mod tests {
         }
     }
 
-    /// Model whose call never comes back; the future is dropped when the
-    /// user interrupts.
+    /// 永不返回的模型；用户打断时 future 被就地丢弃。
     struct HangingLlm;
 
     #[async_trait]
@@ -622,7 +711,7 @@ mod tests {
         }
     }
 
-    /// Tool whose run never comes back.
+    /// 永不返回的工具。
     struct HangingTool {
         spec: ToolSpec,
     }
@@ -638,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_user_message_is_injected_after_tool_results() {
+    async fn queued_user_message_is_injected_at_the_step_boundary() {
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
@@ -651,10 +740,10 @@ mod tests {
         let mut sink = Collector(Vec::new());
         let summary = run(
             config(8),
-            model(),
             Arc::new(registry),
             &llm,
             &input,
+            &standard(model()),
             &mut sink,
         )
         .await
@@ -662,7 +751,7 @@ mod tests {
 
         assert_eq!(
             summary.outcome,
-            Outcome::Completed {
+            Outcome::Answered {
                 reply: Content::try_from("all done").unwrap()
             }
         );
@@ -671,34 +760,32 @@ mod tests {
         let second = &requests[1].prompt.input;
         // system, goal, assistant (tool calls), tool result, injected user
         assert_eq!(second.len(), 5);
-        assert!(matches!(
-            &second[3],
-            agnes_core::message::Message::ToolResult { .. }
-        ));
+        assert!(matches!(&second[3], Message::ToolResult { .. }));
         assert!(matches!(
             &second[4],
-            agnes_core::message::Message::User { content }
-                if content.as_str() == "also update the readme"
+            Message::User { content } if content.as_str() == "also update the readme"
         ));
-        assert!(sink.0.iter().any(|event| matches!(
+        // 注入事件随日志上报
+        assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
-            Event::UserMessagesInjected { messages, .. } if messages.len() == 1
+            agnes_core::event::Event::UserMessagesInjected { messages } if messages.len() == 1
         )));
-        // the injected turn is part of the continuing session context
-        let messages = summary.context.messages();
+        // 注入的消息属于继续的会话上下文
+        let messages = messages_of(&summary.context);
         assert_eq!(messages.len(), 5);
         assert!(matches!(
-            &messages[3],
-            agnes_core::message::Message::User { content }
-                if content.as_str() == "also update the readme"
+            messages[3],
+            Message::User { content } if content.as_str() == "also update the readme"
         ));
+        assert!(summary.pending_user_messages.is_empty());
     }
 
     #[tokio::test]
     async fn interrupt_during_a_model_call_stops_the_run() {
         let input = FakeInput::new();
+        let requests = standard(model());
         let mut sink = Collector(Vec::new());
-        // let the run reach the pending model call first, then interrupt
+        // 先让 run 到达挂起的模型调用，再打断
         let interrupter = async {
             tokio::task::yield_now().await;
             input.interrupt();
@@ -706,10 +793,10 @@ mod tests {
         let (result, ()) = tokio::join!(
             run(
                 config(4),
-                model(),
                 Arc::new(ToolRegistry::default()),
                 &HangingLlm,
                 &input,
+                &requests,
                 &mut sink,
             ),
             interrupter
@@ -717,13 +804,32 @@ mod tests {
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
-        assert_eq!(summary.turns_used, 1);
+        assert_eq!(summary.steps_used, 1);
         assert_eq!(summary.usage, TokenUsage::default());
-        // just the goal — the abandoned response was never recorded
-        assert_eq!(summary.context.len(), 1);
+        // 只剩 goal —— 被丢弃的响应从未入账
+        assert_eq!(messages_of(&summary.context).len(), 1);
         assert!(matches!(
-            &summary.context.messages()[0],
-            agnes_core::message::Message::User { .. }
+            messages_of(&summary.context)[0],
+            Message::User { .. }
+        ));
+        // turn 被干净地收场，不是悬着
+        assert_eq!(
+            shape(summary.context.events()),
+            vec![
+                "message",
+                "turn_start",
+                "step_start",
+                "message_start",
+                "step_end",
+                "turn_end"
+            ]
+        );
+        assert!(matches!(
+            summary.context.events().last(),
+            Some(agnes_core::event::Event::TurnEnd {
+                outcome: Outcome::Interrupted,
+                ..
+            })
         ));
     }
 
@@ -747,8 +853,9 @@ mod tests {
             call("c2", "hang", "{}"),
         ]))]);
         let input = FakeInput::new();
+        let requests = standard(model());
         let mut sink = Collector(Vec::new());
-        // let the first call run and the second start hanging, then interrupt
+        // 第一个调用跑完、第二个挂起时打断
         let interrupter = async {
             tokio::task::yield_now().await;
             input.interrupt();
@@ -756,31 +863,64 @@ mod tests {
         let (result, ()) = tokio::join!(
             run(
                 config(8),
-                model(),
                 Arc::new(registry),
                 &llm,
                 &input,
-                &mut sink
+                &requests,
+                &mut sink,
             ),
             interrupter
         );
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
-        assert_eq!(summary.turns_used, 1);
-        assert_eq!(llm.requests().len(), 1); // no follow-up model call
+        assert_eq!(summary.steps_used, 1);
+        assert_eq!(llm.requests().len(), 1); // 没有后续模型调用
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
-        let messages = summary.context.messages();
+        let messages = messages_of(&summary.context);
         // goal, assistant (tool calls), tool result, interrupted tool result
         assert_eq!(messages.len(), 4);
         assert!(matches!(
-            &messages[2],
-            agnes_core::message::Message::ToolResult { output, .. } if !output.is_error
+            messages[2],
+            Message::ToolResult { output, .. } if !output.is_error
         ));
         assert!(matches!(
-            &messages[3],
-            agnes_core::message::Message::ToolResult { output, .. }
+            messages[3],
+            Message::ToolResult { output, .. }
                 if output.is_error && output.content.contains("interrupted")
         ));
+    }
+
+    #[tokio::test]
+    async fn unapplied_user_messages_come_back_to_the_host() {
+        let input = FakeInput::new();
+        // 最终答复期间敲进来的插话：边界未到，未生效
+        input.queue("too late for this run");
+        let llm = ScriptedLlm::new(vec![response(completed("all done"))]);
+
+        let mut sink = Collector(Vec::new());
+        let summary = run(
+            config(4),
+            Arc::new(ToolRegistry::default()),
+            &llm,
+            &input,
+            &standard(model()),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            summary.outcome,
+            Outcome::Answered {
+                reply: Content::try_from("all done").unwrap()
+            }
+        );
+        // 插话没有进会话；会话里只有 goal 和最终答复
+        assert_eq!(
+            summary.pending_user_messages,
+            vec![Content::try_from("too late for this run").unwrap()]
+        );
+        assert_eq!(messages_of(&summary.context).len(), 2);
     }
 }

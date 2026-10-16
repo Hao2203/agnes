@@ -286,7 +286,7 @@ mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::llm::{LlmRequest, Prompt};
-    use agnes_core::message::{AssistantMessage, ToolOutput, Transcript};
+    use agnes_core::message::{AssistantMessage, Message, ToolOutput};
 
     fn content(text: &str) -> Content {
         Content::try_from(text).unwrap()
@@ -297,8 +297,14 @@ mod tests {
         let request = LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
             prompt: Prompt {
-                input: Transcript::new(SystemPrompt::new("sys"), content("hi"), Vec::new())
-                    .into_messages(),
+                input: vec![
+                    Message::System {
+                        content: SystemPrompt::new("sys"),
+                    },
+                    Message::User {
+                        content: content("hi"),
+                    },
+                ],
                 tools: Vec::new(),
             },
         };
