@@ -9,18 +9,17 @@
 //! 驱动从不自己组装提示词：[`RequestBuilder`] 是宿主的转换者，在每次
 //! 模型调用前由它把 Context 变成请求。
 //!
-//! 工具执行前先过插件链（[`plugin`] / [`permission`]）：插件只处理事件、
-//! 发指令（[`plugin::Command`]），指令由系统执行 —— 放行执行、拒绝则以
-//! 合成失败结果推进机器（core 日志只是个普通失败工具）、`Ask` 则走系统
-//! 自有的审批服务（[`approval`]）挂起等待答覆或打断。core 的封闭枚举
-//! 不因插件扩展 —— 插件的语义事件都发在宿主的 [`Event`] 变体上。
+//! 工具执行前先过扩展内核（[`ext`]）：插件用类型化钩子表态（门禁 /
+//! 结果 / 观察），执行权在系统 —— 放行执行、拒绝则以合成失败结果推进
+//! 机器（core 日志只是个普通失败工具）、要审批则走系统自有的审批服务
+//! （[`approval`]）挂起等待答覆或打断。core 的封闭枚举不因插件扩展 ——
+//! 插件的语义都发在宿主的 [`Event`] 变体上。
 
 mod driver;
 
 pub mod approval;
 pub mod ext;
 pub mod permission;
-pub mod plugin;
 pub mod tools;
 
 use std::sync::Arc;
@@ -38,9 +37,9 @@ use agnes_io::llm::{Llm, LlmError};
 use agnes_io::tool::ToolRegistry;
 use jiff::Timestamp;
 
-use approval::ApprovalChannel;
+use approval::{ApprovalChannel, ApprovalOutcome};
 use driver::{Driver, Ports};
-use plugin::PluginChain;
+use ext::{Denied, Extensions};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -85,25 +84,24 @@ pub enum Event {
         at: Timestamp,
         event: CoreEvent,
     },
-    /// 插件链拒绝了一次工具调用；机器将收到一条合成的失败结果。
+    /// 扩展内核拒绝了一次工具调用；机器将收到一条合成的失败结果。
     ToolGated {
         at: Timestamp,
         call: ToolCall,
-        /// 拒绝理由（随合成结果一起给到模型）。
-        reason: String,
+        /// 拒绝者与理由（理由随合成结果一起给到模型）。
+        denied: Denied,
     },
     /// 权限插件发起的审批问询；驱动随即挂起，等待答覆或打断。
     ApprovalRequested {
         at: Timestamp,
         call: ToolCall,
     },
-    /// 一问一答落定：批准则照常执行，其余（显式拒绝、超时、答覆消失）
-    /// 都以合成失败结果推进。approved=false 与否的细节在 `reason` 类事件
-    /// 上另行可见（问询撤销统一记为未批）。
+    /// 一问一答落定：只有 [`ApprovalOutcome::AllowedOnce`] 照常执行，其余
+    /// （显式拒绝、超时、答覆消失、打断）都以合成失败结果推进。
     ApprovalResolved {
         at: Timestamp,
         call_id: ToolCallId,
-        approved: bool,
+        outcome: ApprovalOutcome,
     },
     Finished {
         at: Timestamp,
@@ -152,10 +150,9 @@ impl RunSummary {
 /// 运行中的插话（[`InputPort::drain`]）由机器缓存、在下一个 step 边界
 /// 生效，没生效的随 [`RunSummary::pending_user_messages`] 还给宿主。
 ///
-/// 工具调用先过 `plugins` 链 —— 插件只处理事件、发指令，指令由系统
-/// 执行：放行执行、否决以合成失败结果推进机器、`Ask` 则走 `approvals`
-/// 问询挂起（未接线即拒绝）。工具失败不中止 run —— 它是给模型的
-/// 错误输出；只有传输/模型错误终止。
+/// 工具调用先过 `extensions` 的门禁折叠 —— 拒绝以合成失败结果推进机器、
+/// `Ask` 则走 `approvals` 问询挂起（未接线即拒绝）。工具失败不中止 run
+/// —— 它是给模型的错误输出；只有传输/模型错误终止。
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: agnes_core::turn::AgentConfig,
@@ -164,7 +161,7 @@ pub async fn run(
     input: &dyn InputPort,
     requests: &dyn RequestBuilder,
     sink: &mut dyn Sink,
-    plugins: &mut PluginChain,
+    extensions: &mut Extensions,
     approvals: Option<&ApprovalChannel>,
 ) -> Result<RunSummary, AgentError> {
     let started_at = Timestamp::now();
@@ -188,7 +185,7 @@ pub async fn run(
         input,
         requests,
         sink: &mut *sink,
-        plugins,
+        extensions,
         approvals,
     };
     let turn = Turn::start(config);
@@ -232,7 +229,6 @@ mod tests {
     use super::*;
     use crate::approval::ApprovalChannel;
     use crate::permission::{PermissionPlugin, Rule};
-    use crate::plugin::Plugin;
     use agnes_core::config::{StepBudget, SystemPrompt};
     use agnes_core::context::Environment;
     use agnes_core::llm::{LlmResponse, StopReason};
@@ -420,7 +416,7 @@ mod tests {
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("all done")),
         ]);
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
 
         let mut sink = Collector(Vec::new());
         let summary = run(
@@ -430,7 +426,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -525,7 +521,7 @@ mod tests {
             response(tool_use(vec![call("c1", "boom", "{}")])),
             response(completed("gave up")),
         ]);
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
 
         let mut sink = Collector(Vec::new());
         let summary = run(
@@ -535,7 +531,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -559,7 +555,7 @@ mod tests {
                 })
             }
         }
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
         let err = run(
             config(4),
             Arc::new(ToolRegistry::default()),
@@ -567,7 +563,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut Collector(Vec::new()),
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -607,7 +603,7 @@ mod tests {
         let registry =
             Arc::new(ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap());
         let llm = ScriptedLlm::new(vec![response(completed("ok"))]);
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
 
         let mut sink = Collector(Vec::new());
         let summary = run(
@@ -617,7 +613,7 @@ mod tests {
             &NoInput,
             &PrimingRequests { model: model() },
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -713,7 +709,7 @@ mod tests {
         ]);
         let input = FakeInput::new();
         input.queue("also update the readme");
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
 
         let mut sink = Collector(Vec::new());
         let summary = run(
@@ -723,7 +719,7 @@ mod tests {
             &input,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -765,7 +761,7 @@ mod tests {
         let input = FakeInput::new();
         let requests = standard(model());
         let mut sink = Collector(Vec::new());
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
         // 先让 run 到达挂起的模型调用，再打断
         let interrupter = async {
             tokio::task::yield_now().await;
@@ -779,7 +775,7 @@ mod tests {
                 &input,
                 &requests,
                 &mut sink,
-                &mut plugins,
+                &mut extensions,
                 None,
             ),
             interrupter
@@ -838,7 +834,7 @@ mod tests {
         let input = FakeInput::new();
         let requests = standard(model());
         let mut sink = Collector(Vec::new());
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
         // 第一个调用跑完、第二个挂起时打断
         let interrupter = async {
             tokio::task::yield_now().await;
@@ -852,7 +848,7 @@ mod tests {
                 &input,
                 &requests,
                 &mut sink,
-                &mut plugins,
+                &mut extensions,
                 None,
             ),
             interrupter
@@ -883,7 +879,7 @@ mod tests {
         // 最终答复期间敲进来的插话：边界未到，未生效
         input.queue("too late for this run");
         let llm = ScriptedLlm::new(vec![response(completed("all done"))]);
-        let mut plugins = PluginChain::default();
+        let mut extensions = Extensions::new();
 
         let mut sink = Collector(Vec::new());
         let summary = run(
@@ -893,7 +889,7 @@ mod tests {
             &input,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -917,10 +913,11 @@ mod tests {
 
     #[tokio::test]
     async fn denied_tool_never_runs_and_the_model_carries_on() {
-        let mut plugins = PluginChain::new(vec![Box::new(PermissionPlugin::new(
+        let mut extensions = Extensions::new();
+        extensions.register(PermissionPlugin::new(
             vec![Rule::Name(ToolName::from_str("note").unwrap())],
             vec![],
-        )) as Box<dyn Plugin>]);
+        ));
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
@@ -936,7 +933,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -953,7 +950,8 @@ mod tests {
         );
         // 宿主上报了 gating
         assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ToolGated { reason, .. } if reason.contains("denied by policy"))
+            matches!(event, Event::ToolGated { denied, .. }
+                if denied.by == "permission" && denied.reason.contains("denied by policy"))
         ));
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
         // 事件序列与一次真实工具往返一致（core 视角无法区分拒绝）
@@ -983,12 +981,11 @@ mod tests {
     #[tokio::test]
     async fn an_ask_resolves_by_approval() {
         let (approval, mut questions) = ApprovalChannel::channel(None);
-        let mut plugins = PluginChain::new(vec![Box::new(
-            PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ),
-        ) as Box<dyn Plugin>]);
+        let mut extensions = Extensions::new();
+        extensions.register(PermissionPlugin::new(
+            vec![],
+            vec![Rule::Name(ToolName::from_str("note").unwrap())],
+        ));
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
@@ -1011,7 +1008,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             Some(&approval),
         )
         .await
@@ -1027,7 +1024,7 @@ mod tests {
             matches!(event, Event::ApprovalRequested { call, .. } if call.id.as_str() == "c1")
         ));
         assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ApprovalResolved { call_id, approved: true, .. }
+            matches!(event, Event::ApprovalResolved { call_id, outcome: ApprovalOutcome::AllowedOnce, .. }
                 if call_id.as_str() == "c1")
         ));
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
@@ -1036,12 +1033,11 @@ mod tests {
     #[tokio::test]
     async fn an_ask_refusal_synthesizes_a_failed_result() {
         let (approval, mut questions) = ApprovalChannel::channel(None);
-        let mut plugins = PluginChain::new(vec![Box::new(
-            PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ),
-        ) as Box<dyn Plugin>]);
+        let mut extensions = Extensions::new();
+        extensions.register(PermissionPlugin::new(
+            vec![],
+            vec![Rule::Name(ToolName::from_str("note").unwrap())],
+        ));
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
@@ -1061,7 +1057,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             Some(&approval),
         )
         .await
@@ -1072,13 +1068,13 @@ mod tests {
         let messages = messages_of(&summary.context);
         assert!(
             matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("denied by policy: the approval was refused"))
+                if output.is_error && output.content.contains("denied by approval: the approval was refused"))
         );
         assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ApprovalResolved { approved: false, .. })
+            matches!(event, Event::ApprovalResolved { outcome: ApprovalOutcome::Rejected, .. })
         ));
         assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ToolGated { reason, .. } if reason.contains("the approval was refused"))
+            matches!(event, Event::ToolGated { denied, .. } if denied.reason.contains("the approval was refused"))
         ));
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
     }
@@ -1087,12 +1083,11 @@ mod tests {
     async fn interrupting_while_waiting_for_approval_closes_the_run() {
         let (approval, kept_questions) = ApprovalChannel::channel(None);
         // 问询接收端保留但不应答 —— run 卡在审批挂起，直到打断
-        let mut plugins = PluginChain::new(vec![Box::new(
-            PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ),
-        ) as Box<dyn Plugin>]);
+        let mut extensions = Extensions::new();
+        extensions.register(PermissionPlugin::new(
+            vec![],
+            vec![Rule::Name(ToolName::from_str("note").unwrap())],
+        ));
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![response(tool_use(vec![call(
@@ -1116,7 +1111,7 @@ mod tests {
                 &input,
                 &requests,
                 &mut sink,
-                &mut plugins,
+                &mut extensions,
                 Some(&approval),
             ),
             interrupter
@@ -1134,7 +1129,7 @@ mod tests {
         )));
         assert!(sink.0.iter().any(|event| matches!(
             event,
-            Event::ApprovalResolved { approved: false, .. }
+            Event::ApprovalResolved { outcome: ApprovalOutcome::Cancelled, .. }
         )));
         // 合成错误结果补位，会话完整
         let messages = messages_of(&summary.context);
@@ -1148,12 +1143,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_approval_timeout_denies_the_call() {
         let (approval, kept_questions) = ApprovalChannel::channel(Some(Duration::from_secs(2)));
-        let mut plugins = PluginChain::new(vec![Box::new(
-            PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ),
-        ) as Box<dyn Plugin>]);
+        let mut extensions = Extensions::new();
+        extensions.register(PermissionPlugin::new(
+            vec![],
+            vec![Rule::Name(ToolName::from_str("note").unwrap())],
+        ));
         let recorder = Arc::new(Recorder::new());
         let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
@@ -1168,7 +1162,7 @@ mod tests {
             &NoInput,
             &standard(model()),
             &mut sink,
-            &mut plugins,
+            &mut extensions,
             Some(&approval),
         )
         .await
@@ -1178,11 +1172,11 @@ mod tests {
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
         assert!(recorder.calls.lock().unwrap().is_empty());
         assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ToolGated { reason, .. } if reason.contains("timed out"))
+            matches!(event, Event::ToolGated { denied, .. } if denied.reason.contains("timed out"))
         ));
         assert!(sink.0.iter().any(|event| matches!(
             event,
-            Event::ApprovalResolved { approved: false, .. }
+            Event::ApprovalResolved { outcome: ApprovalOutcome::Unavailable, .. }
         )));
         // 模型继续走完
         assert_eq!(llm.requests().len(), 2);

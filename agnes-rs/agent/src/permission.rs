@@ -1,13 +1,16 @@
-//! 权限插件：规则表把"工具调用请求"事件映射成指令，不由它执行。
+//! 权限插件：规则表把「工具调用」映射成门禁表态。
 //!
-//! 规则优先级 deny > ask > 放行（无规则默认不表态，交给后续插件；链上
-//! 无人表态则系统默认放行）。deny 命中发 [`Command::Deny`]；ask 命中发
-//! [`Command::Ask`] —— 问询的构造、挂起、超时与答覆落定全部由系统
-//! （[`crate::approval`]）完成，本插件只看事件、发指令。
+//! 规则优先级 deny > ask > 不表态。deny 命中返回 [`Verdict::Deny`]；ask
+//! 命中返回 [`Verdict::Ask`] —— 问询的构造、挂起、超时与答覆落定全部由
+//! 系统（[`crate::approval`]）完成，本插件只看调用、发表态。
+//!
+//! 门禁折叠是拒绝单调的：本插件即使只是不表态，也不会削弱其他插件的
+//! 拒绝。
 
+use agnes_core::message::ToolCall;
 use agnes_core::tool::ToolName;
 
-use crate::plugin::{Command, Plugin, PluginEvent};
+use crate::ext::{Plugin, Verdict};
 
 /// 一条工具名匹配规则：精确或前缀。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +39,7 @@ pub struct PermissionPlugin {
 }
 
 impl PermissionPlugin {
-    /// 新插件：`deny` 一律拒绝（附理由）；`ask` 命中走审批指令；其余
-    /// 不表态。
+    /// 新插件：`deny` 一律拒绝（附理由）；`ask` 命中走审批；其余不表态。
     pub fn new(deny: Vec<Rule>, ask: Vec<Rule>) -> Self {
         Self { deny, ask }
     }
@@ -48,18 +50,14 @@ impl Plugin for PermissionPlugin {
         "permission"
     }
 
-    fn on_event(&mut self, event: &PluginEvent) -> Option<Command> {
-        let PluginEvent::ToolCallRequested { call } = event else {
-            return None;
-        };
+    fn gate(&mut self, call: &ToolCall) -> Option<Verdict> {
         if self.deny.iter().any(|rule| rule.matches(&call.name)) {
-            return Some(Command::Deny(format!(
-                "tool `{}` is denied by policy",
-                call.name
-            )));
+            return Some(Verdict::Deny {
+                reason: format!("tool `{}` is denied by policy", call.name),
+            });
         }
         if self.ask.iter().any(|rule| rule.matches(&call.name)) {
-            return Some(Command::Ask);
+            return Some(Verdict::Ask);
         }
         None
     }
@@ -68,7 +66,7 @@ impl Plugin for PermissionPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::message::{ToolArguments, ToolCall, ToolCallId};
+    use agnes_core::message::{ToolArguments, ToolCallId};
     use std::str::FromStr;
 
     fn call(name: &str) -> ToolCall {
@@ -80,28 +78,25 @@ mod tests {
     }
 
     #[test]
-    fn rules_map_to_commands_in_priority_order() {
+    fn rules_map_to_verdicts_in_priority_order() {
         let mut plugin = PermissionPlugin::new(
             vec![Rule::Prefix("shell".into())],
             vec![Rule::Name(ToolName::from_str("edit").unwrap())],
         );
 
-        // deny 前缀命中 → 拒绝指令
-        let issued = plugin.on_event(&PluginEvent::ToolCallRequested {
-            call: call("shell_find"),
-        });
+        // deny 前缀命中 → 拒绝
         assert_eq!(
-            issued,
-            Some(Command::Deny("tool `shell_find` is denied by policy".into()))
+            plugin.gate(&call("shell_find")),
+            Some(Verdict::Deny {
+                reason: "tool `shell_find` is denied by policy".into()
+            })
         );
 
-        // ask 命中 → 审批指令（是否接线由系统执行时判断）
-        let issued = plugin.on_event(&PluginEvent::ToolCallRequested { call: call("edit") });
-        assert_eq!(issued, Some(Command::Ask));
+        // ask 命中 → 审批（是否接线由系统执行时判断）
+        assert_eq!(plugin.gate(&call("edit")), Some(Verdict::Ask));
 
         // 无规则 → 不表态
-        let issued = plugin.on_event(&PluginEvent::ToolCallRequested { call: call("note") });
-        assert_eq!(issued, None);
+        assert_eq!(plugin.gate(&call("note")), None);
     }
 
     #[test]
@@ -112,30 +107,12 @@ mod tests {
         );
 
         // 名字同时命中 deny（精确）与 ask（前缀）：deny 先定案
-        let issued = plugin.on_event(&PluginEvent::ToolCallRequested {
-            call: call("run_shell"),
-        });
-        assert!(matches!(issued, Some(Command::Deny(_))));
+        assert!(matches!(
+            plugin.gate(&call("run_shell")),
+            Some(Verdict::Deny { .. })
+        ));
 
-        // 仅 ask 前缀命中：走审批指令
-        let issued = plugin.on_event(&PluginEvent::ToolCallRequested {
-            call: call("run_edit"),
-        });
-        assert_eq!(issued, Some(Command::Ask));
-    }
-
-    #[test]
-    fn non_request_events_never_elicit_commands() {
-        let mut plugin = PermissionPlugin::new(
-            vec![Rule::Prefix("x".into())],
-            vec![],
-        );
-        assert_eq!(
-            plugin.on_event(&PluginEvent::ApprovalAnswered {
-                call: call("x"),
-                approved: false,
-            }),
-            None
-        );
+        // 仅 ask 前缀命中：走审批
+        assert_eq!(plugin.gate(&call("run_edit")), Some(Verdict::Ask));
     }
 }

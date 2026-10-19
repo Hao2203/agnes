@@ -261,7 +261,7 @@ impl Host<'_> {
         };
         let requests = StandardRequestBuilder::new(self.model.clone());
         let mut printer = printer;
-        let mut plugins = agnes_agent::plugin::PluginChain::default();
+        let mut extensions = agnes_agent::ext::Extensions::new();
         agnes_agent::run(
             config,
             Arc::clone(self.registry),
@@ -269,7 +269,7 @@ impl Host<'_> {
             input,
             &requests,
             &mut printer,
-            &mut plugins,
+            &mut extensions,
             None,
         )
         .await
@@ -322,16 +322,16 @@ impl Sink for EventPrinter {
                 let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
                 println!("* model {}, tools: [{}]", self.model, names.join(", "));
             }
-            Event::ToolGated { reason, .. } => {
-                println!("  ⛔ {reason}");
+            Event::ToolGated { denied, .. } => {
+                println!("  ⛔ denied by {}: {}", denied.by, denied.reason);
             }
             // 交互式审批 UI 还是后续工作；此处先可见问询与落定
             Event::ApprovalRequested { call, .. } => {
                 println!("  ⏳ waiting approval: {} {}", call.name, call.arguments.as_str());
             }
-            Event::ApprovalResolved { approved, .. } => {
-                if !approved {
-                    println!("  ✗ not approved");
+            Event::ApprovalResolved { outcome, .. } => {
+                if !outcome.allows() {
+                    println!("  ✗ not approved ({outcome:?})");
                 }
             }
             Event::Recorded { event, .. } => match event {

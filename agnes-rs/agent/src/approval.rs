@@ -11,6 +11,8 @@ use agnes_core::tool::ToolName;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+pub use crate::ext::ApprovalOutcome;
+
 /// 递给审批界面的一次问询：界面收到后，用 `reply` 送回 true（批准）或
 /// false（拒绝）。`reply` 被丢弃等价于拒绝。
 #[derive(Debug)]

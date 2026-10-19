@@ -1,20 +1,16 @@
-//! 宿主驱动状态机：管理事件、指令、输入、输出与状态。
+//! 宿主驱动状态机：把 core 的 typestate 与宿主的 IO / 策略接起来。
 //!
-//! 机器的输出（动作）经 [`Driver::pump_actions`] 铸造为事件进入
-//! **事件队列**；[`Driver::drain_events`] 逐条出队 —— core 镜像先交给插件
-//! 再上报宿主，工具调用请求先记下待办、交由插件链发指令（无人表态则系统
-//! 默认放行），问询答覆只作观测。插件发下的指令进 **指令队列**，
-//! [`Driver::execute_command`] 逐条执行：放行向机器喂 `tool_started` 并
-//! 转入等工具；拒绝向机器喂合成失败结果；`Ask` 转入等审批（未接线即
-//! fail-closed 拒绝）。执行的输入又可能让机器产出新动作 —— 反应循环
-//! （[`Driver::react`]）一直转到机器没有新动作、两条队列都空。
+//! 机器产出的动作在 [`Driver::pump_actions`] 里**就地**处理：报告类动作
+//! 先给扩展内核观察、再上报宿主；`CallModel` 组装请求；`RunTool` 走门禁
+//! 折叠（放行 / 审批 / 拒绝）。没有事件队列与指令队列 —— 类型化钩子在
+//! 调用点直接给出决议，系统就地执行。
 //!
-//! **状态**只有"在等什么"：等模型响应 / 等工具执行 / 等审批答覆，三种
-//! 等待各自 select! 打断，结果作为输入喂回机器后回到反应循环，直到机器
-//! 收场。审批的落定也统一经指令队列回流 —— 系统对自己发的指令与插件的
-//! 指令走同一条执行路径。
+//! **状态**只有「在等什么」：等模型响应 / 等工具执行 / 等审批答覆。三个
+//! 等待点都用 `select!` 与打断赛跑；审批落定后就地执行或合成拒绝。
+//!
+//! core 的封闭枚举不因插件扩展：拒绝的合成结果、问询的构造与挂起、结果
+//! 的替换都由驱动完成，机器只看到普通的工具往返。
 
-use std::collections::VecDeque;
 use std::mem;
 use std::time::Duration;
 
@@ -32,7 +28,7 @@ use jiff::Timestamp;
 use tokio::sync::oneshot::Receiver as AnswerReceiver;
 
 use crate::approval::{ApprovalChannel, ApprovalRequest};
-use crate::plugin::{Command, PluginChain, PluginEvent};
+use crate::ext::{ApprovalOutcome, Denied, Extensions, Gate, Notice};
 use crate::{AgentError, Event, Sink};
 
 /// 一次驱动的固定接线：全部被动 IO 端与策略注入点。
@@ -42,7 +38,7 @@ pub(crate) struct Ports<'a> {
     pub(crate) input: &'a dyn InputPort,
     pub(crate) requests: &'a dyn RequestBuilder,
     pub(crate) sink: &'a mut dyn Sink,
-    pub(crate) plugins: &'a mut PluginChain,
+    pub(crate) extensions: &'a mut Extensions,
     pub(crate) approvals: Option<&'a ApprovalChannel>,
 }
 
@@ -131,7 +127,7 @@ impl Machine {
 
 /// 驱动的状态：在等什么。
 enum Waiting {
-    /// 解释态：机器动作或队列还有活（反应循环的驻留态）。
+    /// 中转态：反应循环换绑时的占位，不可观察。
     Reacting,
     /// 等模型响应。
     AwaitingModel { request: LlmRequest },
@@ -147,25 +143,32 @@ enum Waiting {
 
 /// 挂起的审批问询如何落定。
 enum Resolution {
-    /// 批准 —— 照常执行。
-    Approved,
-    /// 拒绝，附理由。
-    Denied(String),
+    /// 批准一次 —— 照常执行。
+    Allowed,
+    /// 拒绝；`outcome` 是 fail-closed 词汇，`detail` 是给模型与界面的理由。
+    Denied {
+        outcome: ApprovalOutcome,
+        detail: &'static str,
+    },
     /// 等待被打断 —— 整个 run 收场。
     Interrupted,
 }
 
-/// 驱动状态机：事件队列 → 插件链 → 指令队列 → 系统执行。
+impl Resolution {
+    fn outcome(&self) -> ApprovalOutcome {
+        match self {
+            Resolution::Allowed => ApprovalOutcome::AllowedOnce,
+            Resolution::Denied { outcome, .. } => *outcome,
+            Resolution::Interrupted => ApprovalOutcome::Cancelled,
+        }
+    }
+}
+
+/// 驱动状态机。
 pub(crate) struct Driver<'a> {
     ports: Ports<'a>,
     machine: Machine,
     state: Waiting,
-    /// 事件队列：core 镜像与系统事件，出口是插件链（镜像同步上报宿主）。
-    events: VecDeque<PluginEvent>,
-    /// 指令队列：插件（及系统自身）发下，由系统按序执行。
-    commands: VecDeque<Command>,
-    /// 已出队、等待指令定案的调用请求。
-    requested: Option<ToolCall>,
 }
 
 impl<'a> Driver<'a> {
@@ -174,9 +177,6 @@ impl<'a> Driver<'a> {
             ports,
             machine: Machine::AwaitingMessage(turn),
             state: Waiting::Reacting,
-            events: VecDeque::new(),
-            commands: VecDeque::new(),
-            requested: None,
         }
     }
 
@@ -194,7 +194,7 @@ impl<'a> Driver<'a> {
             for content in self.ports.input.drain() {
                 self.machine.user_message(content);
             }
-            self.react();
+            self.pump_actions();
             if let Machine::Closed(_) = self.machine {
                 break;
             }
@@ -236,49 +236,66 @@ impl<'a> Driver<'a> {
                             biased;
                             () = self.ports.input.interrupted() => Resolution::Interrupted,
                             answer = answer => match answer {
-                                Ok(true) => Resolution::Approved,
-                                Ok(false) => Resolution::Denied("the approval was refused".into()),
-                                Err(_) => Resolution::Denied("the approver went away".into()),
+                                Ok(true) => Resolution::Allowed,
+                                Ok(false) => Resolution::Denied {
+                                    outcome: ApprovalOutcome::Rejected,
+                                    detail: "the approval was refused",
+                                },
+                                Err(_) => Resolution::Denied {
+                                    outcome: ApprovalOutcome::Unavailable,
+                                    detail: "the approver went away",
+                                },
                             },
                         },
                         Some(limit) => tokio::select! {
                             biased;
                             () = self.ports.input.interrupted() => Resolution::Interrupted,
                             resolution = tokio::time::timeout(limit, answer) => match resolution {
-                                Ok(Ok(true)) => Resolution::Approved,
-                                Ok(Ok(false)) => Resolution::Denied("the approval was refused".into()),
-                                Ok(Err(_recv)) => Resolution::Denied("the approver went away".into()),
-                                Err(_elapsed) => Resolution::Denied("the approval timed out".into()),
+                                Ok(Ok(true)) => Resolution::Allowed,
+                                Ok(Ok(false)) => Resolution::Denied {
+                                    outcome: ApprovalOutcome::Rejected,
+                                    detail: "the approval was refused",
+                                },
+                                Ok(Err(_recv)) => Resolution::Denied {
+                                    outcome: ApprovalOutcome::Unavailable,
+                                    detail: "the approver went away",
+                                },
+                                Err(_elapsed) => Resolution::Denied {
+                                    outcome: ApprovalOutcome::Unavailable,
+                                    detail: "the approval timed out",
+                                },
                             },
                         },
                     };
+                    let outcome = resolution.outcome();
                     self.ports.sink.event(&Event::ApprovalResolved {
                         at: Timestamp::now(),
                         call_id: call.id.clone(),
-                        approved: matches!(resolution, Resolution::Approved),
+                        outcome,
                     });
-                    // 答覆作为观测事件回流；落定统一经指令队列 —— 系统对
-                    // 自己发的指令与插件的指令走同一条执行路径。
-                    let approved = matches!(resolution, Resolution::Approved);
-                    self.events.push_back(PluginEvent::ApprovalAnswered {
-                        call: call.clone(),
-                        approved,
-                    });
+                    self.ports
+                        .extensions
+                        .observe(&Notice::Decided { call: &call, outcome });
                     match resolution {
                         Resolution::Interrupted => {
                             self.transition(Machine::interrupted);
                         }
-                        Resolution::Approved => {
-                            self.requested = Some(call);
-                            self.commands.push_back(Command::Allow);
+                        Resolution::Allowed => {
+                            self.machine.tool_started(&call.id);
+                            self.state = Waiting::AwaitingTool { call };
                         }
-                        Resolution::Denied(reason) => {
-                            self.requested = Some(call);
-                            self.commands.push_back(Command::Deny(reason));
+                        Resolution::Denied { detail, .. } => {
+                            self.deny_tool(
+                                call,
+                                Denied {
+                                    by: "approval",
+                                    reason: detail.into(),
+                                },
+                            );
                         }
                     }
                 }
-                Waiting::Reacting => unreachable!("反应循环只在摆好等待点或收场后退出"),
+                Waiting::Reacting => unreachable!("泵完动作后必然摆好等待点或收场"),
             }
         }
         match self.machine {
@@ -287,134 +304,93 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// 反应循环：把机器动作、事件队列、指令队列处理到静止。
-    fn react(&mut self) {
-        loop {
-            self.pump_actions();
-            self.drain_events();
-            let mut fed = false;
-            while let Some(command) = self.commands.pop_front() {
-                fed |= self.execute_command(command);
-            }
-            // 静止：没有新指令、没有待处理事件、也没有刚喂出的新动作。
-            if !fed && self.events.is_empty() && self.commands.is_empty() {
-                break;
-            }
-        }
-    }
-
-    /// 机器输出 → 事件队列 / 等待目标。
+    /// 机器动作 → 事件上报 / 等待目标；工具调用在这里就地决议。
     fn pump_actions(&mut self) {
         while let Some(action) = self.machine.poll_actions() {
             match action {
-                Action::Report(event) => self.events.push_back(PluginEvent::Core(event)),
+                Action::Report(event) => {
+                    self.ports.extensions.observe(&Notice::Core(&event));
+                    self.ports.sink.event(&Event::Recorded {
+                        at: Timestamp::now(),
+                        event,
+                    });
+                }
                 Action::CallModel => {
                     let request = self.ports.requests.build(self.machine.context());
                     self.state = Waiting::AwaitingModel { request };
                 }
-                Action::RunTool(call) => self
-                    .events
-                    .push_back(PluginEvent::ToolCallRequested { call }),
+                Action::RunTool(call) => self.dispatch_tool(call),
             }
         }
     }
 
-    /// 事件队列出队：core 镜像上报宿主并交给插件；工具调用请求交给插件
-    /// 链发指令（无人表态则系统默认放行）；问询答覆只作观测。
-    fn drain_events(&mut self) {
-        while let Some(event) = self.events.pop_front() {
-            match &event {
-                PluginEvent::Core(core) => {
-                    let command = self.ports.plugins.on_event(&event);
-                    debug_assert!(command.is_none(), "指令只对工具调用请求有效");
-                    self.ports.sink.event(&Event::Recorded {
-                        at: Timestamp::now(),
-                        event: core.clone(),
-                    });
-                }
-                PluginEvent::ToolCallRequested { call } => {
-                    debug_assert!(self.requested.is_none(), "同一时刻只可能有一个待定调用");
-                    self.requested = Some(call.clone());
-                    let command = self
-                        .ports
-                        .plugins
-                        .on_event(&event)
-                        .unwrap_or(Command::Allow);
-                    self.commands.push_back(command);
-                }
-                PluginEvent::ApprovalAnswered { .. } => {
-                    let command = self.ports.plugins.on_event(&event);
-                    debug_assert!(command.is_none(), "指令只对工具调用请求有效");
-                }
-            }
-        }
-    }
-
-    /// 系统执行一条指令；返回是否向机器喂了输入（还有新输出要泵）。
-    fn execute_command(&mut self, command: Command) -> bool {
-        let Some(call) = self.requested.take() else {
-            debug_assert!(false, "指令没有对应的调用请求");
-            return false;
-        };
-        match command {
-            Command::Allow => {
+    /// 门禁折叠 → 放行 / 审批挂起 / 合成拒绝。
+    fn dispatch_tool(&mut self, call: ToolCall) {
+        match self.ports.extensions.gate(&call) {
+            Gate::Allow => {
                 self.machine.tool_started(&call.id);
                 self.state = Waiting::AwaitingTool { call };
-                true
             }
-            Command::Deny(reason) => {
-                self.deny_tool(call, reason);
-                true
-            }
-            Command::Ask => match self.ports.approvals {
-                None => {
+            Gate::Deny(denied) => self.deny_tool(call, denied),
+            Gate::Ask => {
+                let Some(channel) = self.ports.approvals else {
+                    // 没接审批口 = 没有答覆者 = 拒绝（fail-closed）。
                     self.deny_tool(
                         call,
-                        "tool requires an approval, but no approval channel is wired".into(),
+                        Denied {
+                            by: "approval",
+                            reason: "tool requires an approval, but no approval channel is wired"
+                                .into(),
+                        },
                     );
-                    true
-                }
-                Some(channel) => {
-                    let (reply, answer) = tokio::sync::oneshot::channel::<bool>();
-                    let request = ApprovalRequest {
-                        call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        reply,
-                    };
-                    if let Err(closed) = channel.send(request) {
-                        self.deny_tool(call, format!("the approval channel was closed: {closed}"));
-                        return true;
-                    }
-                    self.ports.sink.event(&Event::ApprovalRequested {
-                        at: Timestamp::now(),
-                        call: call.clone(),
-                    });
-                    self.state = Waiting::AwaitingApproval {
+                    return;
+                };
+                let (reply, answer) = tokio::sync::oneshot::channel::<bool>();
+                let request = ApprovalRequest {
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    reply,
+                };
+                if let Err(closed) = channel.send(request) {
+                    self.deny_tool(
                         call,
-                        answer,
-                        timeout: channel.timeout(),
-                    };
-                    false
+                        Denied {
+                            by: "approval",
+                            reason: format!("the approval channel was closed: {closed}"),
+                        },
+                    );
+                    return;
                 }
-            },
+                self.ports
+                    .extensions
+                    .observe(&Notice::Asked { call: &call });
+                self.ports.sink.event(&Event::ApprovalRequested {
+                    at: Timestamp::now(),
+                    call: call.clone(),
+                });
+                self.state = Waiting::AwaitingApproval {
+                    call,
+                    answer,
+                    timeout: channel.timeout(),
+                };
+            }
         }
     }
 
-    /// 以一次合成拒绝推进机器：gating 事件先上报，随后 tool_start +
-    /// 失败结果落位 —— 模型看得见拒绝并自行调整。
-    fn deny_tool(&mut self, call: ToolCall, reason: String) {
+    /// 以一次合成拒绝推进机器：先让插件观察、再上报宿主，随后 tool_start
+    /// + 失败结果落位 —— 模型看得见拒绝并自行调整。
+    fn deny_tool(&mut self, call: ToolCall, denied: Denied) {
+        self.ports
+            .extensions
+            .observe(&Notice::Gated { call: &call, denied: &denied });
         self.ports.sink.event(&Event::ToolGated {
             at: Timestamp::now(),
             call: call.clone(),
-            reason: reason.clone(),
+            denied: denied.clone(),
         });
         self.machine.tool_started(&call.id);
-        self.transition(|machine| {
-            machine.tool_finished(
-                call.id,
-                ToolOutput::error(format!("denied by policy: {reason}")),
-            )
-        });
+        let output = ToolOutput::error(format!("denied by {}: {}", denied.by, denied.reason));
+        self.transition(|machine| machine.tool_finished(call.id, output));
     }
 }
