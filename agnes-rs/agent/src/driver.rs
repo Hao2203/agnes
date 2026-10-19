@@ -222,6 +222,22 @@ impl<'a> Driver<'a> {
                     match raced {
                         None => self.transition(Machine::interrupted),
                         Some(output) => {
+                            // 结果折叠：插件可以在入账前挡回，反馈仍是一条
+                            // 错误结果 —— 调用/结果始终一一对应。
+                            let output =
+                                if let Some(blocked) = self.ports.extensions.settle(&call, &output) {
+                                    self.ports.extensions.observe(&Notice::Blocked {
+                                        call: &call,
+                                        by: blocked.by,
+                                        feedback: &blocked.feedback,
+                                    });
+                                    ToolOutput::error(blocked.feedback)
+                                } else {
+                                    self.ports
+                                        .extensions
+                                        .observe(&Notice::Ran { call: &call, output: &output });
+                                    output
+                                };
                             self.transition(|machine| machine.tool_finished(call.id, output));
                         }
                     }

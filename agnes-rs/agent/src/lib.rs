@@ -228,6 +228,7 @@ pub fn step_budget(max_steps: u32) -> Option<agnes_core::config::StepBudget> {
 mod tests {
     use super::*;
     use crate::approval::ApprovalChannel;
+    use crate::ext::{Notice, Plugin, Settlement};
     use crate::permission::{PermissionPlugin, Rule};
     use agnes_core::config::{StepBudget, SystemPrompt};
     use agnes_core::context::Environment;
@@ -910,6 +911,122 @@ mod tests {
     }
 
     // —— 插件：权限链驱动宿主 FSM ——
+
+    /// 记录观察到的通知、按配置折叠结果。
+    struct Witness {
+        settlement: Settlement,
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Witness {
+        fn new(settlement: Settlement, seen: &Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                settlement,
+                seen: Arc::clone(seen),
+            }
+        }
+    }
+
+    impl Plugin for Witness {
+        fn name(&self) -> &'static str {
+            "witness"
+        }
+
+        fn settle(&mut self, _call: &ToolCall, _output: &ToolOutput) -> Settlement {
+            self.settlement.clone()
+        }
+
+        fn observe(&mut self, notice: &Notice<'_>) {
+            let label = match notice {
+                Notice::Core(_) => return,
+                Notice::Gated { .. } => "gated",
+                Notice::Asked { .. } => "asked",
+                Notice::Decided { .. } => "decided",
+                Notice::Ran { .. } => "ran",
+                Notice::Blocked { .. } => "blocked",
+            };
+            self.seen.lock().unwrap().push(label);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_result_is_observed_as_ran() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut extensions = Extensions::new();
+        extensions.register(Witness::new(Settlement::Accept, &seen));
+
+        let recorder = Arc::new(Recorder::new());
+        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
+        let llm = ScriptedLlm::new(vec![
+            response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
+            response(completed("ok")),
+        ]);
+
+        let mut sink = Collector(Vec::new());
+        let summary = run(
+            config(8),
+            Arc::new(registry),
+            &llm,
+            &NoInput,
+            &standard(model()),
+            &mut sink,
+            &mut extensions,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. } if !output.is_error)
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["ran"]);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_result_is_replaced_by_feedback() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut extensions = Extensions::new();
+        extensions.register(Witness::new(
+            Settlement::Block {
+                feedback: "the note was rejected".into(),
+            },
+            &seen,
+        ));
+
+        let recorder = Arc::new(Recorder::new());
+        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
+        let llm = ScriptedLlm::new(vec![
+            response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
+            response(completed("ok")),
+        ]);
+
+        let mut sink = Collector(Vec::new());
+        let summary = run(
+            config(8),
+            Arc::new(registry),
+            &llm,
+            &NoInput,
+            &standard(model()),
+            &mut sink,
+            &mut extensions,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 工具确实跑过；入账的是反馈，仍然是那一个调用的一条结果
+        assert_eq!(recorder.calls.lock().unwrap().len(), 1);
+        assert!(
+            matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. }
+                if output.is_error && output.content.contains("the note was rejected"))
+        );
+        assert!(recorded(&sink.0).iter().any(|event| matches!(
+            event,
+            CoreEvent::ToolExecutionEnd { is_error: true, .. }
+        )));
+        assert_eq!(*seen.lock().unwrap(), vec!["blocked"]);
+        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+    }
 
     #[tokio::test]
     async fn denied_tool_never_runs_and_the_model_carries_on() {
