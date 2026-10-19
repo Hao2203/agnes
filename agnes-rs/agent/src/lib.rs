@@ -126,8 +126,8 @@ impl<F: FnMut(&Event)> Sink for F {
 ///
 /// `context` 是收场后的会话 —— 系统提示、环境、完整的有序日志；
 /// 喂回下一个 [`agnes_core::turn::AgentConfig`] 即可延续会话。
-/// `pending_user_messages` 是没来得及生效的插话（比如最终答复期间
-/// 敲进来的），宿主接着用。
+/// `pending_user_messages` 是没来得及生效的插话（预算耗尽、最后一次答复
+/// 时仍没轮到），宿主接着用。
 #[derive(Debug, Clone)]
 pub struct RunSummary {
     pub outcome: Outcome,
@@ -799,15 +799,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unapplied_user_messages_come_back_to_the_host() {
+    async fn a_queued_message_continues_the_turn_after_an_answer() {
         let input = FakeInput::new();
-        // 最终答复期间敲进来的插话：边界未到，未生效
+        // 模型还在生成答复时敲进来的插话：收件箱非空 → 同一 turn 续跑
+        input.queue("also update the readme");
+        let llm = ScriptedLlm::new(vec![
+            response(completed("first answer")),
+            response(completed("second answer")),
+        ]);
+        let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
+
+        let mut sink = Collector(Vec::new());
+        let summary = host.run(config(4), &mut sink, None).await.unwrap();
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        // 第二次请求看得见这条插话
+        assert!(requests[1].prompt.input.iter().any(
+            |message| matches!(message, Message::User { content } if content.as_str() == "also update the readme")
+        ));
+        assert_eq!(
+            summary.outcome,
+            Outcome::Answered {
+                reply: Content::try_from("second answer").unwrap()
+            }
+        );
+        assert_eq!(summary.steps_used, 2);
+        assert!(summary.pending_user_messages.is_empty());
+        assert!(recorded(&sink.0).iter().any(|event| matches!(
+            event,
+            CoreEvent::UserMessagesInjected { messages } if messages.len() == 1
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_comes_back_when_the_budget_blocks_another_step() {
+        let input = FakeInput::new();
+        // 一步预算：答复后没有余量续跑，插话还给宿主
         input.queue("too late for this run");
         let llm = ScriptedLlm::new(vec![response(completed("all done"))]);
         let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(4), &mut sink, None).await.unwrap();
+        let summary = host.run(config(1), &mut sink, None).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -815,7 +849,7 @@ mod tests {
                 reply: Content::try_from("all done").unwrap()
             }
         );
-        // 插话没有进会话；会话里只有 goal 和最终答复
+        // 插话没有进会话；会话里只有 goal 和答复
         assert_eq!(
             summary.pending_user_messages,
             vec![Content::try_from("too late for this run").unwrap()]

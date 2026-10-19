@@ -98,6 +98,7 @@ impl Machine {
         match self {
             Machine::AwaitingMessage(turn) => match turn.model_responded(response) {
                 MessageReplied::Tools { turn } => Machine::AwaitingTools(turn),
+                MessageReplied::Continued { turn } => Machine::AwaitingMessage(turn),
                 MessageReplied::Closed { turn } => Machine::Closed(turn),
             },
             other => {

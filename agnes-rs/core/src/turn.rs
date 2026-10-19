@@ -98,7 +98,7 @@ impl fmt::Display for StepNumber {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepOutcome {
-    /// 模型给出最终答复：turn 随之收场。
+    /// 模型给出答复。收件箱非空且预算允许时 turn 会续跑，否则随之收场。
     Answered { reply: Content },
     /// 模型要工具：turn 开下一个 step 接着走。
     ToolUse,
@@ -228,8 +228,9 @@ impl Turn<AwaitingMessage> {
         self.core.buffered_user_messages.push(content);
     }
 
-    /// 一次模型往返的响应到达：用量落账，随后要么转入工具执行
-    /// （第一个调用已排队），要么（答复 / 触顶）收场。
+    /// 一次模型往返的响应到达：用量落账，随后要么转入工具执行，要么
+    /// **收件箱里有待处理的插话且预算允许时注入并开下一个 step**，否则
+    /// （答复 / 触顶）收场。
     pub fn model_responded(self, response: LlmResponse) -> MessageReplied {
         let Turn {
             mut core,
@@ -273,6 +274,22 @@ impl Turn<AwaitingMessage> {
                         },
                     },
                 ]);
+                // 收件箱里有话就不收场：注入后在这个 turn 里开下一个 step。
+                // 预算不允许时仍以答复收场，插话原样留给宿主。
+                if !core.buffered_user_messages.is_empty() && core.budget.allows(core.steps_started)
+                {
+                    let messages = mem::take(&mut core.buffered_user_messages);
+                    core.emit(Event::UserMessagesInjected {
+                        messages: messages.clone(),
+                    });
+                    for content in messages {
+                        core.emit(Event::Message(Message::User { content }));
+                    }
+                    let phase = begin_step(&mut core);
+                    return MessageReplied::Continued {
+                        turn: Turn { core, phase },
+                    };
+                }
                 core.emit(Event::TurnEnd {
                     outcome: Outcome::Answered {
                         reply: reply.clone(),
@@ -490,7 +507,9 @@ impl Turn<Closed> {
 pub enum MessageReplied {
     /// 模型要工具：进入执行阶段（第一个调用已排队派发）。
     Tools { turn: Turn<AwaitingTools> },
-    /// 答复或触顶：turn 收场。
+    /// 模型给出答复，但收件箱里有待处理的插话：已注入并开了下一个 step。
+    Continued { turn: Turn<AwaitingMessage> },
+    /// 答复且没有后续输入、输出触顶，或预算不允许再开一个 step：收场。
     Closed { turn: Turn<Closed> },
 }
 
@@ -915,8 +934,63 @@ mod tests {
     }
 
     #[test]
-    fn unapplied_user_messages_come_back_after_an_answer() {
+    fn a_queued_message_keeps_the_turn_alive_after_an_answer() {
         let mut turn = Turn::start(config(4));
+        let _ = drain(&mut turn);
+        turn.user_message(content("one more thing"));
+        let MessageReplied::Continued { mut turn } =
+            turn.model_responded(response(completed("first answer")))
+        else {
+            panic!("expected Continued");
+        };
+        let _ = drain(&mut turn);
+
+        // 答复入账后，插话紧接着入账，并开了下一个 step
+        assert_eq!(turn.steps_used(), 2);
+        assert_eq!(
+            shape(turn.context().events()),
+            vec![
+                "message",
+                "turn_start",
+                "step_start",
+                "message_start",
+                "message",
+                "message_end",
+                "step_end",
+                "user_injected",
+                "message",
+                "step_start",
+                "message_start",
+            ]
+        );
+
+        // 下一次模型调用看得见这条插话
+        let prompt = Prompt::from_context(turn.context());
+        assert!(prompt.input.iter().any(
+            |message| matches!(message, Message::User { content } if content.as_str() == "one more thing")
+        ));
+
+        // 第二个答复时收件箱已空，正常收场
+        let _ = drain(&mut turn);
+        let MessageReplied::Closed { mut turn } =
+            turn.model_responded(response(completed("second answer")))
+        else {
+            panic!("expected Closed");
+        };
+        let _ = drain(&mut turn);
+        assert_eq!(
+            turn.outcome(),
+            &Outcome::Answered {
+                reply: content("second answer")
+            }
+        );
+        assert!(turn.take_unapplied_user_messages().is_empty());
+    }
+
+    #[test]
+    fn a_queued_message_is_returned_when_the_budget_blocks_another_step() {
+        // 只有一步预算：答复后没有余量续跑，插话原样还给宿主
+        let mut turn = Turn::start(config(1));
         let _ = drain(&mut turn);
         turn.user_message(content("too late"));
         let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done")))
@@ -926,7 +1000,6 @@ mod tests {
         let _ = drain(&mut turn);
 
         assert!(matches!(turn.outcome(), Outcome::Answered { .. }));
-        // 最终答复走完、边界未到 —— 插话不属于这次 turn 的日志，还给宿主
         assert_eq!(
             turn.take_unapplied_user_messages(),
             vec![content("too late")]

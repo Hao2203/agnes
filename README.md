@@ -85,7 +85,9 @@ agnes chat --session ./notes/session.jsonl
   文件，因为日志只追加
 - `exit`、`quit` 或 EOF：退出会话
 - `Ctrl-C`：任务运行中中断任务并保留会话；在提示符处则退出
-- 运行期间输入的消息会排队，在下一批工具调用结束后注入
+- 运行期间输入的消息会排队，在下一个 step 边界注入；如果模型已经给出
+  答复，收件箱非空时会在同一 turn 内续跑（预算允许时），否则作为下一轮
+  任务处理
 - 需要审批的工具在终端询问 `[y] once / [n] reject / [a] always this session`
 
 ### 命令行选项
