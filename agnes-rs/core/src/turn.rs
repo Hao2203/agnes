@@ -1,16 +1,20 @@
 //! turn：把一次用户请求推进到答复的完整运行 —— 由多个 step（模型往返）组成。
 //!
-//! 这是事件循环驱动的 sans-io 状态机：外层驱动只执行 IO —— 从
-//! [`Turn::poll_actions`] 从 FIFO 动作队列里逐个取走 [`Action`]（报告事件、
-//! 把结果作为 [`Input`] 从 [`Turn::handle`] 喂回来。机器只接收输入、消费
-//! 事件、更新状态、产生待执行的动作，从不执行 IO；请求与工具执行的策略
-//! 完全由宿主导，机器既不知道模型是什么，也不知道工具怎么运行。
+//! 这是事件循环驱动的 sans-io 状态机，且状态即类型：机器的阶段由
+//! [`AwaitingMessage`]、[`AwaitingTools`]、[`Closed`] 表示，[`Turn<Phase>`]
+//! 每个阶段只提供推进该阶段的方法 —— 在等工具时"喂"响应、在收场后喂
+//! 任何输入，编译期都不可能。乱序输入的运行时容忍随之取消：真实驱动器
+//! 用 select! 互斥地产生 IO 结果，正确性由类型而非防御保证。
 //!
-//! 外层按当前阶段（[`Phase`]）分发输入，内层是类型状态的 [`Step`] 子机
-//! （见 [`crate::step`]）。与阶段不符的输入被原样放回并忽略 —— 状态不丢，
-//! 协议纪律由驱动器遵守。
+//! 机器只接收输入、消费事件、更新状态、产生待执行的动作，从不执行 IO：
+//! 外层驱动从 [`Turn::poll_actions`] 把 FIFO 动作队列里的 [`Action`] 逐个
+//! 取走执行 —— 上报事件、上调模型、派发工具 —— 再把结果经对应阶段的方法
+//! 喂回来。机器不知道模型是什么，也不知道工具怎么跑；请求与工具执行的
+//! 策略（含权限插件的准否）完全由宿主导，core 的词汇不因插件而扩展。
 //!
-//! 所有发生的事都写进 [`Context`] 的有序日志（消息也是事件）；插话在
+//! 只有推进阶段的信息才进机器：完整响应、工具调用的开始与结果、打断。
+//! 流式增量不走这里 —— 适配器把产生中的消息直报宿主界面。发生的一切
+//! 都写进 [`Context`] 的有序日志（消息也是事件）；插话随时缓存、在下一个
 //! step 边界生效；turn 在最终答复、打断或 step 预算耗尽时收场，其
 //! [`Outcome`] 就是整个 run 的结果。
 
@@ -18,10 +22,11 @@ use crate::config::StepBudget;
 use crate::content::Content;
 use crate::context::Context;
 use crate::event::Event;
-use crate::llm::LlmResponse;
-use crate::message::{Message, MessageDelta, TokenUsage, ToolCall, ToolCallId, ToolOutput};
-use crate::step::{Executing, Generating, Step, StepNumber, StepReply};
-use std::collections::VecDeque;
+use crate::llm::{LlmResponse, StopReason};
+use crate::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolCallId, ToolOutput};
+use agnes_util::NonEmpty;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::mem;
 use std::num::NonZeroU32;
 
@@ -34,26 +39,6 @@ pub struct AgentConfig {
     pub budget: StepBudget,
 }
 
-/// 外层喂给机器的输入 —— IO 的结果，或用户动作。
-#[derive(Debug, Clone)]
-pub enum Input {
-    /// 模型消息的一段流式增量（流式适配器才有）。
-    MessageDelta(MessageDelta),
-    /// 一次模型往返的响应到达。
-    ModelResponded(LlmResponse),
-    /// 宿主开始执行已派发的工具调用。
-    ToolStarted(ToolCallId),
-    /// 宿主执行完一个工具调用。
-    ToolFinished {
-        call_id: ToolCallId,
-        output: ToolOutput,
-    },
-    /// 用户在运行中插话；在下一个 step 边界生效。
-    UserMessage(Content),
-    /// 用户打断；两个等待阶段都可以打断。
-    Interrupted,
-}
-
 /// 机器交给外层执行的动作 —— 机器只产生动作，从不执行 IO。
 #[derive(Debug)]
 pub enum Action {
@@ -61,7 +46,7 @@ pub enum Action {
     Report(Event),
     /// 发起一次模型调用：宿主的 RequestBuilder 从 Context 构造出请求。
     CallModel,
-    /// 执行一个工具调用；产生的 `Input::ToolStarted` 与结果要喂回机器。
+    /// 执行一个工具调用；产生的 `tool_started` 与结果要喂回机器。
     /// 一次只派发一个，按模型给出的顺序。
     RunTool(ToolCall),
 }
@@ -79,287 +64,453 @@ pub enum Outcome {
     BudgetExhausted,
 }
 
-/// 机器的阶段：等消息、等工具，或已收场。
-#[derive(Debug)]
-enum Phase {
-    AwaitingMessage(Step<Generating>),
-    AwaitingTools(Step<Executing>),
-    Closed(Outcome),
+/// step 编号（turn 内 1 起始）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StepNumber(NonZeroU32);
+
+impl StepNumber {
+    pub const FIRST: Self = Self(NonZeroU32::MIN);
+
+    pub fn new(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
 }
 
-/// 事件循环驱动的 sans-io turn 状态机。
+impl fmt::Display for StepNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// 一个 step 怎么收尾。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// 模型给出最终答复：turn 随之收场。
+    Answered { reply: Content },
+    /// 模型要工具：turn 开下一个 step 接着走。
+    ToolUse,
+    /// 模型输出触顶。
+    LengthExceeded,
+    /// 用户打断。
+    Interrupted,
+}
+
+/// 共享内核：机器各阶段都携带的会话与统计状态，外加待执行的动作队列。
 #[derive(Debug)]
-pub struct Turn {
+struct Core {
     context: Context,
     budget: StepBudget,
     usage: TokenUsage,
     steps_started: u32,
     buffered_user_messages: Vec<Content>,
-    /// 待执行的动作队列（FIFO），`poll_actions` 每次取走一个。
     actions: VecDeque<Action>,
+}
+
+impl Core {
+    /// 记录一批转移事件：入账并排队报告 —— 每个转移经此落账。
+    fn note(&mut self, events: Vec<Event>) {
+        for event in events {
+            self.context.record(event.clone());
+            self.actions.push_back(Action::Report(event));
+        }
+    }
+
+    /// 记录一个机器自己的事件并入队报告（等同逐个 note）。
+    fn emit(&mut self, event: Event) {
+        self.context.record(event.clone());
+        self.actions.push_back(Action::Report(event));
+    }
+}
+
+/// 阶段：等模型消息 —— 只接受完整响应、打断和插话。
+#[derive(Debug)]
+pub struct AwaitingMessage {
+    step: StepNumber,
+}
+
+/// 阶段：等工具结果 —— 调用按模型给出的顺序派发给宿主，结果按 id 落位。
+#[derive(Debug)]
+pub struct AwaitingTools {
+    step: StepNumber,
+    calls: NonEmpty<ToolCall>,
+    /// 已交给宿主的调用数。
+    dispatched: usize,
+    outputs: BTreeMap<ToolCallId, ToolOutput>,
+}
+
+impl AwaitingTools {
+    /// 把下一个调用交给宿主执行；全部派发完则返回 None。
+    fn take_next(&mut self) -> Option<ToolCall> {
+        let call = self.calls.as_ref().get(self.dispatched)?.clone();
+        self.dispatched += 1;
+        Some(call)
+    }
+
+    /// 是否所有派发过的调用都有了结果。
+    fn results_complete(&self) -> bool {
+        self.outputs.len() == self.calls.len()
+    }
+}
+
+/// 阶段：已收场 —— [`Outcome`] 就是整个 run 的结果；不再接受任何输入。
+#[derive(Debug)]
+pub struct Closed {
+    outcome: Outcome,
+}
+
+/// 分阶段 typestate 的 turn 机器：`Turn<AwaitingMessage>` →
+/// `Turn<AwaitingTools>` →（回到 `Turn<AwaitingMessage>` 或收为
+/// `Turn<Closed>`），每一步转移都消耗当前阶段、交还下一个。
+#[derive(Debug)]
+pub struct Turn<Phase> {
+    core: Core,
     phase: Phase,
 }
 
-impl Turn {
-    /// 开始 turn：goal 先入账（用户先说话），随后 turn_start、第一个 step
-    /// 的启动动作 —— 外层从动作里见到 `CallModel` 就发起首次调用。
-    pub fn start(config: AgentConfig) -> Self {
-        let AgentConfig {
-            mut context,
-            goal,
-            budget,
-        } = config;
-        let mut actions = VecDeque::new();
-        emit(
-            &mut context,
-            &mut actions,
-            Event::Message(Message::User { content: goal }),
-        );
-        emit(&mut context, &mut actions, Event::TurnStart);
-        let (step, events) = Step::begin(StepNumber::FIRST, &mut context);
-        for event in events {
-            actions.push_back(Action::Report(event));
-        }
-        actions.push_back(Action::CallModel);
-        Self {
-            context,
-            budget,
-            usage: TokenUsage::default(),
-            steps_started: 1,
-            buffered_user_messages: Vec::new(),
-            actions,
-            phase: Phase::AwaitingMessage(step),
-        }
-    }
-
-    /// 消费一个输入，推进状态并把新动作入队。与当前阶段不符的输入被
-    /// 原样放回并忽略 —— 状态不丢；已收场的 turn 忽略一切输入。
-    pub fn handle(&mut self, input: Input) {
-        let Turn {
-            context,
-            budget,
-            usage,
-            steps_started,
-            buffered_user_messages,
-            actions,
-            phase,
-        } = self;
-
-        match input {
-            Input::UserMessage(content) => buffered_user_messages.push(content),
-            Input::MessageDelta(delta) => {
-                if let Phase::AwaitingMessage(step) = phase {
-                    let event = step.update(context, delta);
-                    actions.push_back(Action::Report(event));
-                }
-            }
-            Input::ToolStarted(call_id) => {
-                if let Phase::AwaitingTools(step) = phase {
-                    if let Some(event) = step.tool_started(context, &call_id) {
-                        actions.push_back(Action::Report(event));
-                    }
-                }
-            }
-            Input::ModelResponded(response) => {
-                *usage = usage.saturating_add(response.usage);
-                let taken = take_phase(phase);
-                match taken {
-                    Phase::AwaitingMessage(step) => match step.message_ended(context, response) {
-                        StepReply::Tools { mut step, events } => {
-                            for event in events {
-                                actions.push_back(Action::Report(event));
-                            }
-                            // 一次只派发一个；下一个等结果喂回后再排队。
-                            if let Some(call) = step.take_next() {
-                                actions.push_back(Action::RunTool(call));
-                            }
-                            *phase = Phase::AwaitingTools(step);
-                        }
-                        StepReply::Answered { reply, events } => {
-                            for event in events {
-                                actions.push_back(Action::Report(event));
-                            }
-                            emit(
-                                context,
-                                actions,
-                                Event::TurnEnd {
-                                    outcome: Outcome::Answered {
-                                        reply: reply.clone(),
-                                    },
-                                },
-                            );
-                            *phase = Phase::Closed(Outcome::Answered { reply });
-                        }
-                        StepReply::LengthExceeded { events } => {
-                            for event in events {
-                                actions.push_back(Action::Report(event));
-                            }
-                            emit(
-                                context,
-                                actions,
-                                Event::TurnEnd {
-                                    outcome: Outcome::LengthExceeded,
-                                },
-                            );
-                            *phase = Phase::Closed(Outcome::LengthExceeded);
-                        }
-                    },
-                    other => *phase = other,
-                }
-            }
-            Input::ToolFinished { call_id, output } => {
-                let taken = take_phase(phase);
-                match taken {
-                    Phase::AwaitingTools(mut step) => {
-                        for event in step.tool_finished(context, call_id, output) {
-                            actions.push_back(Action::Report(event));
-                        }
-                        if step.results_complete() {
-                            for event in step.settle(context) {
-                                actions.push_back(Action::Report(event));
-                            }
-                            // step 的边界：运行中的插话在这里生效 ——
-                            // 注入事件在前，消息紧随其后入账。
-                            let messages = mem::take(buffered_user_messages);
-                            if !messages.is_empty() {
-                                emit(
-                                    context,
-                                    actions,
-                                    Event::UserMessagesInjected {
-                                        messages: messages.clone(),
-                                    },
-                                );
-                                for content in messages {
-                                    emit(
-                                        context,
-                                        actions,
-                                        Event::Message(Message::User { content }),
-                                    );
-                                }
-                            }
-                            begin_step(context, budget, steps_started, actions, phase);
-                        } else {
-                            if let Some(call) = step.take_next() {
-                                actions.push_back(Action::RunTool(call));
-                            }
-                            *phase = Phase::AwaitingTools(step);
-                        }
-                    }
-                    other => *phase = other,
-                }
-            }
-            Input::Interrupted => {
-                let taken = take_phase(phase);
-                match taken {
-                    Phase::AwaitingMessage(step) => {
-                        for event in step.interrupted(context) {
-                            actions.push_back(Action::Report(event));
-                        }
-                        emit(
-                            context,
-                            actions,
-                            Event::TurnEnd {
-                                outcome: Outcome::Interrupted,
-                            },
-                        );
-                        *phase = Phase::Closed(Outcome::Interrupted);
-                    }
-                    Phase::AwaitingTools(step) => {
-                        for event in step.interrupted(context) {
-                            actions.push_back(Action::Report(event));
-                        }
-                        emit(
-                            context,
-                            actions,
-                            Event::TurnEnd {
-                                outcome: Outcome::Interrupted,
-                            },
-                        );
-                        *phase = Phase::Closed(Outcome::Interrupted);
-                    }
-                    other => *phase = other,
-                }
-            }
-        }
-    }
-
+impl<Phase> Turn<Phase> {
     /// 从动作队列取走一个待执行动作（FIFO）；队列空了返回 None。
     pub fn poll_actions(&mut self) -> Option<Action> {
-        self.actions.pop_front()
-    }
-
-    /// turn 已收场则给出它的结果。
-    pub fn outcome(&self) -> Option<&Outcome> {
-        match &self.phase {
-            Phase::Closed(outcome) => Some(outcome),
-            Phase::AwaitingMessage(_) | Phase::AwaitingTools(_) => None,
-        }
-    }
-
-    pub fn context(&self) -> &Context {
-        &self.context
+        self.core.actions.pop_front()
     }
 
     pub fn usage(&self) -> TokenUsage {
-        self.usage
+        self.core.usage
     }
 
     /// 已启动的 step 数。
     pub fn steps_used(&self) -> u32 {
-        self.steps_started
+        self.core.steps_started
     }
 
-    /// 结束后仍未生效的插话，还给宿主供下一次使用。
-    pub fn take_unapplied_user_messages(&mut self) -> Vec<Content> {
-        mem::take(&mut self.buffered_user_messages)
-    }
-
-    pub fn into_context(self) -> Context {
-        self.context
+    pub fn context(&self) -> &Context {
+        &self.core.context
     }
 }
 
-/// 记录一个机器自己的事件并排队报告（step 子机自己写日志）。
-fn emit(context: &mut Context, actions: &mut VecDeque<Action>, event: Event) {
-    context.record(event.clone());
-    actions.push_back(Action::Report(event));
-}
-
-/// 开启下一个 step；step 预算不够则 turn 直接收场。
-fn begin_step(
-    context: &mut Context,
-    budget: &StepBudget,
-    steps_started: &mut u32,
-    actions: &mut VecDeque<Action>,
-    phase: &mut Phase,
-) {
-    if !budget.allows(*steps_started) {
-        emit(
+impl Turn<AwaitingMessage> {
+    /// 开始 turn：goal 先入账（用户先说话），随后 turn_start、第一个 step
+    /// 的开启事件 —— 外层从动作里见到 `CallModel` 就发起首次调用。
+    pub fn start(config: AgentConfig) -> Self {
+        let AgentConfig {
             context,
-            actions,
-            Event::TurnEnd {
-                outcome: Outcome::BudgetExhausted,
+            goal,
+            budget,
+        } = config;
+        let mut core = Core {
+            context,
+            budget,
+            usage: TokenUsage::default(),
+            steps_started: 0,
+            buffered_user_messages: Vec::new(),
+            actions: VecDeque::new(),
+        };
+        core.emit(Event::Message(Message::User { content: goal }));
+        core.emit(Event::TurnStart);
+        let phase = begin_step(&mut core);
+        Self { core, phase }
+    }
+
+    /// 运行中插话：先缓存，不动状态；下一个 step 边界生效。
+    pub fn user_message(&mut self, content: Content) {
+        self.core.buffered_user_messages.push(content);
+    }
+
+    /// 一次模型往返的响应到达：用量落账，随后要么转入工具执行
+    /// （第一个调用已排队），要么（答复 / 触顶）收场。
+    pub fn model_responded(self, response: LlmResponse) -> MessageReplied {
+        let Turn {
+            mut core,
+            phase: AwaitingMessage { step },
+        } = self;
+        let LlmResponse { stop_reason, usage } = response;
+        core.usage = core.usage.saturating_add(usage);
+        let stop = stop_reason.clone();
+        match stop_reason {
+            StopReason::ToolUse { content, calls } => {
+                core.note(vec![
+                    Event::Message(Message::Assistant(AssistantMessage::ToolCalls {
+                        content,
+                        calls: calls.clone(),
+                    })),
+                    Event::MessageEnd { step, stop, usage },
+                ]);
+                let mut tools = AwaitingTools {
+                    step,
+                    calls,
+                    dispatched: 0,
+                    outputs: BTreeMap::new(),
+                };
+                // 一次只派发一个；下一个等结果喂回后再排队。
+                if let Some(call) = tools.take_next() {
+                    core.actions.push_back(Action::RunTool(call));
+                }
+                MessageReplied::Tools {
+                    turn: Turn {
+                        core,
+                        phase: tools,
+                    },
+                }
+            }
+            StopReason::Completed { content } => {
+                let reply = content.clone();
+                core.note(vec![
+                    Event::Message(Message::Assistant(AssistantMessage::Text(content))),
+                    Event::MessageEnd { step, stop, usage },
+                    Event::StepEnd {
+                        step,
+                        outcome: StepOutcome::Answered {
+                            reply: reply.clone(),
+                        },
+                    },
+                ]);
+                core.emit(Event::TurnEnd {
+                    outcome: Outcome::Answered {
+                        reply: reply.clone(),
+                    },
+                });
+                MessageReplied::Closed {
+                    turn: Turn {
+                        core,
+                        phase: Closed {
+                            outcome: Outcome::Answered { reply },
+                        },
+                    },
+                }
+            }
+            StopReason::LengthExceeded { content } => {
+                let mut events = Vec::with_capacity(3);
+                if let Some(content) = content {
+                    events.push(Event::Message(Message::Assistant(AssistantMessage::Text(
+                        content,
+                    ))));
+                }
+                events.push(Event::MessageEnd { step, stop, usage });
+                events.push(Event::StepEnd {
+                    step,
+                    outcome: StepOutcome::LengthExceeded,
+                });
+                core.note(events);
+                core.emit(Event::TurnEnd {
+                    outcome: Outcome::LengthExceeded,
+                });
+                MessageReplied::Closed {
+                    turn: Turn {
+                        core,
+                        phase: Closed {
+                            outcome: Outcome::LengthExceeded,
+                        },
+                    },
+                }
+            }
+        }
+    }
+
+    /// 用户打断（响应未达）：`step_end{Interrupted}` + `turn_end`。
+    /// 被丢弃的响应从未入账。
+    #[must_use]
+    pub fn interrupted(self) -> Turn<Closed> {
+        let Turn { mut core, phase } = self;
+        core.note(vec![Event::StepEnd {
+            step: phase.step,
+            outcome: StepOutcome::Interrupted,
+        }]);
+        core.emit(Event::TurnEnd {
+            outcome: Outcome::Interrupted,
+        });
+        Turn {
+            core,
+            phase: Closed {
+                outcome: Outcome::Interrupted,
             },
-        );
-        *phase = Phase::Closed(Outcome::BudgetExhausted);
-        return;
+        }
     }
-    // steps_started < 预算 ≤ u32::MAX，这里加一不会溢出。
-    let number =
-        StepNumber::new(NonZeroU32::new(*steps_started + 1).expect("step count fits a u32"));
-    *steps_started = number.get();
-    let (step, events) = Step::begin(number, context);
-    for event in events {
-        actions.push_back(Action::Report(event));
-    }
-    actions.push_back(Action::CallModel);
-    *phase = Phase::AwaitingMessage(step);
 }
 
-/// 把 phase 取出来以便完成改阶段的转移；占位结果在同一臂内会被立即
-/// 覆盖，或在阶段不匹配时原样放回。
-fn take_phase(phase: &mut Phase) -> Phase {
-    mem::replace(phase, Phase::Closed(Outcome::Interrupted))
+impl Turn<AwaitingTools> {
+    /// 运行中插话：先缓存，不动状态；下一个 step 边界生效。
+    pub fn user_message(&mut self, content: Content) {
+        self.core.buffered_user_messages.push(content);
+    }
+
+    /// 宿主开始执行已派发的调用：`tool_execution_start`；
+    /// 未知 id 被忽略。
+    pub fn tool_started(&mut self, call_id: &ToolCallId) {
+        let Some(call) = self
+            .phase
+            .calls
+            .iter()
+            .find(|call| call.id == *call_id)
+            .cloned()
+        else {
+            return;
+        };
+        let step = self.phase.step;
+        self.core.emit(Event::ToolExecutionStart { step, call });
+    }
+
+    /// 一个结果落位：可能仍在执行（下一个调用已排队），可能结算并启动
+    /// 下一个 step（插话在此生效），可能预算耗尽收场。未知 id 被忽略
+    /// （原样交还，不加事件）。
+    pub fn tool_finished(self, call_id: ToolCallId, output: ToolOutput) -> ToolsAdvanced {
+        let Turn { mut core, mut phase } = self;
+        if !phase.calls.iter().any(|call| call.id == call_id) {
+            return ToolsAdvanced::Ongoing {
+                turn: Turn { core, phase },
+            };
+        }
+        let is_error = output.is_error;
+        let step = phase.step;
+        phase.outputs.insert(call_id.clone(), output.clone());
+        core.note(vec![
+            Event::ToolExecutionEnd {
+                step,
+                call_id: call_id.clone(),
+                is_error,
+            },
+            Event::Message(Message::ToolResult {
+                call_id: call_id.clone(),
+                output,
+            }),
+        ]);
+        if !phase.results_complete() {
+            // 一次只派发一个；下一个等结果喂回后再排队。
+            if let Some(call) = phase.take_next() {
+                core.actions.push_back(Action::RunTool(call));
+            }
+            return ToolsAdvanced::Ongoing {
+                turn: Turn { core, phase },
+            };
+        }
+
+        // 全部落位：结算 step。
+        core.note(vec![Event::StepEnd {
+            step,
+            outcome: StepOutcome::ToolUse,
+        }]);
+        // step 的边界：运行中的插话在这里生效 ——
+        // 注入事件在前，消息紧随其后入账。
+        let messages = mem::take(&mut core.buffered_user_messages);
+        if !messages.is_empty() {
+            core.emit(Event::UserMessagesInjected {
+                messages: messages.clone(),
+            });
+            for content in messages {
+                core.emit(Event::Message(Message::User { content }));
+            }
+        }
+        if core.budget.allows(core.steps_started) {
+            let phase = begin_step(&mut core);
+            ToolsAdvanced::NextStep {
+                turn: Turn { core, phase },
+            }
+        } else {
+            core.emit(Event::TurnEnd {
+                outcome: Outcome::BudgetExhausted,
+            });
+            let phase = Closed {
+                outcome: Outcome::BudgetExhausted,
+            };
+            ToolsAdvanced::Closed {
+                turn: Turn { core, phase },
+            }
+        }
+    }
+
+    /// 用户打断：未完成调用的结果以合成错误补齐（事件照发），再按调用
+    /// 顺序记录结果消息，`step_end{Interrupted}` + `turn_end`。
+    #[must_use]
+    pub fn interrupted(self) -> Turn<Closed> {
+        let Turn { mut core, phase } = self;
+        let mut events = Vec::new();
+        for call in phase.calls.iter() {
+            if phase.outputs.contains_key(&call.id) {
+                continue;
+            }
+            events.push(Event::ToolExecutionEnd {
+                step: phase.step,
+                call_id: call.id.clone(),
+                is_error: true,
+            });
+            events.push(Event::Message(Message::ToolResult {
+                call_id: call.id.clone(),
+                output: ToolOutput::error("not run: the user interrupted the agent"),
+            }));
+        }
+        events.push(Event::StepEnd {
+            step: phase.step,
+            outcome: StepOutcome::Interrupted,
+        });
+        core.note(events);
+        core.emit(Event::TurnEnd {
+            outcome: Outcome::Interrupted,
+        });
+        Turn {
+            core,
+            phase: Closed {
+                outcome: Outcome::Interrupted,
+            },
+        }
+    }
+}
+
+impl Turn<Closed> {
+    /// turn 已收场，给出它的结果。
+    pub fn outcome(&self) -> &Outcome {
+        &self.phase.outcome
+    }
+
+    /// 收场时仍未生效的插话，还给宿主供接续使用。
+    pub fn take_unapplied_user_messages(&mut self) -> Vec<Content> {
+        mem::take(&mut self.core.buffered_user_messages)
+    }
+
+    /// 收场后的会话 —— 系统提示、环境、完整的有序日志；
+    /// 作为下一个 [`AgentConfig`] 即可延续会话。
+    pub fn into_context(self) -> Context {
+        self.core.context
+    }
+}
+
+/// `model_responded` 的落点。
+#[derive(Debug)]
+#[must_use]
+pub enum MessageReplied {
+    /// 模型要工具：进入执行阶段（第一个调用已排队派发）。
+    Tools { turn: Turn<AwaitingTools> },
+    /// 答复或触顶：turn 收场。
+    Closed { turn: Turn<Closed> },
+}
+
+/// `tool_finished` 的落点。
+#[derive(Debug)]
+#[must_use]
+pub enum ToolsAdvanced {
+    /// 结果落位但未收齐：下一个调用已排队。
+    Ongoing { turn: Turn<AwaitingTools> },
+    /// 全部落位并结算：插话已生效，下一个模型往返已排队。
+    NextStep { turn: Turn<AwaitingMessage> },
+    /// 预算耗尽：turn 收场。
+    Closed { turn: Turn<Closed> },
+}
+
+/// 开启一个 step：`step_start` + `message_start`，并把模型调用排进动作；
+/// 调用前必须先确认预算允许（见 [`StepBudget::allows`]）。
+fn begin_step(core: &mut Core) -> AwaitingMessage {
+    // steps_started < 预算 ≤ u32::MAX，这里加一不会溢出。
+    let number = core.steps_started + 1;
+    core.steps_started = number;
+    let step = StepNumber::new(NonZeroU32::new(number).expect("step count fits a u32"));
+    core.note(vec![Event::StepStart { step }, Event::MessageStart { step }]);
+    core.actions.push_back(Action::CallModel);
+    AwaitingMessage { step }
 }
 
 #[cfg(test)]
@@ -367,7 +518,7 @@ mod tests {
     use super::*;
     use crate::config::SystemPrompt;
     use crate::context::Environment;
-    use crate::llm::{Prompt, StopReason};
+    use crate::llm::Prompt;
     use crate::message::{ToolArguments, ToolOutput};
     use crate::tool::ToolName;
     use agnes_util::NonEmpty;
@@ -433,7 +584,6 @@ mod tests {
                 Event::TurnStart => "turn_start",
                 Event::StepStart { .. } => "step_start",
                 Event::MessageStart { .. } => "message_start",
-                Event::MessageUpdate { .. } => "message_update",
                 Event::Message(_) => "message",
                 Event::MessageEnd { .. } => "message_end",
                 Event::ToolExecutionStart { .. } => "tool_start",
@@ -446,7 +596,7 @@ mod tests {
     }
 
     /// 把动作队列摘成 (报告事件的形状, 模型调用数, 工具调用 id 列表)。
-    fn drain(turn: &mut Turn) -> (Vec<&'static str>, usize, Vec<String>) {
+    fn drain<S>(turn: &mut Turn<S>) -> (Vec<&'static str>, usize, Vec<String>) {
         let mut shapes = Vec::new();
         let mut calls = 0;
         let mut tools = Vec::new();
@@ -471,7 +621,6 @@ mod tests {
         );
         assert_eq!(calls, 1);
         assert!(tools.is_empty());
-        assert!(turn.outcome().is_none());
         assert_eq!(turn.steps_used(), 1);
 
         let prompt = Prompt::from_context(turn.context());
@@ -487,39 +636,45 @@ mod tests {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
 
-        turn.handle(Input::ModelResponded(response(tool_use(vec![
-            call("c1"),
-            call("c2"),
-        ]))));
+        let MessageReplied::Tools { mut turn } = turn
+            .model_responded(response(tool_use(vec![call("c1"), call("c2")])))
+        else {
+            panic!("expected Tools");
+        };
         let (shapes, calls, tools) = drain(&mut turn);
         assert_eq!(shapes, vec!["message", "message_end"]);
         assert_eq!(calls, 0);
         assert_eq!(tools, vec!["c1"]);
 
         // 第一个结果落位之前，第二个调用不派发
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::Ongoing { mut turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected Ongoing");
+        };
         let (shapes, _calls, tools) = drain(&mut turn);
         assert_eq!(shapes, vec!["tool_start", "tool_end", "message"]);
         assert_eq!(tools, vec!["c2"]);
-        assert!(turn.outcome().is_none());
     }
 
     #[test]
     fn results_settle_the_step_and_start_the_next_one() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
 
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::NextStep { mut turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected NextStep");
+        };
         let (shapes, calls, tools) = drain(&mut turn);
 
         assert_eq!(
@@ -536,7 +691,6 @@ mod tests {
         assert_eq!(calls, 1);
         assert!(tools.is_empty());
         assert_eq!(turn.steps_used(), 2);
-        assert!(turn.outcome().is_none());
     }
 
     #[test]
@@ -544,23 +698,19 @@ mod tests {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
 
-        turn.handle(Input::ModelResponded(response(completed("done it"))));
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done it"))) else {
+            panic!("expected Closed");
+        };
         let (shapes, calls, tools) = drain(&mut turn);
-        assert_eq!(
-            shapes,
-            vec!["message", "message_end", "step_end", "turn_end"]
-        );
+        assert_eq!(shapes, vec!["message", "message_end", "step_end", "turn_end"]);
         assert_eq!(calls, 0);
         assert!(tools.is_empty());
         assert_eq!(
             turn.outcome(),
-            Some(&Outcome::Answered {
+            &Outcome::Answered {
                 reply: content("done it")
-            })
+            }
         );
-        // 收场后的输入被忽略
-        turn.handle(Input::ModelResponded(response(completed("again"))));
-        assert!(drain(&mut turn).0.is_empty());
     }
 
     #[test]
@@ -568,13 +718,18 @@ mod tests {
         let mut turn = Turn::start(config(1));
         let _ = drain(&mut turn);
 
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::Closed { mut turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected Closed");
+        };
 
         let (shapes, calls, _tools) = drain(&mut turn);
         assert_eq!(
@@ -582,7 +737,7 @@ mod tests {
             vec!["tool_start", "tool_end", "message", "step_end", "turn_end"]
         );
         assert_eq!(calls, 0);
-        assert_eq!(turn.outcome(), Some(&Outcome::BudgetExhausted));
+        assert_eq!(turn.outcome(), &Outcome::BudgetExhausted);
         assert_eq!(turn.steps_used(), 1);
     }
 
@@ -590,18 +745,23 @@ mod tests {
     fn user_messages_take_effect_at_the_step_boundary() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
 
-        turn.handle(Input::UserMessage(content("also check the tests")));
+        turn.user_message(content("also check the tests"));
         // 先入缓存，不动状态
         assert!(drain(&mut turn).0.is_empty());
 
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::NextStep { mut turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected NextStep");
+        };
         let (shapes, _calls, _tools) = drain(&mut turn);
         assert_eq!(
             shapes,
@@ -625,6 +785,10 @@ mod tests {
             &prompt.input[4],
             Message::User { content } if content.as_str() == "also check the tests"
         ));
+        // 所有插话已生效，缓冲空了 —— 收场后由 take_unapplied 验证
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("ok"))) else {
+            panic!("expected Closed");
+        };
         assert!(turn.take_unapplied_user_messages().is_empty());
     }
 
@@ -633,11 +797,11 @@ mod tests {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
 
-        turn.handle(Input::Interrupted);
+        let mut turn = turn.interrupted();
         let (shapes, calls, _tools) = drain(&mut turn);
         assert_eq!(shapes, vec!["step_end", "turn_end"]);
         assert_eq!(calls, 0);
-        assert_eq!(turn.outcome(), Some(&Outcome::Interrupted));
+        assert_eq!(turn.outcome(), &Outcome::Interrupted);
         // 被丢弃的响应从未入账
         assert_eq!(turn.context().messages().count(), 1);
     }
@@ -646,18 +810,22 @@ mod tests {
     fn interrupting_the_tools_fills_synthetic_results() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
-        turn.handle(Input::UserMessage(content("hold on")));
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::Interrupted);
+        turn.user_message(content("hold on"));
+        turn.tool_started(&ToolCallId::new("c1"));
+        let mut turn = turn.interrupted();
         let (shapes, _calls, _tools) = drain(&mut turn);
 
         assert_eq!(
             shapes,
             vec!["tool_start", "tool_end", "message", "step_end", "turn_end"]
         );
-        assert_eq!(turn.outcome(), Some(&Outcome::Interrupted));
+        assert_eq!(turn.outcome(), &Outcome::Interrupted);
         // 边界没到：插话不入日志，随 run 还给宿主
         assert_eq!(
             turn.take_unapplied_user_messages(),
@@ -666,55 +834,58 @@ mod tests {
     }
 
     #[test]
-    fn stale_inputs_are_ignored_without_losing_state() {
+    fn unknown_tool_ids_are_ignored_without_disturbing_state() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
-        // 等工具的 step 不接增量，也不接响应
-        turn.handle(Input::MessageDelta(MessageDelta::Text("x".into())));
-        turn.handle(Input::ModelResponded(response(completed("stale"))));
-        assert!(drain(&mut turn).0.is_empty());
-        assert!(turn.outcome().is_none());
 
-        // 状态完好：turn 继续走完
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
-        let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(completed("done"))));
-        assert_eq!(
-            turn.outcome(),
-            Some(&Outcome::Answered {
-                reply: content("done")
-            })
-        );
-    }
+        turn.tool_started(&ToolCallId::new("nope"));
+        let ToolsAdvanced::Ongoing { mut turn } = turn
+            .tool_finished(ToolCallId::new("nope"), ToolOutput::success("x"))
+        else {
+            panic!("expected Ongoing");
+        };
+        let (shapes, calls, tools) = drain(&mut turn);
+        assert!(shapes.is_empty());
+        assert_eq!(calls, 0);
+        assert!(tools.is_empty());
 
-    #[test]
-    fn deltas_only_count_while_a_step_generates() {
-        let mut turn = Turn::start(config(4));
-        let _ = drain(&mut turn);
-        turn.handle(Input::MessageDelta(MessageDelta::Text("flip".into())));
-        let (shapes, _calls, _tools) = drain(&mut turn);
-        assert_eq!(shapes, vec!["message_update"]);
+        // 状态未被扰动：真实结果照常落位
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::NextStep { turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected NextStep");
+        };
+        assert_eq!(shape(turn.context().events()).last(), Some(&"message_start"));
     }
 
     #[test]
     fn usage_and_steps_accumulate_across_steps() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::NextStep { mut turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected NextStep");
+        };
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(completed("done"))));
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done"))) else {
+            panic!("expected Closed");
+        };
+        let _ = drain(&mut turn);
 
         assert_eq!(
             turn.usage(),
@@ -730,11 +901,13 @@ mod tests {
     fn unapplied_user_messages_come_back_after_an_answer() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::UserMessage(content("too late")));
-        turn.handle(Input::ModelResponded(response(completed("done"))));
+        turn.user_message(content("too late"));
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done"))) else {
+            panic!("expected Closed");
+        };
         let _ = drain(&mut turn);
 
-        assert!(matches!(turn.outcome(), Some(Outcome::Answered { .. })));
+        assert!(matches!(turn.outcome(), Outcome::Answered { .. }));
         // 最终答复走完、边界未到 —— 插话不属于这次 turn 的日志，还给宿主
         assert_eq!(
             turn.take_unapplied_user_messages(),
@@ -747,15 +920,23 @@ mod tests {
     fn a_full_tool_round_reports_its_lifecycle_in_order() {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(tool_use(vec![call("c1")]))));
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1")])))
+        else {
+            panic!("expected Tools");
+        };
         let _ = drain(&mut turn);
-        turn.handle(Input::ToolStarted(ToolCallId::new("c1")));
-        turn.handle(Input::ToolFinished {
-            call_id: ToolCallId::new("c1"),
-            output: output(),
-        });
+        turn.tool_started(&ToolCallId::new("c1"));
+        let ToolsAdvanced::NextStep { mut turn } = turn
+            .tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected NextStep");
+        };
         let _ = drain(&mut turn);
-        turn.handle(Input::ModelResponded(response(completed("done it"))));
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done it"))) else {
+            panic!("expected Closed");
+        };
+        let _ = drain(&mut turn);
 
         assert_eq!(
             shape(turn.context().events()),
@@ -784,5 +965,13 @@ mod tests {
         assert!(matches!(messages[1], Message::Assistant(_)));
         assert!(matches!(messages[2], Message::ToolResult { .. }));
         assert!(matches!(messages[3], Message::Assistant(_)));
+    }
+
+    #[test]
+    fn step_numbers_count_from_one_and_stop_at_the_limit() {
+        assert_eq!(StepNumber::FIRST.get(), 1);
+        assert_eq!(StepNumber::FIRST.next().unwrap().get(), 2);
+        assert_eq!(StepNumber::FIRST.to_string(), "1");
+        assert!(StepNumber(NonZeroU32::MAX).next().is_none());
     }
 }

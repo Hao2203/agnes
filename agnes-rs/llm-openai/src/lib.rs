@@ -282,7 +282,10 @@ mod tests {
         while turn.poll_actions().is_some() {}
 
         let response = Llm::complete(&openai, &request).await.unwrap();
-        turn.handle(agnes_core::turn::Input::ModelResponded(response));
+        let agnes_core::turn::MessageReplied::Tools { mut turn } = turn.model_responded(response)
+        else {
+            panic!("expected Tools");
+        };
         let mut call: Option<agnes_core::message::ToolCall> = None;
         while let Some(action) = turn.poll_actions() {
             match action {
@@ -302,11 +305,12 @@ mod tests {
         );
 
         let call = call.unwrap();
-        turn.handle(agnes_core::turn::Input::ToolStarted(call.id.clone()));
-        turn.handle(agnes_core::turn::Input::ToolFinished {
-            call_id: call.id.clone(),
-            output: agnes_core::message::ToolOutput::success("ok"),
-        });
+        turn.tool_started(&call.id);
+        let agnes_core::turn::ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(call.id, agnes_core::message::ToolOutput::success("ok"))
+        else {
+            panic!("expected NextStep");
+        };
         while let Some(action) = turn.poll_actions() {
             if let agnes_core::turn::Action::CallModel = action {
                 request = build(&turn, &model);
@@ -314,18 +318,21 @@ mod tests {
         }
 
         let response = Llm::complete(&openai, &request).await.unwrap();
-        turn.handle(agnes_core::turn::Input::ModelResponded(response));
+        let agnes_core::turn::MessageReplied::Closed { mut turn } = turn.model_responded(response)
+        else {
+            panic!("expected Closed");
+        };
         while turn.poll_actions().is_some() {}
         assert_eq!(
             turn.outcome(),
-            Some(&agnes_core::turn::Outcome::Answered {
+            &agnes_core::turn::Outcome::Answered {
                 reply: Content::try_from("flipped it").unwrap()
-            })
+            }
         );
     }
 
     /// 在见到 `Action::CallModel` 的当下，用会话状态构造具体请求。
-    fn build(turn: &agnes_core::turn::Turn, model: &ModelName) -> LlmRequest {
+    fn build<S>(turn: &agnes_core::turn::Turn<S>, model: &ModelName) -> LlmRequest {
         LlmRequest {
             model: model.clone(),
             prompt: Prompt::from_context(turn.context()),

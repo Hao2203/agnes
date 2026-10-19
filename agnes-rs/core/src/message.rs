@@ -5,13 +5,12 @@
 //!
 //! String storage follows one rule: values that may be short (call ids,
 //! arguments) wrap `ArcColdString` so short text is inline and longer text is
-//! refcounted; values that certainly cannot be inlined (tool output content,
-//! streamed fragments) stay on `Arc<str>`. The internal representations never
+//! refcounted; values that certainly cannot be inlined (tool output content)
+//! stay on `Arc<str>`. The internal representations never
 //! appear in public signatures.
 
 use crate::config::SystemPrompt;
 use crate::content::Content;
-use crate::tool::ToolName;
 use agnes_util::NonEmpty;
 use cold_string::ArcColdString;
 use serde::de::DeserializeOwned;
@@ -173,20 +172,6 @@ pub enum Message {
         call_id: ToolCallId,
         output: ToolOutput,
     },
-}
-
-/// One fragment of a message the model is still producing, in arrival order.
-/// Fragments are not messages: only the assembled whole — which the host
-/// receives when the message ends — is. Streaming adapters map their
-/// protocol's frames onto these.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessageDelta {
-    /// Text appended to the message body.
-    Text(Arc<str>),
-    /// The model announced a tool call; its arguments may still be streaming.
-    ToolCallStarted { id: ToolCallId, name: ToolName },
-    /// Raw arguments text appended to the named tool call.
-    ToolCallArguments { id: ToolCallId, fragment: Arc<str> },
 }
 
 #[cfg(test)]

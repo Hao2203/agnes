@@ -16,7 +16,6 @@ use agnes_core::content::Content;
 use agnes_core::context::{Context, Environment};
 use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::StopReason;
-use agnes_core::message::MessageDelta;
 use agnes_core::turn::Outcome;
 use agnes_io::input::Input;
 use agnes_io::llm::Llm;
@@ -262,6 +261,7 @@ impl Host<'_> {
         };
         let requests = StandardRequestBuilder::new(self.model.clone());
         let mut printer = printer;
+        let mut plugins = agnes_agent::plugin::PluginChain::default();
         agnes_agent::run(
             config,
             Arc::clone(self.registry),
@@ -269,6 +269,8 @@ impl Host<'_> {
             input,
             &requests,
             &mut printer,
+            &mut plugins,
+            None,
         )
         .await
         .map_err(anyhow::Error::new)
@@ -289,7 +291,6 @@ impl EventPrinter {
         match event {
             CoreEvent::TurnStart => println!("─ turn ─"),
             CoreEvent::MessageStart { .. } => println!("→ model call"),
-            CoreEvent::MessageUpdate { delta, .. } => print_delta(delta),
             CoreEvent::MessageEnd { stop, .. } => {
                 if matches!(stop, StopReason::ToolUse { .. }) {
                     println!("← tool calls requested");
@@ -321,6 +322,18 @@ impl Sink for EventPrinter {
                 let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
                 println!("* model {}, tools: [{}]", self.model, names.join(", "));
             }
+            Event::ToolGated { reason, .. } => {
+                println!("  ⛔ {reason}");
+            }
+            // 交互式审批 UI 还是后续工作；此处先可见问询与落定
+            Event::ApprovalRequested { call, .. } => {
+                println!("  ⏳ waiting approval: {} {}", call.name, call.arguments.as_str());
+            }
+            Event::ApprovalResolved { approved, .. } => {
+                if !approved {
+                    println!("  ✗ not approved");
+                }
+            }
             Event::Recorded { event, .. } => match event {
                 CoreEvent::UserMessagesInjected { messages, .. } => {
                     println!("  ▸ injected {} queued message(s)", messages.len());
@@ -329,16 +342,6 @@ impl Sink for EventPrinter {
             },
             Event::Finished { .. } => {}
         }
-    }
-}
-
-/// Streamed text is written through as it arrives; other fragments wait for
-/// the assembled message. Streaming adapters are not wired up yet, so this
-/// fires only once they are.
-fn print_delta(delta: &MessageDelta) {
-    if let MessageDelta::Text(text) = delta {
-        print!("{text}");
-        std::io::stdout().flush().ok();
     }
 }
 
