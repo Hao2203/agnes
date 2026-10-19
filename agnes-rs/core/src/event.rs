@@ -16,7 +16,11 @@ use crate::message::{Message, TokenUsage, ToolCall, ToolCallId};
 use crate::turn::{Outcome, StepNumber, StepOutcome};
 
 /// 运行时日志里的一条，按发生顺序。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 序列化是耐久日志的格式契约：变体名是 `snake_case`，未知变体在反序列
+/// 化时被拒绝（fail closed）—— 读不懂的日志不猜，直接拒载。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Event {
     /// turn 开始：一条用户请求进入 agent 循环。
     TurnStart,
@@ -50,4 +54,109 @@ pub enum Event {
     UserMessagesInjected { messages: Vec<Content> },
     /// turn 收场 —— 结果就是整个 run 的结果。
     TurnEnd { outcome: Outcome },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SystemPrompt;
+    use crate::message::{AssistantMessage, ToolOutput};
+    use crate::tool::ToolName;
+    use agnes_util::NonEmpty;
+    use std::str::FromStr;
+
+    fn content(text: &str) -> Content {
+        Content::try_from(text).unwrap()
+    }
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new(id),
+            name: ToolName::from_str("note").unwrap(),
+            arguments: crate::message::ToolArguments::new(r#"{"text":"hi"}"#),
+        }
+    }
+
+    /// 每个变体各来一条，覆盖嵌套的消息与结果形状。
+    fn every_variant() -> Vec<Event> {
+        let step = StepNumber::FIRST;
+        let first_call = call("c1");
+        vec![
+            Event::TurnStart,
+            Event::StepStart { step },
+            Event::MessageStart { step },
+            Event::Message(Message::System {
+                content: SystemPrompt::new("sys"),
+            }),
+            Event::Message(Message::User {
+                content: content("go"),
+            }),
+            Event::Message(Message::Assistant(AssistantMessage::Text(content("hi")))),
+            Event::Message(Message::Assistant(AssistantMessage::ToolCalls {
+                content: None,
+                calls: NonEmpty::new(first_call.clone()),
+            })),
+            Event::Message(Message::ToolResult {
+                call_id: first_call.id.clone(),
+                output: ToolOutput::success("noted"),
+            }),
+            Event::MessageEnd {
+                step,
+                stop: StopReason::ToolUse {
+                    content: None,
+                    calls: NonEmpty::new(first_call),
+                },
+                usage: TokenUsage { input: 3, output: 4 },
+            },
+            Event::ToolExecutionStart {
+                step,
+                call: call("c2"),
+            },
+            Event::ToolExecutionEnd {
+                step,
+                call_id: ToolCallId::new("c2"),
+                is_error: true,
+            },
+            Event::StepEnd {
+                step,
+                outcome: StepOutcome::ToolUse,
+            },
+            Event::UserMessagesInjected {
+                messages: vec![content("also")],
+            },
+            Event::TurnEnd {
+                outcome: Outcome::Answered {
+                    reply: content("done"),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn every_event_variant_round_trips() {
+        for event in every_variant() {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, event, "round trip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn invalid_payloads_are_refused() {
+        // 空内容
+        assert!(serde_json::from_str::<Content>(r#""""#).is_err());
+        // 空工具调用集合 —— NonEmpty 的构造器不可绕过
+        assert!(
+            serde_json::from_str::<StopReason>(r#"{"tool_use":{"content":null,"calls":[]}}"#)
+                .is_err()
+        );
+        // step 编号不能为 0
+        assert!(serde_json::from_str::<Event>(r#"{"step_start":{"step":0}}"#).is_err());
+        // 工具名不能带空白
+        assert!(serde_json::from_str::<ToolName>(r#""a b""#).is_err());
+        // 参数模式必须是对象
+        assert!(serde_json::from_str::<crate::tool::JsonSchema>("[1,2]").is_err());
+        // 未知事件变体：读不懂就拒载，不静默丢弃
+        assert!(serde_json::from_str::<Event>(r#"{"future_event":{}}"#).is_err());
+    }
 }

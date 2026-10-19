@@ -91,6 +91,9 @@ dependencies = [
 [[package]]
 name = "agnes-util"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "anstream"

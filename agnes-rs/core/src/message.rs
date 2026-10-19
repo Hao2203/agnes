@@ -58,6 +58,19 @@ impl Ord for ToolCallId {
     }
 }
 
+impl serde::Serialize for ToolCallId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolCallId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::new(raw))
+    }
+}
+
 /// Raw JSON arguments of a tool call, not yet parsed against the tool's
 /// schema. Parsing happens inside the tool (parse at the boundary).
 #[derive(Clone, PartialEq, Eq)]
@@ -85,7 +98,20 @@ impl fmt::Debug for ToolArguments {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl serde::Serialize for ToolArguments {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolArguments {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::new(raw))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: crate::tool::ToolName,
@@ -96,7 +122,7 @@ pub struct ToolCall {
 /// see them and react. Cloned into the log once per result. The content is
 /// bulk text (file contents, command output) that can never be inline, so it
 /// stays on the standard `Arc<str>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolOutput {
     pub content: Arc<str>,
     pub is_error: bool,
@@ -119,7 +145,7 @@ impl ToolOutput {
 }
 
 /// Token accounting for one model response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
@@ -142,7 +168,8 @@ impl fmt::Display for TokenUsage {
 
 /// A message produced by the model: either pure text, or tool calls with
 /// optional commentary text alongside.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssistantMessage {
     /// A pure text reply.
     Text(Content),
@@ -156,7 +183,8 @@ pub enum AssistantMessage {
 /// One message of the conversation. Messages are recorded as
 /// [`Event::Message`](crate::event::Event::Message) entries of the context
 /// log, so their order relative to everything else that happened is fixed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Message {
     /// The system prompt as a model input element. The prompt itself is a
     /// field of the context; this variant exists for the projection into a

@@ -60,7 +60,8 @@ pub struct LlmRequest {
 /// Why the model stopped — carrying the data that distinguishes the case,
 /// so impossible combinations (tool use without calls, a final answer
 /// without content) cannot be constructed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model produced a final answer; guaranteed non-empty.
     Completed { content: Content },

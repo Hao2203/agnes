@@ -88,6 +88,19 @@ impl fmt::Debug for SystemPrompt {
     }
 }
 
+impl serde::Serialize for SystemPrompt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SystemPrompt {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::new(raw))
+    }
+}
+
 /// Secret credential. The key material lives in a `secrecy::SecretString`:
 /// wiped from memory on drop, reachable only through [`ApiKey::expose`], and
 /// never printed by `Debug` — keys cannot leak through logs.

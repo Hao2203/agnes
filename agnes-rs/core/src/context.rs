@@ -17,7 +17,7 @@ use crate::tool::ToolSpec;
 
 /// What the run can act with: the tools on offer. Grows with the needs of
 /// hosts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Environment {
     tools: Vec<ToolSpec>,
 }
@@ -51,6 +51,20 @@ impl Context {
             system,
             environment,
             events: Vec::new(),
+        }
+    }
+
+    /// Rebuilds a session from an already-validated log.
+    ///
+    /// This is the replay boundary, not a recording path: the caller (a
+    /// session store) has checked continuity and ordering, and the machine
+    /// keeps appending through its own transitions. Core trusts typed
+    /// in-process input — validation belongs at the file/wire boundary.
+    pub fn restore(system: SystemPrompt, environment: Environment, events: Vec<Event>) -> Self {
+        Self {
+            system,
+            environment,
+            events,
         }
     }
 
@@ -164,6 +178,20 @@ mod tests {
         assert!(context.events().is_empty());
         assert_eq!(context.system().as_str(), "sys");
         assert_eq!(context.environment().tools().len(), 1);
+    }
+
+    #[test]
+    fn restore_seeds_the_log_from_a_validated_history() {
+        let events = vec![Event::TurnStart, user_event("hello")];
+        let context = Context::restore(
+            SystemPrompt::new("sys"),
+            Environment::default(),
+            events.clone(),
+        );
+
+        assert_eq!(context.events(), events.as_slice());
+        assert_eq!(context.messages().count(), 1);
+        assert_eq!(context.system().as_str(), "sys");
     }
 
     #[test]

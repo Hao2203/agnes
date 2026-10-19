@@ -52,7 +52,8 @@ pub enum Action {
 }
 
 /// turn 怎么收场 —— 也是整个 run 的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// 模型给出最终答复。
     Answered { reply: Content },
@@ -65,7 +66,10 @@ pub enum Outcome {
 }
 
 /// step 编号（turn 内 1 起始）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct StepNumber(NonZeroU32);
 
 impl StepNumber {
@@ -91,7 +95,8 @@ impl fmt::Display for StepNumber {
 }
 
 /// 一个 step 怎么收尾。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepOutcome {
     /// 模型给出最终答复：turn 随之收场。
     Answered { reply: Content },

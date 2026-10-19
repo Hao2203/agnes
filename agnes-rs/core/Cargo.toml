@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-agnes-util.workspace = true
+agnes-util = { workspace = true, features = ["serde"] }
 cold-string.workspace = true
 secrecy.workspace = true
 url.workspace = true

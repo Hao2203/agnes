@@ -66,13 +66,33 @@ impl FromStr for ToolName {
     }
 }
 
+impl serde::Serialize for ToolName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("tool parameter schema must be a JSON object")]
 pub struct SchemaError;
 
 /// JSON schema describing a tool's parameters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
 pub struct JsonSchema(serde_json::Value);
+
+impl From<JsonSchema> for serde_json::Value {
+    fn from(schema: JsonSchema) -> Self {
+        schema.0
+    }
+}
 
 impl TryFrom<serde_json::Value> for JsonSchema {
     type Error = SchemaError;
@@ -96,7 +116,7 @@ impl JsonSchema {
 /// whenever specs are snapshotted for a request. The description is prose
 /// that can never be inline, so it stays on the standard `Arc<str>`; the
 /// name carries its own internal representation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSpec {
     pub name: ToolName,
     pub description: Arc<str>,

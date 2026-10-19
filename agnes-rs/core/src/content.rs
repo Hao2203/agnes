@@ -66,6 +66,19 @@ impl TryFrom<String> for Content {
     }
 }
 
+impl serde::Serialize for Content {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Content {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(raw).ok_or_else(|| serde::de::Error::custom("content must be non-empty"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
