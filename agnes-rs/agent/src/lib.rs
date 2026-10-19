@@ -16,13 +16,14 @@
 //! 插件的语义都发在宿主的 [`Event`] 变体上。
 
 mod driver;
+mod host;
 
 pub mod approval;
 pub mod ext;
 pub mod permission;
 pub mod tools;
 
-use std::sync::Arc;
+pub use host::{Host, HostBuilder, LoadError};
 
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
@@ -31,15 +32,12 @@ use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::{LlmRequest, Prompt, RequestBuilder};
 use agnes_core::message::{TokenUsage, ToolCall, ToolCallId};
 use agnes_core::tool::ToolName;
-use agnes_core::turn::{Outcome, Turn};
-use agnes_io::input::Input as InputPort;
-use agnes_io::llm::{Llm, LlmError};
-use agnes_io::tool::ToolRegistry;
+use agnes_core::turn::Outcome;
+use agnes_io::llm::LlmError;
 use jiff::Timestamp;
 
-use approval::{ApprovalChannel, ApprovalOutcome};
-use driver::{Driver, Ports};
-use ext::{Denied, Extensions};
+use approval::ApprovalOutcome;
+use ext::Denied;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -143,77 +141,6 @@ impl RunSummary {
     }
 }
 
-/// 一次完整 run：从 [`Turn::start`] 到收场。
-///
-/// 控制：运行中随时可打断（[`InputPort::interrupted`]）—— 模型响应、
-/// 工具执行、审批挂起三个等待点都适用，in-flight 的 future 就地丢弃；
-/// 运行中的插话（[`InputPort::drain`]）由机器缓存、在下一个 step 边界
-/// 生效，没生效的随 [`RunSummary::pending_user_messages`] 还给宿主。
-///
-/// 工具调用先过 `extensions` 的门禁折叠 —— 拒绝以合成失败结果推进机器、
-/// `Ask` 则走 `approvals` 问询挂起（未接线即拒绝）。工具失败不中止 run
-/// —— 它是给模型的错误输出；只有传输/模型错误终止。
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    config: agnes_core::turn::AgentConfig,
-    registry: Arc<ToolRegistry>,
-    llm: &dyn Llm,
-    input: &dyn InputPort,
-    requests: &dyn RequestBuilder,
-    sink: &mut dyn Sink,
-    extensions: &mut Extensions,
-    approvals: Option<&ApprovalChannel>,
-) -> Result<RunSummary, AgentError> {
-    let started_at = Timestamp::now();
-    let goal = config.goal.clone();
-    let tools = config
-        .context
-        .environment()
-        .tools()
-        .iter()
-        .map(|spec| spec.name.clone())
-        .collect();
-    sink.event(&Event::Started {
-        at: started_at,
-        goal,
-        tools,
-    });
-
-    let ports = Ports {
-        registry: registry.as_ref(),
-        llm,
-        input,
-        requests,
-        sink: &mut *sink,
-        extensions,
-        approvals,
-    };
-    let turn = Turn::start(config);
-    // 驱动状态机一路跑到收场（收场前的报告事件由它的反应循环补完）。
-    let mut closed = Driver::new(turn, ports).run().await?;
-
-    let finished_at = Timestamp::now();
-    let outcome = closed.outcome().clone();
-    let steps_used = closed.steps_used();
-    let usage = closed.usage();
-    let pending_user_messages = closed.take_unapplied_user_messages();
-    let context = closed.into_context();
-    let summary = RunSummary {
-        outcome: outcome.clone(),
-        steps_used,
-        usage,
-        context,
-        pending_user_messages,
-        started_at,
-        finished_at,
-    };
-    sink.event(&Event::Finished {
-        at: finished_at,
-        outcome,
-    });
-    Ok(summary)
-}
-
 /// 宿主可用的默认 step 预算。
 pub const DEFAULT_STEP_BUDGET: u32 = 32;
 
@@ -235,14 +162,15 @@ mod tests {
     use agnes_core::llm::{LlmResponse, StopReason};
     use agnes_core::message::{Message, ToolArguments, ToolOutput};
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
-    use agnes_io::input::NoInput;
+    use agnes_io::input::{Input as InputPort, NoInput};
+    use agnes_io::llm::Llm;
     use agnes_io::tool::Tool;
     use agnes_util::NonEmpty;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::num::NonZeroU32;
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::watch;
 
@@ -340,10 +268,6 @@ mod tests {
         ModelName::from_str("test-model").unwrap()
     }
 
-    fn standard(model: ModelName) -> StandardRequestBuilder {
-        StandardRequestBuilder::new(model)
-    }
-
     fn response(stop_reason: StopReason) -> LlmResponse {
         LlmResponse {
             stop_reason,
@@ -412,26 +336,18 @@ mod tests {
     #[tokio::test]
     async fn happy_path_runs_tools_and_finishes() {
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("all done")),
         ]);
-        let mut extensions = Extensions::new();
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -510,33 +426,25 @@ mod tests {
             }
         }
 
-        let registry = ToolRegistry::build(vec![Arc::new(AlwaysFails {
+        let tool = Arc::new(AlwaysFails {
             spec: ToolSpec {
                 name: ToolName::from_str("boom").unwrap(),
                 description: "".into(),
                 parameters: JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
             },
-        }) as Arc<dyn Tool>])
-        .unwrap();
+        }) as Arc<dyn Tool>;
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "boom", "{}")])),
             response(completed("gave up")),
         ]);
-        let mut extensions = Extensions::new();
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .tool(tool)
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
         assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
@@ -556,19 +464,15 @@ mod tests {
                 })
             }
         }
-        let mut extensions = Extensions::new();
-        let err = run(
-            config(4),
-            Arc::new(ToolRegistry::default()),
-            &Broken,
-            &NoInput,
-            &standard(model()),
-            &mut Collector(Vec::new()),
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let llm = Broken;
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .build()
+            .unwrap();
+        let err = host
+            .run(config(4), &mut Collector(Vec::new()))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             AgentError::Llm(LlmError::Api { status, .. })
@@ -601,24 +505,16 @@ mod tests {
     #[tokio::test]
     async fn the_request_builder_shapes_what_the_model_sees() {
         let recorder = Arc::new(Recorder::new());
-        let registry =
-            Arc::new(ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap());
         let llm = ScriptedLlm::new(vec![response(completed("ok"))]);
-        let mut extensions = Extensions::new();
+        let mut host = Host::builder(&llm, &NoInput)
+            .request_builder(Box::new(PrimingRequests { model: model() }))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
 
+        let config = config_with(host.tools().specs(), 4);
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config_with(registry.specs(), 4),
-            Arc::clone(&registry),
-            &llm,
-            &NoInput,
-            &PrimingRequests { model: model() },
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config, &mut sink).await.unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
 
         let requests = llm.requests();
@@ -703,28 +599,20 @@ mod tests {
     #[tokio::test]
     async fn queued_user_message_is_injected_at_the_step_boundary() {
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("all done")),
         ]);
         let input = FakeInput::new();
         input.queue("also update the readme");
-        let mut extensions = Extensions::new();
+        let mut host = Host::builder(&llm, &input)
+            .model(model())
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &input,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -760,27 +648,18 @@ mod tests {
     #[tokio::test]
     async fn interrupt_during_a_model_call_stops_the_run() {
         let input = FakeInput::new();
-        let requests = standard(model());
+        let llm = HangingLlm;
+        let mut host = Host::builder(&llm, &input)
+            .model(model())
+            .build()
+            .unwrap();
         let mut sink = Collector(Vec::new());
-        let mut extensions = Extensions::new();
         // 先让 run 到达挂起的模型调用，再打断
         let interrupter = async {
             tokio::task::yield_now().await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(
-            run(
-                config(4),
-                Arc::new(ToolRegistry::default()),
-                &HangingLlm,
-                &input,
-                &requests,
-                &mut sink,
-                &mut extensions,
-                None,
-            ),
-            interrupter
-        );
+        let (result, ()) = tokio::join!(host.run(config(4), &mut sink), interrupter);
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
@@ -816,44 +695,31 @@ mod tests {
     #[tokio::test]
     async fn interrupt_during_tools_settles_the_whole_batch() {
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![
-            Arc::clone(&recorder) as Arc<dyn Tool>,
-            Arc::new(HangingTool {
+        let llm = ScriptedLlm::new(vec![response(tool_use(vec![
+            call("c1", "note", r#"{"text":"hi"}"#),
+            call("c2", "hang", "{}"),
+        ]))]);
+        let input = FakeInput::new();
+        let mut host = Host::builder(&llm, &input)
+            .model(model())
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .tool(Arc::new(HangingTool {
                 spec: ToolSpec {
                     name: ToolName::from_str("hang").unwrap(),
                     description: "never returns".into(),
                     parameters: JsonSchema::try_from(serde_json::json!({"type": "object"}))
                         .unwrap(),
                 },
-            }),
-        ])
-        .unwrap();
-        let llm = ScriptedLlm::new(vec![response(tool_use(vec![
-            call("c1", "note", r#"{"text":"hi"}"#),
-            call("c2", "hang", "{}"),
-        ]))]);
-        let input = FakeInput::new();
-        let requests = standard(model());
+            }))
+            .build()
+            .unwrap();
         let mut sink = Collector(Vec::new());
-        let mut extensions = Extensions::new();
         // 第一个调用跑完、第二个挂起时打断
         let interrupter = async {
             tokio::task::yield_now().await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(
-            run(
-                config(8),
-                Arc::new(registry),
-                &llm,
-                &input,
-                &requests,
-                &mut sink,
-                &mut extensions,
-                None,
-            ),
-            interrupter
-        );
+        let (result, ()) = tokio::join!(host.run(config(8), &mut sink), interrupter);
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
@@ -880,21 +746,13 @@ mod tests {
         // 最终答复期间敲进来的插话：边界未到，未生效
         input.queue("too late for this run");
         let llm = ScriptedLlm::new(vec![response(completed("all done"))]);
-        let mut extensions = Extensions::new();
+        let mut host = Host::builder(&llm, &input)
+            .model(model())
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(4),
-            Arc::new(ToolRegistry::default()),
-            &llm,
-            &input,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(4), &mut sink).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -952,29 +810,20 @@ mod tests {
     #[tokio::test]
     async fn an_accepted_result_is_observed_as_ran() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut extensions = Extensions::new();
-        extensions.register(Witness::new(Settlement::Accept, &seen));
-
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("ok")),
         ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(Witness::new(Settlement::Accept, &seen))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
 
         assert!(
             matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. } if !output.is_error)
@@ -985,34 +834,25 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_result_is_replaced_by_feedback() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let mut extensions = Extensions::new();
-        extensions.register(Witness::new(
-            Settlement::Block {
-                feedback: "the note was rejected".into(),
-            },
-            &seen,
-        ));
-
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("ok")),
         ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(Witness::new(
+                Settlement::Block {
+                    feedback: "the note was rejected".into(),
+                },
+                &seen,
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
 
         // 工具确实跑过；入账的是反馈，仍然是那一个调用的一条结果
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
@@ -1030,31 +870,23 @@ mod tests {
 
     #[tokio::test]
     async fn denied_tool_never_runs_and_the_model_carries_on() {
-        let mut extensions = Extensions::new();
-        extensions.register(PermissionPlugin::new(
-            vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            vec![],
-        ));
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("understood — moving on")),
         ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(PermissionPlugin::new(
+                vec![Rule::Name(ToolName::from_str("note").unwrap())],
+                vec![],
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            None,
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
 
         // 工具没跑
         assert!(recorder.calls.lock().unwrap().is_empty());
@@ -1098,17 +930,21 @@ mod tests {
     #[tokio::test]
     async fn an_ask_resolves_by_approval() {
         let (approval, mut questions) = ApprovalChannel::channel(None);
-        let mut extensions = Extensions::new();
-        extensions.register(PermissionPlugin::new(
-            vec![],
-            vec![Rule::Name(ToolName::from_str("note").unwrap())],
-        ));
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("did it")),
         ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(PermissionPlugin::new(
+                vec![],
+                vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .approvals(Some(&approval))
+            .build()
+            .unwrap();
         // 审批界面接问询、送回批准
         let reviewer = tokio::spawn(async move {
             let question = questions.recv().await.expect("the question arrives");
@@ -1118,18 +954,7 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            Some(&approval),
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
         reviewer.await.unwrap();
 
         // 批准后工具真正运行了
@@ -1150,35 +975,28 @@ mod tests {
     #[tokio::test]
     async fn an_ask_refusal_synthesizes_a_failed_result() {
         let (approval, mut questions) = ApprovalChannel::channel(None);
-        let mut extensions = Extensions::new();
-        extensions.register(PermissionPlugin::new(
-            vec![],
-            vec![Rule::Name(ToolName::from_str("note").unwrap())],
-        ));
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("refused and seen")),
         ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(PermissionPlugin::new(
+                vec![],
+                vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .approvals(Some(&approval))
+            .build()
+            .unwrap();
         let reviewer = tokio::spawn(async move {
             let question = questions.recv().await.expect("the question arrives");
             question.reply.send(false).expect("the refusal is sent");
         });
 
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            Some(&approval),
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
         reviewer.await.unwrap();
 
         assert!(recorder.calls.lock().unwrap().is_empty());
@@ -1200,39 +1018,30 @@ mod tests {
     async fn interrupting_while_waiting_for_approval_closes_the_run() {
         let (approval, kept_questions) = ApprovalChannel::channel(None);
         // 问询接收端保留但不应答 —— run 卡在审批挂起，直到打断
-        let mut extensions = Extensions::new();
-        extensions.register(PermissionPlugin::new(
-            vec![],
-            vec![Rule::Name(ToolName::from_str("note").unwrap())],
-        ));
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![response(tool_use(vec![call(
             "c1",
             "note",
             r#"{"text":"hi"}"#,
         )]))]);
         let input = FakeInput::new();
-        let requests = standard(model());
+        let mut host = Host::builder(&llm, &input)
+            .model(model())
+            .plugin(PermissionPlugin::new(
+                vec![],
+                vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .approvals(Some(&approval))
+            .build()
+            .unwrap();
         let mut sink = Collector(Vec::new());
         // 挂起后才打断：定时器走完一段再触发
         let interrupter = async {
             tokio::time::sleep(Duration::from_secs(60)).await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(
-            run(
-                config(8),
-                Arc::new(registry),
-                &llm,
-                &input,
-                &requests,
-                &mut sink,
-                &mut extensions,
-                Some(&approval),
-            ),
-            interrupter
-        );
+        let (result, ()) = tokio::join!(host.run(config(8), &mut sink), interrupter);
         let summary = result.unwrap();
         drop(kept_questions);
 
@@ -1260,30 +1069,23 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_approval_timeout_denies_the_call() {
         let (approval, kept_questions) = ApprovalChannel::channel(Some(Duration::from_secs(2)));
-        let mut extensions = Extensions::new();
-        extensions.register(PermissionPlugin::new(
-            vec![],
-            vec![Rule::Name(ToolName::from_str("note").unwrap())],
-        ));
         let recorder = Arc::new(Recorder::new());
-        let registry = ToolRegistry::build(vec![Arc::clone(&recorder) as Arc<dyn Tool>]).unwrap();
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
             response(completed("proceeding without it")),
         ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(PermissionPlugin::new(
+                vec![],
+                vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .approvals(Some(&approval))
+            .build()
+            .unwrap();
         let mut sink = Collector(Vec::new());
-        let summary = run(
-            config(8),
-            Arc::new(registry),
-            &llm,
-            &NoInput,
-            &standard(model()),
-            &mut sink,
-            &mut extensions,
-            Some(&approval),
-        )
-        .await
-        .unwrap();
+        let summary = host.run(config(8), &mut sink).await.unwrap();
         drop(kept_questions);
 
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));

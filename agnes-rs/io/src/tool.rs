@@ -46,6 +46,25 @@ impl ToolRegistry {
         Ok(Self { tools: map })
     }
 
+    /// Adds a tool; a live registry lets hosts grow the tool set between runs.
+    pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), DuplicateTool> {
+        let name = tool.spec().name.clone();
+        if self.tools.insert(name.clone(), tool).is_some() {
+            return Err(DuplicateTool(name));
+        }
+        Ok(())
+    }
+
+    /// Removes a tool, returning it when it was there.
+    pub fn deregister(&mut self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        self.tools.remove(name)
+    }
+
+    /// Whether a tool with this name is registered.
+    pub fn contains(&self, name: &ToolName) -> bool {
+        self.tools.contains_key(name)
+    }
+
     pub fn get(&self, name: &ToolName) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }
@@ -128,6 +147,27 @@ mod tests {
         let specs = registry.specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["read_file", "write_file"]);
+    }
+
+    #[test]
+    fn a_live_registry_registers_and_deregisters() {
+        let mut registry = ToolRegistry::default();
+        let name = ToolName::from_str("echo").unwrap();
+        assert!(!registry.contains(&name));
+
+        registry
+            .register(Arc::new(Echo::new("echo")) as Arc<dyn Tool>)
+            .unwrap();
+        assert!(registry.contains(&name));
+        assert!(
+            registry
+                .register(Arc::new(Echo::new("echo")) as Arc<dyn Tool>)
+                .is_err()
+        );
+
+        assert!(registry.deregister(&name).is_some());
+        assert!(!registry.contains(&name));
+        assert!(registry.deregister(&name).is_none());
     }
 
     #[tokio::test]

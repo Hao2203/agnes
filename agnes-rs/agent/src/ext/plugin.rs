@@ -56,3 +56,22 @@ pub trait Plugin: Send + Sync {
     /// 只读观察。
     fn observe(&mut self, _notice: &Notice<'_>) {}
 }
+
+/// 装箱的插件仍是插件：装配器可以统一按 `Box<dyn Plugin>` 持有。
+impl Plugin for Box<dyn Plugin> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn gate(&mut self, call: &ToolCall) -> Option<Verdict> {
+        (**self).gate(call)
+    }
+
+    fn settle(&mut self, call: &ToolCall, output: &ToolOutput) -> Settlement {
+        (**self).settle(call, output)
+    }
+
+    fn observe(&mut self, notice: &Notice<'_>) {
+        (**self).observe(notice);
+    }
+}

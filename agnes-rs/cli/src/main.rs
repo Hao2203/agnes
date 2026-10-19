@@ -1,6 +1,7 @@
 mod input;
 
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,13 +11,13 @@ use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
 
 use agnes_agent::tools::{ListDir, ReadFile, Shell, WriteFile};
-use agnes_agent::{Event, Sink, StandardRequestBuilder};
+use agnes_agent::{Event, Sink};
 use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::context::{Context, Environment};
 use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::StopReason;
-use agnes_core::turn::Outcome;
+use agnes_core::turn::{AgentConfig, Outcome};
 use agnes_io::input::Input;
 use agnes_io::llm::Llm;
 use agnes_io::tool::{Tool, ToolRegistry};
@@ -112,15 +113,6 @@ async fn real_main() -> anyhow::Result<()> {
     };
 
     let root = std::env::current_dir().context("cannot determine working directory")?;
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadFile::new(root.clone())),
-        Arc::new(WriteFile::new(root.clone())),
-        Arc::new(ListDir::new(root.clone())),
-    ];
-    if cli.allow_shell {
-        tools.push(Arc::new(Shell::new(root)));
-    }
-    let registry = Arc::new(ToolRegistry::build(tools).context("building tool registry")?);
 
     let transport = ReqwestTransport::new(REQUEST_TIMEOUT);
     let client = OpenAiClient::new(transport, base_url, api_key);
@@ -137,16 +129,10 @@ async fn real_main() -> anyhow::Result<()> {
             let input = UserInput::new();
             input::spawn_ctrl_c(&input);
             input.begin_run();
-            let printer = EventPrinter::new(model.clone());
-            let host = Host {
-                llm: &client,
-                registry: &registry,
-                model,
-                max_steps: cli.max_steps,
-            };
-            let summary = host
-                .run_task(goal, session_context(&registry), &*input, printer)
-                .await?;
+            let mut printer = EventPrinter::new(model.clone());
+            let mut host = build_host(&client, &*input, model.clone(), &root, cli.allow_shell)?;
+            let config = agent_config(goal, session_context(host.tools()), cli.max_steps)?;
+            let summary = host.run(config, &mut printer).await?;
             print_summary(&summary);
         }
         Some(Command::Chat) | None => {
@@ -157,13 +143,8 @@ async fn real_main() -> anyhow::Result<()> {
             let input = UserInput::new();
             input::spawn_stdin_reader(&input);
             input::spawn_ctrl_c(&input);
-            let host = Host {
-                llm: &client,
-                registry: &registry,
-                model,
-                max_steps: cli.max_steps,
-            };
-            let mut context = session_context(&registry);
+            let mut host = build_host(&client, &*input, model.clone(), &root, cli.allow_shell)?;
+            let mut context = session_context(host.tools());
             loop {
                 print!("agnes> ");
                 std::io::stdout().flush().ok();
@@ -175,14 +156,13 @@ async fn real_main() -> anyhow::Result<()> {
                     }
                     Line::Task(goal) => {
                         input.begin_run();
-                        let result = host
-                            .run_task(
-                                goal,
-                                context.clone(),
-                                &*input,
-                                EventPrinter::new(host.model.clone()),
-                            )
-                            .await;
+                        let result = match agent_config(goal, context.clone(), cli.max_steps) {
+                            Ok(config) => host
+                                .run(config, &mut EventPrinter::new(model.clone()))
+                                .await
+                                .map_err(anyhow::Error::new),
+                            Err(err) => Err(err),
+                        };
                         input.end_run();
                         match result {
                             Ok(summary) => {
@@ -232,49 +212,40 @@ async fn read_goal_from_stdin() -> anyhow::Result<String> {
     }
 }
 
-/// The fixed wiring every task run needs: the model client, the tool
-/// registry, the model name and the step budget.
-struct Host<'a> {
+/// The fixed wiring every run needs: the model client, the tools, and the
+/// request transform.
+fn build_host<'a>(
     llm: &'a dyn Llm,
-    registry: &'a Arc<ToolRegistry>,
+    input: &'a dyn Input,
     model: ModelName,
-    max_steps: u32,
+    root: &Path,
+    allow_shell: bool,
+) -> anyhow::Result<agnes_agent::Host<'a>> {
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ReadFile::new(root.to_path_buf())),
+        Arc::new(WriteFile::new(root.to_path_buf())),
+        Arc::new(ListDir::new(root.to_path_buf())),
+    ];
+    if allow_shell {
+        tools.push(Arc::new(Shell::new(root.to_path_buf())));
+    }
+    agnes_agent::Host::builder(llm, input)
+        .model(model)
+        .tools(tools)
+        .build()
+        .context("assembling the host")
 }
 
-impl Host<'_> {
-    async fn run_task(
-        &self,
-        goal: Content,
-        context: Context,
-        input: &dyn Input,
-        printer: EventPrinter,
-    ) -> anyhow::Result<agnes_agent::RunSummary> {
-        let budget: StepBudget = self
-            .max_steps
-            .to_string()
-            .parse()
-            .context("invalid --max-turns")?;
-        let config = agnes_core::turn::AgentConfig {
-            context,
-            goal,
-            budget,
-        };
-        let requests = StandardRequestBuilder::new(self.model.clone());
-        let mut printer = printer;
-        let mut extensions = agnes_agent::ext::Extensions::new();
-        agnes_agent::run(
-            config,
-            Arc::clone(self.registry),
-            self.llm,
-            input,
-            &requests,
-            &mut printer,
-            &mut extensions,
-            None,
-        )
-        .await
-        .map_err(anyhow::Error::new)
-    }
+fn agent_config(goal: Content, context: Context, max_steps: u32) -> anyhow::Result<AgentConfig> {
+    let budget: StepBudget = max_steps
+        .to_string()
+        .parse()
+        .context("invalid --max-turns")?;
+    Ok(AgentConfig {
+        context,
+        goal,
+        budget,
+    })
 }
 
 struct EventPrinter {
