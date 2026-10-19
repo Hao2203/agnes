@@ -267,10 +267,10 @@ pub fn extract_error_body(body: &str) -> String {
     match parsed {
         Ok(Value::Object(map)) => {
             let error = map.get("error");
-            if let Some(Value::Object(inner)) = error {
-                if let Some(Value::String(message)) = inner.get("message") {
-                    return message.clone();
-                }
+            if let Some(Value::Object(inner)) = error
+                && let Some(Value::String(message)) = inner.get("message")
+            {
+                return message.clone();
             }
             if let Some(Value::String(message)) = map.get("message") {
                 return message.clone();

@@ -43,6 +43,9 @@ use ext::Denied;
 pub enum AgentError {
     #[error(transparent)]
     Llm(#[from] LlmError),
+    /// 会话日志写失败：宁可中止，也不在没有审计轨迹的情况下继续跑。
+    #[error(transparent)]
+    Session(#[from] agnes_io::session::SessionError),
 }
 
 /// 标准转换者：Context 的标准投影（[`Prompt::from_context`]）加模型名。
@@ -347,7 +350,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -409,6 +412,62 @@ mod tests {
         assert!(summary.pending_user_messages.is_empty());
     }
 
+    /// 记录落盘事件与 flush 次数的会话日志。
+    struct RecordingSession {
+        events: Arc<Mutex<Vec<CoreEvent>>>,
+        flushes: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl agnes_io::session::SessionLog for RecordingSession {
+        async fn append(
+            &mut self,
+            _at: jiff::Timestamp,
+            event: &CoreEvent,
+        ) -> Result<(), agnes_io::session::SessionError> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), agnes_io::session::SessionError> {
+            *self.flushes.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_reported_event_is_persisted_in_order() {
+        let recorder = Arc::new(Recorder::new());
+        let llm = ScriptedLlm::new(vec![
+            response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
+            response(completed("done")),
+        ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .build()
+            .unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let flushes = Arc::new(Mutex::new(0));
+        let mut session = RecordingSession {
+            events: Arc::clone(&events),
+            flushes: Arc::clone(&flushes),
+        };
+
+        let mut sink = Collector(Vec::new());
+        let summary = host
+            .run(config(8), &mut sink, Some(&mut session))
+            .await
+            .unwrap();
+
+        // 落盘顺序就是上报顺序，且一个不落
+        assert_eq!(*events.lock().unwrap(), recorded(&sink.0));
+        assert_eq!(events.lock().unwrap().len(), summary.context.events().len());
+        // 每个模型调用前 + 收场各一次
+        assert!(*flushes.lock().unwrap() >= 2);
+    }
+
     #[tokio::test]
     async fn tool_failure_is_surfaced_not_fatal() {
         struct AlwaysFails {
@@ -444,7 +503,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
         assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
@@ -470,7 +529,7 @@ mod tests {
             .build()
             .unwrap();
         let err = host
-            .run(config(4), &mut Collector(Vec::new()))
+            .run(config(4), &mut Collector(Vec::new()), None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -514,7 +573,7 @@ mod tests {
 
         let config = config_with(host.tools().specs(), 4);
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config, &mut sink).await.unwrap();
+        let summary = host.run(config, &mut sink, None).await.unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
 
         let requests = llm.requests();
@@ -612,7 +671,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -659,7 +718,7 @@ mod tests {
             tokio::task::yield_now().await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(host.run(config(4), &mut sink), interrupter);
+        let (result, ()) = tokio::join!(host.run(config(4), &mut sink, None), interrupter);
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
@@ -719,7 +778,7 @@ mod tests {
             tokio::task::yield_now().await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(host.run(config(8), &mut sink), interrupter);
+        let (result, ()) = tokio::join!(host.run(config(8), &mut sink, None), interrupter);
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
@@ -752,7 +811,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(4), &mut sink).await.unwrap();
+        let summary = host.run(config(4), &mut sink, None).await.unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -823,7 +882,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
 
         assert!(
             matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. } if !output.is_error)
@@ -852,7 +911,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
 
         // 工具确实跑过；入账的是反馈，仍然是那一个调用的一条结果
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
@@ -886,7 +945,7 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
 
         // 工具没跑
         assert!(recorder.calls.lock().unwrap().is_empty());
@@ -954,7 +1013,7 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
         reviewer.await.unwrap();
 
         // 批准后工具真正运行了
@@ -996,7 +1055,7 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
         reviewer.await.unwrap();
 
         assert!(recorder.calls.lock().unwrap().is_empty());
@@ -1041,7 +1100,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(host.run(config(8), &mut sink), interrupter);
+        let (result, ()) = tokio::join!(host.run(config(8), &mut sink, None), interrupter);
         let summary = result.unwrap();
         drop(kept_questions);
 
@@ -1085,7 +1144,7 @@ mod tests {
             .build()
             .unwrap();
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink).await.unwrap();
+        let summary = host.run(config(8), &mut sink, None).await.unwrap();
         drop(kept_questions);
 
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));

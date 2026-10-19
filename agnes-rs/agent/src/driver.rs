@@ -23,6 +23,7 @@ use agnes_core::turn::{
 };
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
+use agnes_io::session::SessionLog;
 use agnes_io::tool::ToolRegistry;
 use jiff::Timestamp;
 use tokio::sync::oneshot::Receiver as AnswerReceiver;
@@ -37,9 +38,14 @@ pub(crate) struct Ports<'a> {
     pub(crate) llm: &'a dyn Llm,
     pub(crate) input: &'a dyn InputPort,
     pub(crate) requests: &'a dyn RequestBuilder,
-    pub(crate) sink: &'a mut dyn Sink,
     pub(crate) extensions: &'a mut Extensions,
     pub(crate) approvals: Option<&'a ApprovalChannel>,
+}
+
+/// 一次 run 的出口：上报与落盘只在这次 run 内借用。
+pub(crate) struct Outlets<'s, 'q> {
+    pub(crate) sink: &'s mut dyn Sink,
+    pub(crate) session: Option<&'q mut dyn SessionLog>,
 }
 
 /// core turn 的阶段化封装 —— 驱动状态机的动态货币。
@@ -165,16 +171,22 @@ impl Resolution {
 }
 
 /// 驱动状态机。
-pub(crate) struct Driver<'a> {
+pub(crate) struct Driver<'a, 's, 'q> {
     ports: Ports<'a>,
+    outlets: Outlets<'s, 'q>,
     machine: Machine,
     state: Waiting,
 }
 
-impl<'a> Driver<'a> {
-    pub(crate) fn new(turn: Turn<AwaitingMessage>, ports: Ports<'a>) -> Self {
+impl<'a, 's, 'q> Driver<'a, 's, 'q> {
+    pub(crate) fn new(
+        turn: Turn<AwaitingMessage>,
+        ports: Ports<'a>,
+        outlets: Outlets<'s, 'q>,
+    ) -> Self {
         Self {
             ports,
+            outlets,
             machine: Machine::AwaitingMessage(turn),
             state: Waiting::Reacting,
         }
@@ -194,7 +206,7 @@ impl<'a> Driver<'a> {
             for content in self.ports.input.drain() {
                 self.machine.user_message(content);
             }
-            self.pump_actions();
+            self.pump_actions().await?;
             if let Machine::Closed(_) = self.machine {
                 break;
             }
@@ -284,7 +296,7 @@ impl<'a> Driver<'a> {
                         },
                     };
                     let outcome = resolution.outcome();
-                    self.ports.sink.event(&Event::ApprovalResolved {
+                    self.outlets.sink.event(&Event::ApprovalResolved {
                         at: Timestamp::now(),
                         call_id: call.id.clone(),
                         outcome,
@@ -314,30 +326,52 @@ impl<'a> Driver<'a> {
                 Waiting::Reacting => unreachable!("泵完动作后必然摆好等待点或收场"),
             }
         }
+        self.flush_session().await?;
         match self.machine {
             Machine::Closed(turn) => Ok(turn),
             _ => unreachable!("循环只在机器收场后退出"),
         }
     }
 
-    /// 机器动作 → 事件上报 / 等待目标；工具调用在这里就地决议。
-    fn pump_actions(&mut self) {
+    /// 机器动作 → 落盘 / 事件上报 / 等待目标；工具调用在这里就地决议。
+    async fn pump_actions(&mut self) -> Result<(), AgentError> {
         while let Some(action) = self.machine.poll_actions() {
             match action {
                 Action::Report(event) => {
+                    // 先入账、再上报：模型可见的东西一定已经在日志里。
+                    self.record(&event).await?;
                     self.ports.extensions.observe(&Notice::Core(&event));
-                    self.ports.sink.event(&Event::Recorded {
+                    self.outlets.sink.event(&Event::Recorded {
                         at: Timestamp::now(),
                         event,
                     });
                 }
                 Action::CallModel => {
+                    // 提交边界：请求发出前，日志已经耐久。
+                    self.flush_session().await?;
                     let request = self.ports.requests.build(self.machine.context());
                     self.state = Waiting::AwaitingModel { request };
                 }
                 Action::RunTool(call) => self.dispatch_tool(call),
             }
         }
+        Ok(())
+    }
+
+    /// 报告类动作落进会话日志（尽力而为；`flush` 才承诺持久）。
+    async fn record(&mut self, event: &agnes_core::event::Event) -> Result<(), AgentError> {
+        if let Some(session) = self.outlets.session.as_mut() {
+            session.append(Timestamp::now(), event).await?;
+        }
+        Ok(())
+    }
+
+    /// 让日志耐久；没有接会话时是空操作。
+    async fn flush_session(&mut self) -> Result<(), AgentError> {
+        if let Some(session) = self.outlets.session.as_mut() {
+            session.flush().await?;
+        }
+        Ok(())
     }
 
     /// 门禁折叠 → 放行 / 审批挂起 / 合成拒绝。
@@ -381,7 +415,7 @@ impl<'a> Driver<'a> {
                 self.ports
                     .extensions
                     .observe(&Notice::Asked { call: &call });
-                self.ports.sink.event(&Event::ApprovalRequested {
+                self.outlets.sink.event(&Event::ApprovalRequested {
                     at: Timestamp::now(),
                     call: call.clone(),
                 });
@@ -400,7 +434,7 @@ impl<'a> Driver<'a> {
         self.ports
             .extensions
             .observe(&Notice::Gated { call: &call, denied: &denied });
-        self.ports.sink.event(&Event::ToolGated {
+        self.outlets.sink.event(&Event::ToolGated {
             at: Timestamp::now(),
             call: call.clone(),
             denied: denied.clone(),

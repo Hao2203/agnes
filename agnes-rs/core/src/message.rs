@@ -16,6 +16,7 @@ use cold_string::ArcColdString;
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Identifier of a tool call, assigned by the model. Cloned for every tool
@@ -55,6 +56,12 @@ impl PartialOrd for ToolCallId {
 impl Ord for ToolCallId {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for ToolCallId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 

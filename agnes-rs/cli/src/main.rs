@@ -1,27 +1,35 @@
 mod input;
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 
-use agnes_agent::tools::{ListDir, ReadFile, Shell, WriteFile};
+use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
+use agnes_agent::permission::{PolicyBundle, Rule};
+use agnes_agent::tools::FsBundle;
 use agnes_agent::{Event, Sink};
 use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::context::{Context, Environment};
 use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::StopReason;
+use agnes_core::tool::ToolName;
 use agnes_core::turn::{AgentConfig, Outcome};
 use agnes_io::input::Input;
 use agnes_io::llm::Llm;
-use agnes_io::tool::{Tool, ToolRegistry};
+use agnes_io::session::SessionLog;
+use agnes_io::tool::ToolRegistry;
 use agnes_llm_openai::OpenAiClient;
+use agnes_session_file::SessionFile;
 use agnes_transport_reqwest::ReqwestTransport;
 
 use crate::input::{Line, UserInput};
@@ -62,6 +70,18 @@ struct Cli {
     /// Offer the run_shell tool to the model
     #[arg(long, global = true)]
     allow_shell: bool,
+
+    /// Keep the chat session in this append-only file; resumes when it exists
+    #[arg(long, global = true)]
+    session: Option<PathBuf>,
+
+    /// Never prompt for approval (tools with ask rules run directly)
+    #[arg(long, global = true)]
+    yes: bool,
+
+    /// Deny a tool by exact name, or by prefix with a trailing `*` (repeatable)
+    #[arg(long = "deny", global = true, value_name = "TOOL")]
+    deny: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -117,10 +137,10 @@ async fn real_main() -> anyhow::Result<()> {
     let transport = ReqwestTransport::new(REQUEST_TIMEOUT);
     let client = OpenAiClient::new(transport, base_url, api_key);
 
-    match cli.command {
+    match &cli.command {
         Some(Command::Run { task }) => {
             let goal = match task {
-                Some(task) => task,
+                Some(task) => task.clone(),
                 None => read_goal_from_stdin().await?,
             };
             let goal = Content::try_from(goal.trim()).context(
@@ -129,10 +149,26 @@ async fn real_main() -> anyhow::Result<()> {
             let input = UserInput::new();
             input::spawn_ctrl_c(&input);
             input.begin_run();
+            let ask = ask_rules(&cli);
+            let approvals = approvals_for(&input, &ask);
+            let deny = cli
+                .deny
+                .iter()
+                .map(|spec| parse_rule(spec))
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let mut printer = EventPrinter::new(model.clone());
-            let mut host = build_host(&client, &*input, model.clone(), &root, cli.allow_shell)?;
+            let mut host = build_host(
+                &client,
+                &*input,
+                model.clone(),
+                &root,
+                cli.allow_shell,
+                approvals.as_ref(),
+                deny,
+                ask,
+            )?;
             let config = agent_config(goal, session_context(host.tools()), cli.max_steps)?;
-            let summary = host.run(config, &mut printer).await?;
+            let summary = host.run(config, &mut printer, None).await?;
             print_summary(&summary);
         }
         Some(Command::Chat) | None => {
@@ -143,8 +179,51 @@ async fn real_main() -> anyhow::Result<()> {
             let input = UserInput::new();
             input::spawn_stdin_reader(&input);
             input::spawn_ctrl_c(&input);
-            let mut host = build_host(&client, &*input, model.clone(), &root, cli.allow_shell)?;
-            let mut context = session_context(host.tools());
+
+            let ask = ask_rules(&cli);
+            let approvals = approvals_for(&input, &ask);
+            let deny = cli
+                .deny
+                .iter()
+                .map(|spec| parse_rule(spec))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let mut host = build_host(
+                &client,
+                &*input,
+                model.clone(),
+                &root,
+                cli.allow_shell,
+                approvals.as_ref(),
+                deny,
+                ask,
+            )?;
+
+            // 会话文件（可选）：存在即恢复，不存在即新建。
+            let mut session_file = None;
+            let mut restored = None;
+            if let Some(path) = cli.session.as_deref() {
+                let opened = open_session(path, &host).await?;
+                if opened.repairs.is_empty() {
+                    println!("(session: {})", path.display());
+                } else {
+                    println!(
+                        "(resumed {}: repaired {} unfinished event(s))",
+                        path.display(),
+                        opened.repairs.len()
+                    );
+                }
+                restored = Some(opened.events);
+                session_file = Some(opened.session);
+            }
+            let mut context = match restored {
+                Some(events) => Context::restore(
+                    SystemPrompt::new(SYSTEM_PROMPT),
+                    Environment::new(host.tools().specs()),
+                    events,
+                ),
+                None => session_context(host.tools()),
+            };
+
             loop {
                 print!("agnes> ");
                 std::io::stdout().flush().ok();
@@ -152,15 +231,40 @@ async fn real_main() -> anyhow::Result<()> {
                     Line::Exit => break,
                     Line::Reset => {
                         context.reset();
-                        println!("(session cleared)");
+                        match cli.session.as_deref() {
+                            // 日志只追加：`/new` 轮转到下一个空闲的兄弟文件。
+                            Some(path) => {
+                                if let Some(mut file) = session_file.take() {
+                                    file.flush().await.context("closing the session")?;
+                                }
+                                let next = rotate(path);
+                                let opened = open_session(&next, &host).await?;
+                                println!("(session cleared — new file: {})", next.display());
+                                context = Context::restore(
+                                    SystemPrompt::new(SYSTEM_PROMPT),
+                                    Environment::new(host.tools().specs()),
+                                    opened.events,
+                                );
+                                session_file = Some(opened.session);
+                            }
+                            None => println!("(session cleared)"),
+                        }
                     }
                     Line::Task(goal) => {
                         input.begin_run();
                         let result = match agent_config(goal, context.clone(), cli.max_steps) {
-                            Ok(config) => host
-                                .run(config, &mut EventPrinter::new(model.clone()))
+                            Ok(config) => {
+                                let session = session_file
+                                    .as_mut()
+                                    .map(|file| file as &mut dyn SessionLog);
+                                host.run(
+                                    config,
+                                    &mut EventPrinter::new(model.clone()),
+                                    session,
+                                )
                                 .await
-                                .map_err(anyhow::Error::new),
+                                .map_err(anyhow::Error::new)
+                            }
                             Err(err) => Err(err),
                         };
                         input.end_run();
@@ -212,28 +316,117 @@ async fn read_goal_from_stdin() -> anyhow::Result<String> {
     }
 }
 
-/// The fixed wiring every run needs: the model client, the tools, and the
-/// request transform.
+/// The fixed wiring every run needs: the model client, the tools, the policy
+/// and the request transform.
+#[allow(clippy::too_many_arguments)]
 fn build_host<'a>(
     llm: &'a dyn Llm,
     input: &'a dyn Input,
     model: ModelName,
     root: &Path,
     allow_shell: bool,
+    approvals: Option<&'a ApprovalChannel>,
+    deny: Vec<Rule>,
+    ask: Vec<Rule>,
 ) -> anyhow::Result<agnes_agent::Host<'a>> {
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadFile::new(root.to_path_buf())),
-        Arc::new(WriteFile::new(root.to_path_buf())),
-        Arc::new(ListDir::new(root.to_path_buf())),
-    ];
-    if allow_shell {
-        tools.push(Arc::new(Shell::new(root.to_path_buf())));
-    }
-    agnes_agent::Host::builder(llm, input)
+    let mut builder = agnes_agent::Host::builder(llm, input)
         .model(model)
-        .tools(tools)
+        .bundle(FsBundle::new(root, allow_shell));
+    if let Some(approvals) = approvals {
+        builder = builder.approvals(Some(approvals));
+    }
+    builder
+        .bundle(PolicyBundle::new(deny, ask))
         .build()
         .context("assembling the host")
+}
+
+/// 默认策略：`run_shell` 需要一次审批（除非 `--yes` 或 shell 不在场）。
+fn ask_rules(cli: &Cli) -> Vec<Rule> {
+    if cli.yes || !cli.allow_shell {
+        return Vec::new();
+    }
+    vec![Rule::Name(
+        ToolName::from_str("run_shell").expect("`run_shell` is a valid tool name"),
+    )]
+}
+
+/// 有 ask 规则才有审批口；没有审批口的 ask 会在装载期被拒绝。
+fn approvals_for(input: &Arc<UserInput>, ask: &[Rule]) -> Option<ApprovalChannel> {
+    if ask.is_empty() {
+        return None;
+    }
+    let (channel, questions) = ApprovalChannel::channel(None);
+    spawn_approver(Arc::clone(input), questions);
+    Some(channel)
+}
+
+/// `--deny` 的语法：`name` 精确匹配，`prefix*` 前缀匹配。
+fn parse_rule(spec: &str) -> anyhow::Result<Rule> {
+    match spec.strip_suffix('*') {
+        Some(prefix) if !prefix.is_empty() => Ok(Rule::Prefix(prefix.to_owned())),
+        Some(_) => bail!("empty prefix in --deny `{spec}`"),
+        None => Ok(Rule::Name(
+            ToolName::from_str(spec).with_context(|| format!("invalid --deny `{spec}`"))?,
+        )),
+    }
+}
+
+async fn open_session(
+    path: &Path,
+    host: &agnes_agent::Host<'_>,
+) -> anyhow::Result<agnes_session_file::Opened> {
+    SessionFile::open_or_create(
+        path,
+        SystemPrompt::new(SYSTEM_PROMPT),
+        Environment::new(host.tools().specs()),
+    )
+    .await
+    .with_context(|| format!("opening session `{}`", path.display()))
+}
+
+/// 会话文件不可重写：`/new` 轮转到下一个空闲的兄弟文件。
+fn rotate(path: &Path) -> PathBuf {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("jsonl");
+    (1..)
+        .map(|n| path.with_file_name(format!("{stem}.{n}.{extension}")))
+        .find(|candidate| !candidate.exists())
+        .expect("an unused session name exists")
+}
+
+/// 审批界面：问询期间读到的行不分类，直接作为答覆（空行 = 拒绝）。
+fn spawn_approver(
+    input: Arc<UserInput>,
+    mut questions: mpsc::UnboundedReceiver<ApprovalRequest>,
+) {
+    tokio::spawn(async move {
+        let mut always: HashSet<ToolName> = HashSet::new();
+        while let Some(question) = questions.recv().await {
+            let approved = if always.contains(&question.tool_name) {
+                true
+            } else {
+                println!();
+                println!(
+                    "approve `{}`: {}",
+                    question.tool_name,
+                    question.arguments.as_str()
+                );
+                print!("  [y] once  [n] reject  [a] always this session: ");
+                std::io::stdout().flush().ok();
+                let answer = input.ask().await.unwrap_or_default();
+                match answer.trim() {
+                    "a" | "A" => {
+                        always.insert(question.tool_name.clone());
+                        true
+                    }
+                    "y" | "Y" | "yes" => true,
+                    _ => false,
+                }
+            };
+            let _ = question.reply.send(approved);
+        }
+    });
 }
 
 fn agent_config(goal: Content, context: Context, max_steps: u32) -> anyhow::Result<AgentConfig> {
@@ -343,5 +536,45 @@ fn print_summary(summary: &agnes_agent::RunSummary) {
     // 单次 run：没生效的插话已经无处可去，提示一下别静默丢失
     for message in &summary.pending_user_messages {
         eprintln!("note: unused queued message: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str) -> Rule {
+        Rule::Name(ToolName::from_str(name).unwrap())
+    }
+
+    #[test]
+    fn deny_rules_parse_exact_names_and_prefixes() {
+        assert_eq!(parse_rule("run_shell").unwrap(), tool("run_shell"));
+        assert_eq!(parse_rule("run_*").unwrap(), Rule::Prefix("run_".into()));
+        assert!(parse_rule("*").is_err());
+        assert!(parse_rule("a b").is_err());
+    }
+
+    #[test]
+    fn rotation_picks_the_next_free_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(rotate(&path), dir.path().join("session.1.jsonl"));
+
+        std::fs::write(dir.path().join("session.1.jsonl"), "").unwrap();
+        assert_eq!(rotate(&path), dir.path().join("session.2.jsonl"));
+    }
+
+    #[test]
+    fn ask_rules_follow_shell_and_yes() {
+        let cli = Cli::parse_from(["agnes", "chat"]);
+        assert!(ask_rules(&cli).is_empty());
+
+        let cli = Cli::parse_from(["agnes", "chat", "--allow-shell"]);
+        assert_eq!(ask_rules(&cli), vec![tool("run_shell")]);
+
+        let cli = Cli::parse_from(["agnes", "chat", "--allow-shell", "--yes"]);
+        assert!(ask_rules(&cli).is_empty());
     }
 }

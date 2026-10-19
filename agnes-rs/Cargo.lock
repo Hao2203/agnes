@@ -27,11 +27,13 @@ dependencies = [
  "agnes-core",
  "agnes-io",
  "agnes-llm-openai",
+ "agnes-session-file",
  "agnes-transport-reqwest",
  "anyhow",
  "async-trait",
  "clap",
  "jiff",
+ "tempfile",
  "tokio",
 ]
 
@@ -74,6 +76,22 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agnes-session-file"
+version = "0.1.0"
+dependencies = [
+ "agnes-core",
+ "agnes-io",
+ "agnes-util",
+ "async-trait",
+ "jiff",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
 ]
 

@@ -13,11 +13,12 @@ use agnes_core::llm::RequestBuilder;
 use agnes_core::turn::{AgentConfig, Turn};
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
+use agnes_io::session::SessionLog;
 use agnes_io::tool::{DuplicateTool, Tool, ToolRegistry};
 use jiff::Timestamp;
 
 use crate::approval::ApprovalChannel;
-use crate::driver::{Driver, Ports};
+use crate::driver::{Driver, Outlets, Ports};
 use crate::ext::{Bundle, Extensions, Plugin};
 use crate::{AgentError, Event, RunSummary, Sink, StandardRequestBuilder};
 
@@ -100,6 +101,7 @@ impl<'a> Host<'a> {
         &mut self,
         config: AgentConfig,
         sink: &mut dyn Sink,
+        session: Option<&mut dyn SessionLog>,
     ) -> Result<RunSummary, AgentError> {
         let started_at = Timestamp::now();
         let goal = config.goal.clone();
@@ -121,13 +123,16 @@ impl<'a> Host<'a> {
             llm: self.llm,
             input: self.input,
             requests: self.requests.as_ref(),
-            sink: &mut *sink,
             extensions: &mut self.extensions,
             approvals: self.approvals,
         };
+        let outlets = Outlets {
+            sink: &mut *sink,
+            session,
+        };
         let turn = Turn::start(config);
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）。
-        let mut closed = Driver::new(turn, ports).run().await?;
+        let mut closed = Driver::new(turn, ports, outlets).run().await?;
 
         let finished_at = Timestamp::now();
         let outcome = closed.outcome().clone();

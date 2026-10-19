@@ -26,6 +26,10 @@ pub enum Line {
 pub struct UserInput {
     queue: Mutex<VecDeque<Line>>,
     wake: Notify,
+    /// 审批问询期间：读到的行不分类，原样进答覆队列。
+    answering: AtomicBool,
+    answers: Mutex<VecDeque<String>>,
+    answer_wake: Notify,
     stop: watch::Sender<bool>,
     running: AtomicBool,
 }
@@ -36,6 +40,9 @@ impl UserInput {
         Arc::new(Self {
             queue: Mutex::new(VecDeque::new()),
             wake: Notify::new(),
+            answering: AtomicBool::new(false),
+            answers: Mutex::new(VecDeque::new()),
+            answer_wake: Notify::new(),
             stop,
             running: AtomicBool::new(false),
         })
@@ -44,6 +51,30 @@ impl UserInput {
     pub fn push(&self, line: Line) {
         self.queue.lock().unwrap().push_back(line);
         self.wake.notify_one();
+    }
+
+    /// 等待审批的一行答覆：进入答覆模式，读到的行不分类、原样交回。
+    pub async fn ask(&self) -> Option<String> {
+        self.answering.store(true, Ordering::SeqCst);
+        loop {
+            {
+                let mut answers = self.answers.lock().unwrap();
+                if let Some(line) = answers.pop_front() {
+                    self.answering.store(false, Ordering::SeqCst);
+                    return Some(line);
+                }
+            }
+            self.answer_wake.notified().await;
+        }
+    }
+
+    fn is_answering(&self) -> bool {
+        self.answering.load(Ordering::SeqCst)
+    }
+
+    fn push_answer(&self, line: String) {
+        self.answers.lock().unwrap().push_back(line);
+        self.answer_wake.notify_one();
     }
 
     /// Next line for the chat loop; waits until one is available.
@@ -114,11 +145,17 @@ pub fn spawn_stdin_reader(input: &Arc<UserInput>) {
         loop {
             match read_line_lossy(&mut reader).await {
                 Ok(Some(line)) => {
-                    if let Some(line) = classify(&line) {
+                    if input.is_answering() {
+                        input.push_answer(line);
+                    } else if let Some(line) = classify(&line) {
                         input.push(line);
                     }
                 }
                 Ok(None) | Err(_) => {
+                    // EOF 也要给挂起的审批一个答覆，否则问询会一直悬着。
+                    if input.is_answering() {
+                        input.push_answer(String::new());
+                    }
                     input.push(Line::Exit);
                     return;
                 }
@@ -201,6 +238,21 @@ mod tests {
 
         // the command barrier and whatever follows it stay queued
         assert!(input.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn answering_mode_takes_raw_lines() {
+        let input = UserInput::new();
+        let asker = {
+            let input = Arc::clone(&input);
+            tokio::spawn(async move { input.ask().await })
+        };
+        tokio::task::yield_now().await;
+        input.push_answer("y".into());
+        assert_eq!(asker.await.unwrap().as_deref(), Some("y"));
+        // 答覆模式已退出：后续行照常分类
+        input.push(Line::Reset);
+        assert!(matches!(input.next().await, Line::Reset));
     }
 
     #[test]
