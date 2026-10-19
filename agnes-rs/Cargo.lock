@@ -59,6 +59,7 @@ dependencies = [
  "async-trait",
  "http",
  "jiff",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

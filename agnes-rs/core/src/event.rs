@@ -38,6 +38,8 @@ pub enum Event {
     /// step 的模型消息完成。
     MessageEnd {
         step: StepNumber,
+        /// 产生这条消息的模型（适配器从请求回带）。
+        model: crate::config::ModelName,
         stop: StopReason,
         usage: TokenUsage,
     },
@@ -111,6 +113,7 @@ mod tests {
             }),
             Event::MessageEnd {
                 step,
+                model: crate::config::ModelName::from_str("test-model").unwrap(),
                 stop: StopReason::ToolUse {
                     content: None,
                     calls: NonEmpty::new(first_call),

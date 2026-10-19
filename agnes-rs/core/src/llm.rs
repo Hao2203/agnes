@@ -86,6 +86,8 @@ pub enum StopReason {
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
+    /// 产生这条响应的模型 —— 由适配器从请求原样回带，切换模型后日志可追溯。
+    pub model: ModelName,
     pub stop_reason: StopReason,
     pub usage: TokenUsage,
 }

@@ -3,15 +3,22 @@
 //! The seam is deliberately tiny: the driver owns the ordering and the
 //! session format owns the envelope. Two promises, and nothing else:
 //!
-//! - [`SessionLog::append`] is **best effort** — returning from it does not
-//!   promise crash durability.
+//! - [`SessionLog::append`] / [`SessionLog::append_host`] are **best effort**
+//!   — returning from them does not promise crash durability.
 //! - [`SessionLog::flush`] is the **durability boundary**: after it returns,
 //!   everything appended so far survives a crash. The driver flushes before
 //!   every model request and when the run ends.
+//!
+//! The log carries two vocabularies: core events ([`Event`]) are the run's
+//! truth, and [`HostEvent`]s are the audit trail core must not know about
+//! (approval decisions, the cause of an aborted run). They share one order.
 
 use agnes_core::event::Event;
+use agnes_core::message::ToolCallId;
+use agnes_core::tool::ToolName;
 use async_trait::async_trait;
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -21,11 +28,55 @@ pub enum SessionError {
     Format(String),
 }
 
+/// How an approval ask settled. Fail-closed: only
+/// [`ApprovalOutcome::AllowedOnce`] lets the call run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    /// Explicitly approved once.
+    AllowedOnce,
+    /// Explicitly refused.
+    Rejected,
+    /// The wait was cancelled (the run was interrupted).
+    Cancelled,
+    /// No answerer: not wired, channel closed, reply dropped, or timed out.
+    Unavailable,
+}
+
+impl ApprovalOutcome {
+    /// The one value that allows the call.
+    pub fn allows(self) -> bool {
+        matches!(self, Self::AllowedOnce)
+    }
+}
+
+/// Audit records that belong to the host, not to the core vocabulary.
+///
+/// They never extend [`Event`]: plugins and approvals are host semantics, and
+/// core stays closed. The session format interleaves both by one sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostEvent {
+    /// An approval question was handed to the answerer.
+    ApprovalRequested { call_id: ToolCallId, tool: ToolName },
+    /// The question settled (including cancellation and unavailability).
+    ApprovalResolved {
+        call_id: ToolCallId,
+        outcome: ApprovalOutcome,
+    },
+    /// The run stopped with an error (model, transport or session write).
+    /// Core does not model I/O failures, so the cause lives here.
+    Failed { cause: String },
+}
+
 /// Append-only sink for one session's event log.
 #[async_trait]
 pub trait SessionLog: Send {
-    /// Appends one event, stamped by the host's clock.
+    /// Appends one core event, stamped by the host's clock.
     async fn append(&mut self, at: Timestamp, event: &Event) -> Result<(), SessionError>;
+
+    /// Appends one host-semantic audit record, sharing the same order.
+    async fn append_host(&mut self, at: Timestamp, event: &HostEvent) -> Result<(), SessionError>;
 
     /// Makes everything appended so far durable.
     async fn flush(&mut self) -> Result<(), SessionError>;
@@ -35,11 +86,13 @@ pub trait SessionLog: Send {
 mod tests {
     use super::*;
     use agnes_core::event::Event;
+    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
     struct Memory {
         events: Arc<Mutex<Vec<Event>>>,
+        notes: Arc<Mutex<Vec<HostEvent>>>,
         flushes: Arc<Mutex<usize>>,
     }
 
@@ -47,6 +100,15 @@ mod tests {
     impl SessionLog for Memory {
         async fn append(&mut self, _at: Timestamp, event: &Event) -> Result<(), SessionError> {
             self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        async fn append_host(
+            &mut self,
+            _at: Timestamp,
+            event: &HostEvent,
+        ) -> Result<(), SessionError> {
+            self.notes.lock().unwrap().push(event.clone());
             Ok(())
         }
 
@@ -64,6 +126,15 @@ mod tests {
         log.append(Timestamp::now(), &Event::TurnStart)
             .await
             .unwrap();
+        log.append_host(
+            Timestamp::now(),
+            &HostEvent::ApprovalRequested {
+                call_id: ToolCallId::new("c1"),
+                tool: ToolName::from_str("run_shell").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
         log.flush().await.unwrap();
         log.append(
             Timestamp::now(),
@@ -74,9 +145,10 @@ mod tests {
         .await
         .unwrap();
 
-        let events = memory.events.lock().unwrap().clone();
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], Event::TurnStart));
+        assert_eq!(memory.events.lock().unwrap().len(), 2);
+        assert_eq!(memory.notes.lock().unwrap().len(), 1);
         assert_eq!(*memory.flushes.lock().unwrap(), 1);
+        assert!(!ApprovalOutcome::Rejected.allows());
+        assert!(ApprovalOutcome::AllowedOnce.allows());
     }
 }

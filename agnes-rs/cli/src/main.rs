@@ -209,14 +209,17 @@ async fn real_main() -> anyhow::Result<()> {
             let mut log = Log::default();
             if let Some(path) = cli.session.as_deref() {
                 let opened = open_session(path).await?;
-                if opened.repairs.is_empty() {
-                    println!("(session: {})", path.display());
-                } else {
+                let repaired = opened.repairs.len();
+                if repaired > 0 {
                     println!(
-                        "(resumed {}: repaired {} unfinished event(s))",
-                        path.display(),
-                        opened.repairs.len()
+                        "(resumed {}: repaired {repaired} unfinished event(s))",
+                        path.display()
                     );
+                } else {
+                    println!("(session: {})", path.display());
+                }
+                if !opened.notes.is_empty() {
+                    println!("(recovered {} audit note(s))", opened.notes.len());
                 }
                 log = opened.log;
                 session_file = Some(opened.session);

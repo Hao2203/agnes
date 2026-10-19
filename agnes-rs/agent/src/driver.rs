@@ -23,7 +23,7 @@ use agnes_core::turn::{
 };
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
-use agnes_io::session::SessionLog;
+use agnes_io::session::{HostEvent, SessionLog};
 use agnes_io::tool::ToolRegistry;
 use jiff::Timestamp;
 use tokio::sync::oneshot::Receiver as AnswerReceiver;
@@ -199,8 +199,18 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         self.machine = transfer(taken);
     }
 
-    /// 一路驱动到收场。
+    /// 一路驱动到收场；中止时把原因写进审计记录，再原样返回错误。
     pub(crate) async fn run(mut self) -> Result<Turn<Closed>, AgentError> {
+        match self.drive().await {
+            Ok(closed) => Ok(closed),
+            Err(err) => {
+                self.record_failure(&err).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn drive(&mut self) -> Result<Turn<Closed>, AgentError> {
         loop {
             // 输入：运行中的插话随时进机器缓存；生效时机由机器按 step
             // 边界决定。
@@ -299,6 +309,11 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                         },
                     };
                     let outcome = resolution.outcome();
+                    self.record_host(HostEvent::ApprovalResolved {
+                        call_id: call.id.clone(),
+                        outcome,
+                    })
+                    .await?;
                     self.outlets.sink.event(&Event::ApprovalResolved {
                         at: Timestamp::now(),
                         call_id: call.id.clone(),
@@ -331,10 +346,33 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
             }
         }
         self.flush_session().await?;
-        match self.machine {
+        match mem::replace(&mut self.machine, Machine::Transient) {
             Machine::Closed(turn) => Ok(turn),
             _ => unreachable!("循环只在机器收场后退出"),
         }
+    }
+
+    /// 把中止原因写进审计记录。写失败不能掩盖真正的错误。
+    async fn record_failure(&mut self, err: &AgentError) {
+        let Some(session) = self.outlets.session.as_mut() else {
+            return;
+        };
+        let note = HostEvent::Failed {
+            cause: err.to_string(),
+        };
+        let written = session.append_host(Timestamp::now(), &note).await;
+        if written.is_ok() {
+            let _ = session.flush().await;
+        }
+        debug_assert!(written.is_ok(), "记录中止原因时写盘失败");
+    }
+
+    /// 追加一条宿主审计记录（审批问询/决定）。与 core 记录同样先落盘再上报。
+    async fn record_host(&mut self, event: HostEvent) -> Result<(), AgentError> {
+        if let Some(session) = self.outlets.session.as_mut() {
+            session.append_host(Timestamp::now(), &event).await?;
+        }
+        Ok(())
     }
 
     /// 机器动作 → 落盘 / 事件上报 / 等待目标；工具调用在这里就地决议。
@@ -363,7 +401,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                     let request = self.ports.requests.build(self.machine.log());
                     self.state = Waiting::AwaitingModel { request };
                 }
-                Action::RunTool(call) => self.dispatch_tool(call),
+                Action::RunTool(call) => self.dispatch_tool(call).await?,
             }
         }
         Ok(())
@@ -377,8 +415,8 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         Ok(())
     }
 
-    /// 门禁折叠 → 放行 / 审批挂起 / 合成拒绝。
-    fn dispatch_tool(&mut self, call: ToolCall) {
+    /// 门禁折叠 → 放行 / 审批挂起 / 合成拒绝。审批问询与回绝都先落审计。
+    async fn dispatch_tool(&mut self, call: ToolCall) -> Result<(), AgentError> {
         match self.ports.extensions.gate(&call) {
             Gate::Allow => {
                 self.machine.tool_started(&call.id);
@@ -388,6 +426,11 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
             Gate::Ask => {
                 let Some(channel) = self.ports.approvals else {
                     // 没接审批口 = 没有答覆者 = 拒绝（fail-closed）。
+                    self.record_host(HostEvent::ApprovalResolved {
+                        call_id: call.id.clone(),
+                        outcome: ApprovalOutcome::Unavailable,
+                    })
+                    .await?;
                     self.deny_tool(
                         call,
                         Denied {
@@ -396,7 +439,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                                 .into(),
                         },
                     );
-                    return;
+                    return Ok(());
                 };
                 let (reply, answer) = tokio::sync::oneshot::channel::<bool>();
                 let request = ApprovalRequest {
@@ -406,6 +449,11 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                     reply,
                 };
                 if let Err(closed) = channel.send(request) {
+                    self.record_host(HostEvent::ApprovalResolved {
+                        call_id: call.id.clone(),
+                        outcome: ApprovalOutcome::Unavailable,
+                    })
+                    .await?;
                     self.deny_tool(
                         call,
                         Denied {
@@ -413,8 +461,13 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                             reason: format!("the approval channel was closed: {closed}"),
                         },
                     );
-                    return;
+                    return Ok(());
                 }
+                self.record_host(HostEvent::ApprovalRequested {
+                    call_id: call.id.clone(),
+                    tool: call.name.clone(),
+                })
+                .await?;
                 self.ports
                     .extensions
                     .observe(&Notice::Asked { call: &call });
@@ -429,6 +482,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                 };
             }
         }
+        Ok(())
     }
 
     /// 以一次合成拒绝推进机器：先让插件观察、再上报宿主，随后 tool_start

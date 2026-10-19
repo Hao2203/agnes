@@ -1,5 +1,6 @@
 //! Wire types for the OpenAI chat-completions API and mapping to core types.
 
+use agnes_core::config::ModelName;
 use agnes_core::content::Content;
 use agnes_core::llm::{LlmRequest, LlmResponse, StopReason};
 use agnes_core::message::{
@@ -192,7 +193,7 @@ pub struct WireUsage {
 }
 
 impl ChatCompletionResponse {
-    pub fn into_core(self) -> Result<LlmResponse, LlmError> {
+    pub fn into_core(self, model: ModelName) -> Result<LlmResponse, LlmError> {
         let choice = self
             .choices
             .into_iter()
@@ -244,6 +245,7 @@ impl ChatCompletionResponse {
             }
         };
         Ok(LlmResponse {
+            model,
             stop_reason,
             usage: self
                 .usage
@@ -290,6 +292,10 @@ mod tests {
 
     fn content(text: &str) -> Content {
         Content::try_from(text).unwrap()
+    }
+
+    fn model() -> ModelName {
+        ModelName::from_str("test-model").unwrap()
     }
 
     #[test]
@@ -373,7 +379,8 @@ mod tests {
             "some_future_field": true
         }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
-        let response = parsed.into_core().unwrap();
+        let response = parsed.into_core(model()).unwrap();
+        assert_eq!(response.model, model());
         assert_eq!(
             response.usage,
             TokenUsage {
@@ -406,7 +413,7 @@ mod tests {
             }]
         }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
-        let response = parsed.into_core().unwrap();
+        let response = parsed.into_core(model()).unwrap();
         let StopReason::ToolUse { content, calls } = &response.stop_reason else {
             panic!("expected ToolUse");
         };
@@ -420,7 +427,7 @@ mod tests {
             r#"{ "choices": [{ "message": { "content": null }, "finish_reason": "stop" }] }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
-            parsed.into_core(),
+            parsed.into_core(model()),
             Err(LlmError::Malformed { .. })
         ));
 
@@ -428,7 +435,7 @@ mod tests {
             r#"{ "choices": [{ "message": { "content": "   " }, "finish_reason": "stop" }] }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
-            parsed.into_core(),
+            parsed.into_core(model()),
             Err(LlmError::Malformed { .. })
         ));
     }
@@ -439,7 +446,7 @@ mod tests {
             r#"{ "choices": [{ "message": { "content": null }, "finish_reason": "tool_calls" }] }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
-            parsed.into_core(),
+            parsed.into_core(model()),
             Err(LlmError::Malformed { .. })
         ));
     }
@@ -449,7 +456,7 @@ mod tests {
         let body =
             r#"{ "choices": [{ "message": { "content": null }, "finish_reason": "length" }] }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
-        let response = parsed.into_core().unwrap();
+        let response = parsed.into_core(model()).unwrap();
         assert_eq!(
             response.stop_reason,
             StopReason::LengthExceeded { content: None }
@@ -460,7 +467,7 @@ mod tests {
     fn no_choices_is_malformed() {
         let parsed: ChatCompletionResponse = serde_json::from_str(r#"{"choices": []}"#).unwrap();
         assert!(matches!(
-            parsed.into_core(),
+            parsed.into_core(model()),
             Err(LlmError::Malformed { .. })
         ));
     }
@@ -471,7 +478,7 @@ mod tests {
             r#"{ "choices": [{ "message": { "content": "x" }, "finish_reason": "wednesday" }] }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
-            parsed.into_core(),
+            parsed.into_core(model()),
             Err(LlmError::Malformed { .. })
         ));
     }

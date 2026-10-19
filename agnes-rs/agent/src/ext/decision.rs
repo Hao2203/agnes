@@ -54,22 +54,6 @@ pub struct Blocked {
     pub feedback: String,
 }
 
-/// 审批结果。fail-closed：只有 [`ApprovalOutcome::AllowedOnce`] 放行。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalOutcome {
-    /// 明确批准一次。
-    AllowedOnce,
-    /// 审批者明确拒绝。
-    Rejected,
-    /// 等待被撤销（运行被打断）。
-    Cancelled,
-    /// 没有可用的审批者：未接线、通道关闭、答覆消失或超时。
-    Unavailable,
-}
-
-impl ApprovalOutcome {
-    /// 唯一的放行值。
-    pub fn allows(self) -> bool {
-        matches!(self, Self::AllowedOnce)
-    }
-}
+/// 审批结果。词汇定义在 `agnes_io::session`（它同时是耐久记录的格式），
+/// 这里只做再导出，插件与驱动的 import 不变。
+pub use agnes_io::session::ApprovalOutcome;

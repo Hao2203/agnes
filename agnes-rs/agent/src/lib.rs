@@ -159,7 +159,7 @@ pub fn step_budget(max_steps: u32) -> Option<agnes_core::config::StepBudget> {
 mod tests {
     use super::*;
     use crate::approval::ApprovalChannel;
-    use crate::ext::{Notice, Plugin, Settlement};
+    use crate::ext::{ApprovalOutcome, Notice, Plugin, Settlement};
     use crate::permission::{PermissionPlugin, Rule};
     use agnes_core::config::{StepBudget, SystemPrompt};
     use agnes_core::header::{Environment, Header};
@@ -168,6 +168,7 @@ mod tests {
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
     use agnes_io::input::{Input as InputPort, NoInput};
     use agnes_io::llm::Llm;
+    use agnes_io::session::HostEvent;
     use agnes_io::tool::Tool;
     use agnes_util::NonEmpty;
     use async_trait::async_trait;
@@ -275,6 +276,7 @@ mod tests {
 
     fn response(stop_reason: StopReason) -> LlmResponse {
         LlmResponse {
+            model: model(),
             stop_reason,
             usage: TokenUsage {
                 input: 1,
@@ -416,9 +418,10 @@ mod tests {
         assert!(summary.pending_user_messages.is_empty());
     }
 
-    /// 记录落盘事件与 flush 次数的会话日志。
+    /// 记录落盘事件、审计记录与 flush 次数的会话日志。
     struct RecordingSession {
         events: Arc<Mutex<Vec<CoreEvent>>>,
+        notes: Arc<Mutex<Vec<HostEvent>>>,
         flushes: Arc<Mutex<usize>>,
     }
 
@@ -430,6 +433,15 @@ mod tests {
             event: &CoreEvent,
         ) -> Result<(), agnes_io::session::SessionError> {
             self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        async fn append_host(
+            &mut self,
+            _at: jiff::Timestamp,
+            event: &HostEvent,
+        ) -> Result<(), agnes_io::session::SessionError> {
+            self.notes.lock().unwrap().push(event.clone());
             Ok(())
         }
 
@@ -453,9 +465,11 @@ mod tests {
             .unwrap();
 
         let events = Arc::new(Mutex::new(Vec::new()));
+        let notes = Arc::new(Mutex::new(Vec::new()));
         let flushes = Arc::new(Mutex::new(0));
         let mut session = RecordingSession {
             events: Arc::clone(&events),
+            notes: Arc::clone(&notes),
             flushes: Arc::clone(&flushes),
         };
 
@@ -470,6 +484,93 @@ mod tests {
         assert_eq!(events.lock().unwrap().len(), summary.log.events().len());
         // 每个模型调用前 + 收场各一次
         assert!(*flushes.lock().unwrap() >= 2);
+    }
+
+    #[tokio::test]
+    async fn approval_decisions_are_persisted_as_audit_notes() {
+        let (approval, mut questions) = ApprovalChannel::channel(None);
+        let recorder = Arc::new(Recorder::new());
+        let llm = ScriptedLlm::new(vec![
+            response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
+            response(completed("done")),
+        ]);
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .plugin(PermissionPlugin::new(
+                vec![],
+                vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            ))
+            .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+            .approvals(Some(&approval))
+            .build()
+            .unwrap();
+
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let mut session = RecordingSession {
+            events: Arc::new(Mutex::new(Vec::new())),
+            notes: Arc::clone(&notes),
+            flushes: Arc::new(Mutex::new(0)),
+        };
+        let reviewer = tokio::spawn(async move {
+            let question = questions.recv().await.expect("the question arrives");
+            question.reply.send(true).expect("the approval is sent");
+        });
+
+        let mut sink = Collector(Vec::new());
+        host.run(config(8), &mut sink, Some(&mut session))
+            .await
+            .unwrap();
+        reviewer.await.unwrap();
+
+        let notes = notes.lock().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(matches!(
+            &notes[0],
+            HostEvent::ApprovalRequested { tool, .. } if tool.as_str() == "note"
+        ));
+        assert!(matches!(
+            &notes[1],
+            HostEvent::ApprovalResolved {
+                outcome: ApprovalOutcome::AllowedOnce,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_records_its_cause() {
+        struct Broken;
+        #[async_trait]
+        impl Llm for Broken {
+            async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+                Err(LlmError::Api {
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    detail: "down".to_owned(),
+                })
+            }
+        }
+
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let mut session = RecordingSession {
+            events: Arc::new(Mutex::new(Vec::new())),
+            notes: Arc::clone(&notes),
+            flushes: Arc::new(Mutex::new(0)),
+        };
+        let llm = Broken;
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .build()
+            .unwrap();
+
+        let err = host
+            .run(config(4), &mut Collector(Vec::new()), Some(&mut session))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Llm(_)));
+
+        let notes = notes.lock().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(matches!(&notes[0], HostEvent::Failed { cause } if cause.contains("down")));
     }
 
     #[tokio::test]

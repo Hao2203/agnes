@@ -241,7 +241,11 @@ impl Turn<AwaitingMessage> {
             mut core,
             phase: AwaitingMessage { step },
         } = self;
-        let LlmResponse { stop_reason, usage } = response;
+        let LlmResponse {
+            model,
+            stop_reason,
+            usage,
+        } = response;
         core.usage = core.usage.saturating_add(usage);
         let stop = stop_reason.clone();
         match stop_reason {
@@ -251,7 +255,12 @@ impl Turn<AwaitingMessage> {
                         content,
                         calls: calls.clone(),
                     })),
-                    Event::MessageEnd { step, stop, usage },
+                    Event::MessageEnd {
+                        step,
+                        model,
+                        stop,
+                        usage,
+                    },
                 ]);
                 let mut tools = AwaitingTools {
                     step,
@@ -271,7 +280,12 @@ impl Turn<AwaitingMessage> {
                 let reply = content.clone();
                 core.note(vec![
                     Event::Message(Message::Assistant(AssistantMessage::Text(content))),
-                    Event::MessageEnd { step, stop, usage },
+                    Event::MessageEnd {
+                        step,
+                        model,
+                        stop,
+                        usage,
+                    },
                     Event::StepEnd {
                         step,
                         outcome: StepOutcome::Answered {
@@ -316,7 +330,12 @@ impl Turn<AwaitingMessage> {
                         content,
                     ))));
                 }
-                events.push(Event::MessageEnd { step, stop, usage });
+                events.push(Event::MessageEnd {
+                    step,
+                    model,
+                    stop,
+                    usage,
+                });
                 events.push(Event::StepEnd {
                     step,
                     outcome: StepOutcome::LengthExceeded,
@@ -578,6 +597,7 @@ mod tests {
 
     fn response(stop_reason: StopReason) -> LlmResponse {
         LlmResponse {
+            model: crate::config::ModelName::from_str("test-model").unwrap(),
             stop_reason,
             usage: usage(),
         }

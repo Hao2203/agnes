@@ -4,7 +4,7 @@
 //! (tokio) today or any other async transport tomorrow.
 pub mod wire;
 
-use agnes_core::config::{ApiKey, BaseUrl};
+use agnes_core::config::{ApiKey, BaseUrl, ModelName};
 use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_io::http::{HttpTransport, TransportError};
 use agnes_io::llm::{Llm, LlmError};
@@ -43,6 +43,7 @@ impl<T: HttpTransport> OpenAiClient<T> {
 
     fn parse_response(
         &self,
+        model: ModelName,
         status: http::StatusCode,
         body: &str,
     ) -> Result<LlmResponse, LlmError> {
@@ -56,7 +57,7 @@ impl<T: HttpTransport> OpenAiClient<T> {
             serde_json::from_str(body).map_err(|e| LlmError::Malformed {
                 detail: format!("invalid JSON: {e}"),
             })?;
-        parsed.into_core()
+        parsed.into_core(model)
     }
 }
 
@@ -65,7 +66,11 @@ impl<T: HttpTransport> Llm for OpenAiClient<T> {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let http_request = self.build_request(request)?;
         let http_response = self.transport.send(http_request).await?;
-        self.parse_response(http_response.status(), http_response.body())
+        self.parse_response(
+            request.model.clone(),
+            http_response.status(),
+            http_response.body(),
+        )
     }
 }
 
