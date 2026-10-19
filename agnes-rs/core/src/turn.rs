@@ -258,10 +258,7 @@ impl Turn<AwaitingMessage> {
                     core.actions.push_back(Action::RunTool(call));
                 }
                 MessageReplied::Tools {
-                    turn: Turn {
-                        core,
-                        phase: tools,
-                    },
+                    turn: Turn { core, phase: tools },
                 }
             }
             StopReason::Completed { content } => {
@@ -365,7 +362,10 @@ impl Turn<AwaitingTools> {
     /// 下一个 step（插话在此生效），可能预算耗尽收场。未知 id 被忽略
     /// （原样交还，不加事件）。
     pub fn tool_finished(self, call_id: ToolCallId, output: ToolOutput) -> ToolsAdvanced {
-        let Turn { mut core, mut phase } = self;
+        let Turn {
+            mut core,
+            mut phase,
+        } = self;
         if !phase.calls.iter().any(|call| call.id == call_id) {
             return ToolsAdvanced::Ongoing {
                 turn: Turn { core, phase },
@@ -513,7 +513,10 @@ fn begin_step(core: &mut Core) -> AwaitingMessage {
     let number = core.steps_started + 1;
     core.steps_started = number;
     let step = StepNumber::new(NonZeroU32::new(number).expect("step count fits a u32"));
-    core.note(vec![Event::StepStart { step }, Event::MessageStart { step }]);
+    core.note(vec![
+        Event::StepStart { step },
+        Event::MessageStart { step },
+    ]);
     core.actions.push_back(Action::CallModel);
     AwaitingMessage { step }
 }
@@ -641,8 +644,8 @@ mod tests {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
 
-        let MessageReplied::Tools { mut turn } = turn
-            .model_responded(response(tool_use(vec![call("c1"), call("c2")])))
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
         };
@@ -653,8 +656,8 @@ mod tests {
 
         // 第一个结果落位之前，第二个调用不派发
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::Ongoing { mut turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::Ongoing { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected Ongoing");
         };
@@ -675,8 +678,8 @@ mod tests {
         let _ = drain(&mut turn);
 
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::NextStep { mut turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected NextStep");
         };
@@ -703,11 +706,16 @@ mod tests {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
 
-        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done it"))) else {
+        let MessageReplied::Closed { mut turn } =
+            turn.model_responded(response(completed("done it")))
+        else {
             panic!("expected Closed");
         };
         let (shapes, calls, tools) = drain(&mut turn);
-        assert_eq!(shapes, vec!["message", "message_end", "step_end", "turn_end"]);
+        assert_eq!(
+            shapes,
+            vec!["message", "message_end", "step_end", "turn_end"]
+        );
         assert_eq!(calls, 0);
         assert!(tools.is_empty());
         assert_eq!(
@@ -730,8 +738,8 @@ mod tests {
         };
         let _ = drain(&mut turn);
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::Closed { mut turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::Closed { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected Closed");
         };
@@ -762,8 +770,8 @@ mod tests {
         assert!(drain(&mut turn).0.is_empty());
 
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::NextStep { mut turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected NextStep");
         };
@@ -791,7 +799,8 @@ mod tests {
             Message::User { content } if content.as_str() == "also check the tests"
         ));
         // 所有插话已生效，缓冲空了 —— 收场后由 take_unapplied 验证
-        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("ok"))) else {
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("ok")))
+        else {
             panic!("expected Closed");
         };
         assert!(turn.take_unapplied_user_messages().is_empty());
@@ -850,8 +859,8 @@ mod tests {
         let _ = drain(&mut turn);
 
         turn.tool_started(&ToolCallId::new("nope"));
-        let ToolsAdvanced::Ongoing { mut turn } = turn
-            .tool_finished(ToolCallId::new("nope"), ToolOutput::success("x"))
+        let ToolsAdvanced::Ongoing { mut turn } =
+            turn.tool_finished(ToolCallId::new("nope"), ToolOutput::success("x"))
         else {
             panic!("expected Ongoing");
         };
@@ -862,12 +871,14 @@ mod tests {
 
         // 状态未被扰动：真实结果照常落位
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::NextStep { turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::NextStep { turn } = turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected NextStep");
         };
-        assert_eq!(shape(turn.context().events()).last(), Some(&"message_start"));
+        assert_eq!(
+            shape(turn.context().events()).last(),
+            Some(&"message_start")
+        );
     }
 
     #[test]
@@ -881,13 +892,14 @@ mod tests {
         };
         let _ = drain(&mut turn);
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::NextStep { mut turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected NextStep");
         };
         let _ = drain(&mut turn);
-        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done"))) else {
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done")))
+        else {
             panic!("expected Closed");
         };
         let _ = drain(&mut turn);
@@ -907,7 +919,8 @@ mod tests {
         let mut turn = Turn::start(config(4));
         let _ = drain(&mut turn);
         turn.user_message(content("too late"));
-        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done"))) else {
+        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done")))
+        else {
             panic!("expected Closed");
         };
         let _ = drain(&mut turn);
@@ -932,13 +945,15 @@ mod tests {
         };
         let _ = drain(&mut turn);
         turn.tool_started(&ToolCallId::new("c1"));
-        let ToolsAdvanced::NextStep { mut turn } = turn
-            .tool_finished(ToolCallId::new("c1"), output())
+        let ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
         else {
             panic!("expected NextStep");
         };
         let _ = drain(&mut turn);
-        let MessageReplied::Closed { mut turn } = turn.model_responded(response(completed("done it"))) else {
+        let MessageReplied::Closed { mut turn } =
+            turn.model_responded(response(completed("done it")))
+        else {
             panic!("expected Closed");
         };
         let _ = drain(&mut turn);

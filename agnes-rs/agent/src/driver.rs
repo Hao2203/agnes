@@ -236,20 +236,22 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                         Some(output) => {
                             // 结果折叠：插件可以在入账前挡回，反馈仍是一条
                             // 错误结果 —— 调用/结果始终一一对应。
-                            let output =
-                                if let Some(blocked) = self.ports.extensions.settle(&call, &output) {
-                                    self.ports.extensions.observe(&Notice::Blocked {
-                                        call: &call,
-                                        by: blocked.by,
-                                        feedback: &blocked.feedback,
-                                    });
-                                    ToolOutput::error(blocked.feedback)
-                                } else {
-                                    self.ports
-                                        .extensions
-                                        .observe(&Notice::Ran { call: &call, output: &output });
-                                    output
-                                };
+                            let output = if let Some(blocked) =
+                                self.ports.extensions.settle(&call, &output)
+                            {
+                                self.ports.extensions.observe(&Notice::Blocked {
+                                    call: &call,
+                                    by: blocked.by,
+                                    feedback: &blocked.feedback,
+                                });
+                                ToolOutput::error(blocked.feedback)
+                            } else {
+                                self.ports.extensions.observe(&Notice::Ran {
+                                    call: &call,
+                                    output: &output,
+                                });
+                                output
+                            };
                             self.transition(|machine| machine.tool_finished(call.id, output));
                         }
                     }
@@ -301,9 +303,10 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                         call_id: call.id.clone(),
                         outcome,
                     });
-                    self.ports
-                        .extensions
-                        .observe(&Notice::Decided { call: &call, outcome });
+                    self.ports.extensions.observe(&Notice::Decided {
+                        call: &call,
+                        outcome,
+                    });
                     match resolution {
                         Resolution::Interrupted => {
                             self.transition(Machine::interrupted);
@@ -431,9 +434,10 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     /// 以一次合成拒绝推进机器：先让插件观察、再上报宿主，随后 tool_start
     /// + 失败结果落位 —— 模型看得见拒绝并自行调整。
     fn deny_tool(&mut self, call: ToolCall, denied: Denied) {
-        self.ports
-            .extensions
-            .observe(&Notice::Gated { call: &call, denied: &denied });
+        self.ports.extensions.observe(&Notice::Gated {
+            call: &call,
+            denied: &denied,
+        });
         self.outlets.sink.event(&Event::ToolGated {
             at: Timestamp::now(),
             call: call.clone(),

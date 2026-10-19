@@ -4,9 +4,10 @@
 //! access ([`llm::Llm`]), tools ([`tool::Tool`]), raw HTTP
 //! ([`http::HttpTransport`]), the user's out-of-band actions while a run
 //! executes ([`input::Input`]), and the durable session log
-//! ([`session::SessionLog`]). All seams are async and `Send + Sync`, so any
-//! async runtime can drive them; swapping runtimes means swapping the
-//! implementations (see `agnes-transport-reqwest`), never `agnes-core`.
+//! ([`session::SessionLog`]). Seams are async and `Send`; most are also
+//! `Sync` — the session log is not, because a session has a single writer.
+//! Swapping runtimes means swapping the implementations (see
+//! `agnes-transport-reqwest`), never `agnes-core`.
 
 pub mod http;
 pub mod input;

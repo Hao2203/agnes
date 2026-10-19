@@ -1,10 +1,12 @@
-//! 审批服务：系统自有的问询基础设施。
+//! 审批服务：宿主自有的问询基础设施。
 //!
-//! 插件只发 [`Command::Ask`](crate::plugin::Command::Ask) 指令；驱动按照
-//! 本服务发问询（每问询自带一条 oneshot 答覆通道）、挂起等待
-//! （可选超时）、按答覆执行——审批的 IO 与等待全部在宿主侧，
-//! core 与插件都不需要知道"等审批"的细节。问询是尽力而为的：
-//! 通道被关闭、`reply` 被丢弃、超时，都会按拒绝（fail-closed）落定。
+//! 插件的门禁只需表达「要审批」（[`crate::ext::Verdict::Ask`]）；驱动按
+//! 本服务发问询（每次问询自带一条 oneshot 答覆通道）、挂起等待（可选
+//! 超时）、按答覆落定 —— 审批的 IO 与等待全部在宿主侧，core 与插件都
+//! 不需要知道「等审批」的细节。
+//!
+//! 落定词汇是 fail-closed 的：[`ApprovalOutcome`] 只有 `AllowedOnce`
+//! 放行；通道被关闭、`reply` 被丢弃、超时、运行被打断，都按拒绝落定。
 
 use agnes_core::message::{ToolArguments, ToolCallId};
 use agnes_core::tool::ToolName;

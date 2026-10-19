@@ -13,6 +13,11 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
   `turn_end`）全程记入 `Context` 的事件日志，消息本身也是事件，
   完整顺序随时可复原
+- 宿主扩展内核：门禁 / 结果 / 观察三类类型化钩子，拒绝单调
+  （插件无法把拒绝变回放行），注册可回收，装载期校验配置
+- 工具调用可走审批流：`allowed-once | rejected | cancelled | unavailable`，
+  没接审批口即拒绝（fail-closed）
+- 会话日志可落盘：JSONL、单写者、崩溃后补写收尾（绝不重写已有记录）
 - 端口与适配器分离：`core` 无 I/O、无异步，替换运行时只需更换适配器
 - 边界处一次性解析：模型名、URL、API key、工具名等都是强类型
 - 秘密保护：API key 由 `secrecy` 承载，调试输出不泄露明文
@@ -21,7 +26,7 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 ## 快速开始
 
-需要 Rust 1.85+（edition 2024）。
+需要 Rust 1.89+（edition 2024）。
 
 ```bash
 cd agnes-rs
@@ -69,10 +74,19 @@ agnes> exit
 
 会话中每一行都是一个任务，且共享完整会话记忆：
 
-- `/new`：清空此前对话（保留系统提示），开始全新会话
+带 `--session` 时会话落盘，重启后用同一路径即可恢复（崩溃留下的未收尾
+事件会被自动补写）：
+
+```bash
+agnes chat --session ./notes/session.jsonl
+```
+
+- `/new`：清空此前对话（保留系统提示）；带 `--session` 时轮转到新的兄弟
+  文件，因为日志只追加
 - `exit`、`quit` 或 EOF：退出会话
 - `Ctrl-C`：任务运行中中断任务并保留会话；在提示符处则退出
 - 运行期间输入的消息会排队，在下一批工具调用结束后注入
+- 需要审批的工具在终端询问 `[y] once / [n] reject / [a] always this session`
 
 ### 命令行选项
 
@@ -83,8 +97,16 @@ agnes> exit
 | `--model <MODEL>` | `gpt-4o-mini` | 模型名称 |
 | `--base-url <URL>` | `https://api.openai.com/v1` | OpenAI 兼容 API 地址 |
 | `--api-key <KEY>` | 见环境变量 | API 密钥 |
-| `--max-turns <N>` | `32` | 每个任务的最大模型轮次 |
+| `--max-steps <N>` | `32` | 每个任务的最大模型轮次 |
 | `--allow-shell` | 关闭 | 向模型提供 `run_shell` 工具 |
+| `--session <PATH>` | 关闭 | chat 的会话文件：存在即恢复，不存在即新建 |
+| `--yes` | 关闭 | 不启用 ask 规则（需要审批的工具直接执行） |
+| `--deny <TOOL>` | 无 | 拒绝工具：`name` 精确匹配，`prefix*` 前缀匹配，可重复 |
+
+默认策略：`run_shell`（仅在启用 `--allow-shell` 时）每次执行前在终端询问
+`[y] once / [n] reject / [a] always this session`；拒绝会作为一次失败的
+工具结果反馈给模型。带 `--session` 时，`/new` 会轮转到下一个空闲的兄弟
+文件 —— 日志只追加，从不重写。
 
 ### 环境变量
 
@@ -114,43 +136,52 @@ agnes> exit
 
 ```text
 util ← core ← io ← agent ← cli
+               ↖ session-file
 ```
 
-`agnes-transport-reqwest` 与 `agnes-llm-openai` 是挂在 `io` 之上的
-适配器；只有 `agnes-cli` 负责把具体实现组装成可运行的程序。
+`agnes-transport-reqwest`、`agnes-llm-openai` 与 `agnes-session-file` 是挂在
+`io` 之上的适配器；只有 `agnes-cli` 负责把具体实现组装成可运行的程序。
 
 | crate | 职责 |
 | --- | --- |
 | `agnes-util` | 零依赖基础类型：`NonEmpty<T>`、`EmptyError` |
 | `agnes-core` | 纯领域模型与类型状态机，无 I/O、无异步 |
-| `agnes-io` | 异步端口 trait：`Llm`、`Tool`、`HttpTransport`、`Input` |
+| `agnes-io` | 异步端口 trait：`Llm`、`Tool`、`HttpTransport`、`Input`、`SessionLog` |
 | `agnes-llm-openai` | OpenAI Chat Completions 协议适配，泛型于传输层 |
 | `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器 |
-| `agnes-agent` | 异步驱动器、事件流与内置工具 |
-| `agnes-cli` | 二进制 `agnes`：参数解析、REPL 与会话管理 |
+| `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写 |
+| `agnes-agent` | 宿主装配（`Host`）、驱动状态机、扩展内核与内置工具 |
+| `agnes-cli` | 二进制 `agnes`：参数解析、REPL、审批与终端渲染 |
 
 ### 关键设计
 
-- **类型状态机**：`Agent<Ready>` → `Agent<AwaitingModel>` →
-  `Agent<AwaitingTools>` → `Agent<Finished>`；一个 task 由多轮
-  `turn` 组成（`Turn<Generating>` → `Turn<Executing>` →
-  `Turn<Ended>`）。每次转移消耗当前状态、把发生的事写进 `Context`
-  （消息与生命周期事件），并返回下一个状态与该转移产生的 `Events`。
-- **端口与适配器**：`Llm`、`Tool`、`HttpTransport`、`Input` 都是
-  `async_trait` 端口；`OpenAiClient<T: HttpTransport>` 不绑定具体传输。
+- **类型状态机**：`Turn<AwaitingMessage>` → `Turn<AwaitingTools>` →
+  `Turn<Closed>`；转移消耗当前状态，把发生的事写进 `Context`（消息与
+  生命周期事件），并返回下一个状态。动态状态只存在于宿主驱动。
+- **宿主扩展内核**：`Plugin` 用类型化钩子表态 —— 门禁（`gate`，只能
+  拒绝或要求审批，`Allow` 不可表达）、结果折叠（`settle`，挡回并以反馈
+  替换）、只读观察（`observe`）。折叠取最强结果，注册顺序因此无法把
+  拒绝变回放行；长期注册拿 `Registration`，临时注册用 `Scope`（离开
+  作用域逆序撤销）。
+- **装载期校验**：`Bundle::install` 在装配时检查规则能否命中已注册工具、
+  配了 ask 是否真的接了审批口；配置错误在启动时失败，而不是第一次调用。
+- **端口与适配器**：`Llm`、`Tool`、`HttpTransport`、`Input`、`SessionLog`
+  都是 `async_trait` 端口；`OpenAiClient<T: HttpTransport>` 不绑定具体传输。
 - **非法状态不可表示**：`StopReason::ToolUse` 携带非空的
   `NonEmpty<ToolCall>`，`Content` 保证非空，`ApiKey` 由 `secrecy`
-  承载，错误类型不携带字符串载荷。
-- **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型；
-  只有模型或传输错误会中止运行。
+  承载，`ApprovalOutcome` 只有 `AllowedOnce` 会放行。
+- **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型（拒绝、
+  挡回、超时同样如此）；只有模型或传输错误会中止运行。
 - **Context 即账本**：系统提示、环境（tools）以及一条按发生顺序记录
   的事件日志；消息也是事件（`Event::Message`），因此任意时刻的完整顺序
   都能从 `Context::events()` 复原。`RunSummary.context` 可直接传回
-  下一次运行；`/new` 调用 `Context::reset()` 清空日志。
+  下一次运行。
+- **日志耐久**：每个上报事件先追加到会话文件、再上报宿主；每个模型请求
+  前与收场时 `flush`（fsync）。恢复时校验 `seq` 连续性与头信息，并
+  **补写**未收尾的 step/turn（与 `Turn::interrupted` 同形），从不重写
+  已有记录。
 - **转换者由宿主决定**：`core` 不组装提示词；驱动器在每次模型调用前用
-  宿主的 `RequestBuilder` 把 `Context` 转成 `LlmRequest`，提示词怎么构造
-  完全由实现决定（`Prompt::from_context` 是标准投影，
-  `StandardRequestBuilder` 是现成实现）。
+  宿主的 `RequestBuilder` 把 `Context` 转成 `LlmRequest`。
 - **两阶段可中断**：等待模型消息与等待工具执行都能被打断，且都会以
   `turn_end` 收尾——工具阶段必须补齐每个调用的结果。
 

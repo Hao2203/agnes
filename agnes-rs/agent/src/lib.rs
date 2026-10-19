@@ -1,13 +1,14 @@
-//! 驱动器：宿主状态机（[`driver`]）解释 [`agnes_core::turn`] 状态机产生
-//! 的动作 —— 管理事件队列、指令队列、输入输出与等待状态。
+//! 驱动器：宿主状态机（私有模块 `driver`）解释 [`agnes_core::turn`] 状态机
+//! 产生的动作 —— 就地处理动作、管理等待点与输入输出。
 //!
-//! 机器是类型状态的（阶段即类型）；这个 crate 做 IO —— 通过
-//! `agnes-io` 的异步接缝 —— 把结果经对应阶段的方法喂回机器，一路用
-//! [`Event`] 上报发生的事。运行时（tokio、smol、…）由宿主的执行器与
-//! 传输层选择，与本 crate 无关。
+//! 机器是类型状态的（阶段即类型）；这个 crate 做 IO —— 通过 `agnes-io`
+//! 的异步接缝 —— 把结果经对应阶段的方法喂回机器，一路用 [`Event`] 上报
+//! 发生的事。运行时（tokio、smol、…）由宿主的执行器与传输层选择，与本
+//! crate 无关。
 //!
-//! 驱动从不自己组装提示词：[`RequestBuilder`] 是宿主的转换者，在每次
-//! 模型调用前由它把 Context 变成请求。
+//! 宿主用 [`Host`] 装配：模型、输入、工具、扩展内核、审批口与会话日志在
+//! 装载期一次性解析。驱动从不自己组装提示词：[`RequestBuilder`] 是宿主
+//! 的转换者，在每次模型调用前由它把 Context 变成请求。
 //!
 //! 工具执行前先过扩展内核（[`ext`]）：插件用类型化钩子表态（门禁 /
 //! 结果 / 观察），执行权在系统 —— 放行执行、拒绝则以合成失败结果推进
@@ -505,10 +506,11 @@ mod tests {
         let mut sink = Collector(Vec::new());
         let summary = host.run(config(8), &mut sink, None).await.unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
-        assert!(recorded(&sink.0).iter().any(|event| matches!(
-            event,
-            CoreEvent::ToolExecutionEnd { is_error: true, .. }
-        )));
+        assert!(
+            recorded(&sink.0)
+                .iter()
+                .any(|event| matches!(event, CoreEvent::ToolExecutionEnd { is_error: true, .. }))
+        );
     }
 
     #[tokio::test]
@@ -708,10 +710,7 @@ mod tests {
     async fn interrupt_during_a_model_call_stops_the_run() {
         let input = FakeInput::new();
         let llm = HangingLlm;
-        let mut host = Host::builder(&llm, &input)
-            .model(model())
-            .build()
-            .unwrap();
+        let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
         let mut sink = Collector(Vec::new());
         // 先让 run 到达挂起的模型调用，再打断
         let interrupter = async {
@@ -805,10 +804,7 @@ mod tests {
         // 最终答复期间敲进来的插话：边界未到，未生效
         input.queue("too late for this run");
         let llm = ScriptedLlm::new(vec![response(completed("all done"))]);
-        let mut host = Host::builder(&llm, &input)
-            .model(model())
-            .build()
-            .unwrap();
+        let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
 
         let mut sink = Collector(Vec::new());
         let summary = host.run(config(4), &mut sink, None).await.unwrap();
@@ -919,10 +915,11 @@ mod tests {
             matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. }
                 if output.is_error && output.content.contains("the note was rejected"))
         );
-        assert!(recorded(&sink.0).iter().any(|event| matches!(
-            event,
-            CoreEvent::ToolExecutionEnd { is_error: true, .. }
-        )));
+        assert!(
+            recorded(&sink.0)
+                .iter()
+                .any(|event| matches!(event, CoreEvent::ToolExecutionEnd { is_error: true, .. }))
+        );
         assert_eq!(*seen.lock().unwrap(), vec!["blocked"]);
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
     }
@@ -952,15 +949,15 @@ mod tests {
         // core 日志里是一次普通的失败工具
         let messages = messages_of(&summary.context);
         assert_eq!(messages.len(), 4);
-        assert!(
-            matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("denied by policy"))
-        );
+        assert!(matches!(&messages[2], Message::ToolResult { output, .. }
+                if output.is_error && output.content.contains("denied by policy")));
         // 宿主上报了 gating
-        assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ToolGated { denied, .. }
-                if denied.by == "permission" && denied.reason.contains("denied by policy"))
-        ));
+        assert!(
+            sink.0
+                .iter()
+                .any(|event| matches!(event, Event::ToolGated { denied, .. }
+                if denied.by == "permission" && denied.reason.contains("denied by policy")))
+        );
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
         // 事件序列与一次真实工具往返一致（core 视角无法区分拒绝）
         assert_eq!(
@@ -1060,13 +1057,15 @@ mod tests {
 
         assert!(recorder.calls.lock().unwrap().is_empty());
         let messages = messages_of(&summary.context);
-        assert!(
-            matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("denied by approval: the approval was refused"))
-        );
-        assert!(sink.0.iter().any(|event|
-            matches!(event, Event::ApprovalResolved { outcome: ApprovalOutcome::Rejected, .. })
-        ));
+        assert!(matches!(&messages[2], Message::ToolResult { output, .. }
+                if output.is_error && output.content.contains("denied by approval: the approval was refused")));
+        assert!(sink.0.iter().any(|event| matches!(
+            event,
+            Event::ApprovalResolved {
+                outcome: ApprovalOutcome::Rejected,
+                ..
+            }
+        )));
         assert!(sink.0.iter().any(|event|
             matches!(event, Event::ToolGated { denied, .. } if denied.reason.contains("the approval was refused"))
         ));
@@ -1108,21 +1107,23 @@ mod tests {
         assert_eq!(llm.requests().len(), 1); // 没有后续模型调用
         assert!(recorder.calls.lock().unwrap().is_empty());
         // 问询已记录，落定为未批
+        assert!(
+            sink.0
+                .iter()
+                .any(|event| matches!(event, Event::ApprovalRequested { .. }))
+        );
         assert!(sink.0.iter().any(|event| matches!(
             event,
-            Event::ApprovalRequested { .. }
-        )));
-        assert!(sink.0.iter().any(|event| matches!(
-            event,
-            Event::ApprovalResolved { outcome: ApprovalOutcome::Cancelled, .. }
+            Event::ApprovalResolved {
+                outcome: ApprovalOutcome::Cancelled,
+                ..
+            }
         )));
         // 合成错误结果补位，会话完整
         let messages = messages_of(&summary.context);
         assert_eq!(messages.len(), 3);
-        assert!(
-            matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("interrupted"))
-        );
+        assert!(matches!(&messages[2], Message::ToolResult { output, .. }
+                if output.is_error && output.content.contains("interrupted")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1154,7 +1155,10 @@ mod tests {
         ));
         assert!(sink.0.iter().any(|event| matches!(
             event,
-            Event::ApprovalResolved { outcome: ApprovalOutcome::Unavailable, .. }
+            Event::ApprovalResolved {
+                outcome: ApprovalOutcome::Unavailable,
+                ..
+            }
         )));
         // 模型继续走完
         assert_eq!(llm.requests().len(), 2);

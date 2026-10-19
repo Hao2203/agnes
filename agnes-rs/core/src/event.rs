@@ -106,7 +106,10 @@ mod tests {
                     content: None,
                     calls: NonEmpty::new(first_call),
                 },
-                usage: TokenUsage { input: 3, output: 4 },
+                usage: TokenUsage {
+                    input: 3,
+                    output: 4,
+                },
             },
             Event::ToolExecutionStart {
                 step,

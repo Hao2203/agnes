@@ -1,5 +1,5 @@
 //! Tool vocabulary: names, specs, and errors. Pure data — the async
-//! [`agnes_io::tool::Tool`] seam and registry live in `agnes-io`.
+//! `agnes_io::tool::Tool` seam and registry live in `agnes-io`.
 //!
 //! Names may be short and are cloned on every spec snapshot, so they wrap
 //! `ArcColdString` (inline when short, refcounted when long). Descriptions are

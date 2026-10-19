@@ -61,7 +61,9 @@ mod tests {
         let memory = Memory::default();
         let mut log: Box<dyn SessionLog> = Box::new(memory.clone());
 
-        log.append(Timestamp::now(), &Event::TurnStart).await.unwrap();
+        log.append(Timestamp::now(), &Event::TurnStart)
+            .await
+            .unwrap();
         log.flush().await.unwrap();
         log.append(
             Timestamp::now(),

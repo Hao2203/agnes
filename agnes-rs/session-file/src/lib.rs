@@ -436,11 +436,9 @@ mod tests {
     use agnes_core::content::Content;
     use agnes_core::context::Context;
     use agnes_core::llm::{LlmResponse, StopReason};
-    use agnes_core::message::{ToolArguments, TokenUsage};
+    use agnes_core::message::{TokenUsage, ToolArguments};
     use agnes_core::tool::{JsonSchema, ToolName, ToolSpec};
-    use agnes_core::turn::{
-        AgentConfig, AwaitingMessage, MessageReplied, ToolsAdvanced, Turn,
-    };
+    use agnes_core::turn::{AgentConfig, AwaitingMessage, MessageReplied, ToolsAdvanced, Turn};
     use agnes_util::NonEmpty;
     use std::num::NonZeroU32;
     use std::str::FromStr;
@@ -543,7 +541,10 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
-        session.append(Timestamp::now(), &Event::TurnStart).await.unwrap();
+        session
+            .append(Timestamp::now(), &Event::TurnStart)
+            .await
+            .unwrap();
         session
             .append(
                 Timestamp::now(),

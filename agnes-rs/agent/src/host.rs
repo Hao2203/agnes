@@ -52,7 +52,11 @@ impl fmt::Debug for Host<'_> {
         f.debug_struct("Host")
             .field(
                 "tools",
-                &self.tools.names().map(|name| name.as_str()).collect::<Vec<_>>(),
+                &self
+                    .tools
+                    .names()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>(),
             )
             .field("plugins", &self.extensions.names().collect::<Vec<_>>())
             .field("approvals", &self.approvals.is_some())
@@ -342,7 +346,10 @@ mod tests {
             .approvals(Some(&approval))
             .build()
             .unwrap();
-        assert_eq!(host.extensions().names().collect::<Vec<_>>(), ["permission"]);
+        assert_eq!(
+            host.extensions().names().collect::<Vec<_>>(),
+            ["permission"]
+        );
     }
 
     #[test]

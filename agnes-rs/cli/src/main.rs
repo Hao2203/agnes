@@ -257,13 +257,9 @@ async fn real_main() -> anyhow::Result<()> {
                                 let session = session_file
                                     .as_mut()
                                     .map(|file| file as &mut dyn SessionLog);
-                                host.run(
-                                    config,
-                                    &mut EventPrinter::new(model.clone()),
-                                    session,
-                                )
-                                .await
-                                .map_err(anyhow::Error::new)
+                                host.run(config, &mut EventPrinter::new(model.clone()), session)
+                                    .await
+                                    .map_err(anyhow::Error::new)
                             }
                             Err(err) => Err(err),
                         };
@@ -387,7 +383,10 @@ async fn open_session(
 
 /// 会话文件不可重写：`/new` 轮转到下一个空闲的兄弟文件。
 fn rotate(path: &Path) -> PathBuf {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("jsonl");
     (1..)
         .map(|n| path.with_file_name(format!("{stem}.{n}.{extension}")))
@@ -396,10 +395,7 @@ fn rotate(path: &Path) -> PathBuf {
 }
 
 /// 审批界面：问询期间读到的行不分类，直接作为答覆（空行 = 拒绝）。
-fn spawn_approver(
-    input: Arc<UserInput>,
-    mut questions: mpsc::UnboundedReceiver<ApprovalRequest>,
-) {
+fn spawn_approver(input: Arc<UserInput>, mut questions: mpsc::UnboundedReceiver<ApprovalRequest>) {
     tokio::spawn(async move {
         let mut always: HashSet<ToolName> = HashSet::new();
         while let Some(question) = questions.recv().await {
@@ -491,7 +487,11 @@ impl Sink for EventPrinter {
             }
             // 交互式审批 UI 还是后续工作；此处先可见问询与落定
             Event::ApprovalRequested { call, .. } => {
-                println!("  ⏳ waiting approval: {} {}", call.name, call.arguments.as_str());
+                println!(
+                    "  ⏳ waiting approval: {} {}",
+                    call.name,
+                    call.arguments.as_str()
+                );
             }
             Event::ApprovalResolved { outcome, .. } => {
                 if !outcome.allows() {

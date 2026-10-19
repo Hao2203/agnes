@@ -72,7 +72,11 @@ impl Extensions {
 
     /// 撤销一次注册；已经不在表里则返回 `false`。
     pub fn revoke(&mut self, registration: Registration) -> bool {
-        match self.slots.iter().position(|slot| slot.id == registration.id) {
+        match self
+            .slots
+            .iter()
+            .position(|slot| slot.id == registration.id)
+        {
             Some(at) => {
                 self.slots.remove(at);
                 true
