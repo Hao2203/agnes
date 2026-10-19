@@ -429,7 +429,7 @@ fn agent_config(goal: Content, context: Context, max_steps: u32) -> anyhow::Resu
     let budget: StepBudget = max_steps
         .to_string()
         .parse()
-        .context("invalid --max-turns")?;
+        .context("invalid --max-steps")?;
     Ok(AgentConfig {
         context,
         goal,
@@ -521,7 +521,7 @@ fn print_summary(summary: &agnes_agent::RunSummary) {
         }
         Outcome::BudgetExhausted => {
             println!();
-            println!("(stopped: step budget exhausted — raise --max-turns)");
+            println!("(stopped: step budget exhausted — raise --max-steps)");
         }
         Outcome::LengthExceeded => {
             println!();
