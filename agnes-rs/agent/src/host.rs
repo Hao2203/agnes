@@ -5,6 +5,7 @@
 //! 工具注册表与扩展内核，因此插件状态可以跨 turn 保留，工具也可以在
 //! 运行之间增删。
 
+use std::fmt;
 use std::sync::Arc;
 
 use agnes_core::config::ModelName;
@@ -17,7 +18,7 @@ use jiff::Timestamp;
 
 use crate::approval::ApprovalChannel;
 use crate::driver::{Driver, Ports};
-use crate::ext::{Extensions, Plugin};
+use crate::ext::{Bundle, Extensions, Plugin};
 use crate::{AgentError, Event, RunSummary, Sink, StandardRequestBuilder};
 
 /// 装载期的失败：自包含的配置错误在这里暴露。
@@ -25,6 +26,12 @@ use crate::{AgentError, Event, RunSummary, Sink, StandardRequestBuilder};
 pub enum LoadError {
     #[error("no model configured: set `model` or supply a request builder")]
     MissingModel,
+    /// 一条永远不可能命中的规则（工具名拼错、前缀无人匹配）。
+    #[error("bundle `{bundle}` has a rule that can never fire: {rule}")]
+    UnknownTool { bundle: &'static str, rule: String },
+    /// 配了 ask 规则，却没有接审批口 —— 运行期只会全部失败。
+    #[error("bundle `{bundle}` asks for approval, but no approval channel is wired")]
+    AskWithoutApprovals { bundle: &'static str },
     #[error(transparent)]
     DuplicateTool(#[from] DuplicateTool),
 }
@@ -37,6 +44,19 @@ pub struct Host<'a> {
     approvals: Option<&'a ApprovalChannel>,
     tools: ToolRegistry,
     extensions: Extensions,
+}
+
+impl fmt::Debug for Host<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Host")
+            .field(
+                "tools",
+                &self.tools.names().map(|name| name.as_str()).collect::<Vec<_>>(),
+            )
+            .field("plugins", &self.extensions.names().collect::<Vec<_>>())
+            .field("approvals", &self.approvals.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> Host<'a> {
@@ -141,6 +161,7 @@ pub struct HostBuilder<'a> {
     approvals: Option<&'a ApprovalChannel>,
     tools: Vec<Arc<dyn Tool>>,
     plugins: Vec<Box<dyn Plugin>>,
+    bundles: Vec<Box<dyn Bundle>>,
 }
 
 impl<'a> HostBuilder<'a> {
@@ -153,6 +174,7 @@ impl<'a> HostBuilder<'a> {
             approvals: None,
             tools: Vec::new(),
             plugins: Vec::new(),
+            bundles: Vec::new(),
         }
     }
 
@@ -190,6 +212,12 @@ impl<'a> HostBuilder<'a> {
         self
     }
 
+    /// 追加一个装载单元；在 [`HostBuilder::build`] 里按注册顺序应用。
+    pub fn bundle(mut self, bundle: impl Bundle + 'static) -> Self {
+        self.bundles.push(Box::new(bundle));
+        self
+    }
+
     pub fn build(self) -> Result<Host<'a>, LoadError> {
         let requests = match (self.requests, self.model) {
             (Some(requests), _) => requests,
@@ -201,13 +229,133 @@ impl<'a> HostBuilder<'a> {
         for plugin in self.plugins {
             extensions.register(plugin);
         }
-        Ok(Host {
+        let mut host = Host {
             llm: self.llm,
             input: self.input,
             requests,
             approvals: self.approvals,
             tools,
             extensions,
-        })
+        };
+        // 装载单元按注册顺序应用：前者装上的工具对后者的规则校验可见。
+        for bundle in self.bundles {
+            bundle.install(&mut host)?;
+        }
+        Ok(host)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::{PolicyBundle, Rule};
+    use crate::tools::{FsBundle, ReadFile};
+    use agnes_core::llm::{LlmRequest, LlmResponse};
+    use agnes_core::tool::ToolName;
+    use agnes_io::input::NoInput;
+    use agnes_io::llm::LlmError;
+    use async_trait::async_trait;
+    use std::str::FromStr;
+
+    /// 不会真正被调用的模型。
+    struct Never;
+
+    #[async_trait]
+    impl Llm for Never {
+        async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            std::future::pending().await
+        }
+    }
+
+    fn model() -> ModelName {
+        ModelName::from_str("test-model").unwrap()
+    }
+
+    fn name(tool: &str) -> ToolName {
+        ToolName::from_str(tool).unwrap()
+    }
+
+    #[test]
+    fn a_missing_model_fails_at_load() {
+        let llm = Never;
+        let input = NoInput;
+        let err = Host::builder(&llm, &input).build().unwrap_err();
+        assert!(matches!(err, LoadError::MissingModel));
+    }
+
+    #[test]
+    fn a_rule_that_can_never_fire_fails_at_load() {
+        let llm = Never;
+        let input = NoInput;
+
+        // 精确规则指向不存在的工具
+        let err = Host::builder(&llm, &input)
+            .model(model())
+            .bundle(PolicyBundle::new(vec![Rule::Name(name("nope"))], vec![]))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, LoadError::UnknownTool { .. }));
+
+        // 前缀规则无人匹配
+        let err = Host::builder(&llm, &input)
+            .model(model())
+            .bundle(FsBundle::new(".", false))
+            .bundle(PolicyBundle::new(vec![Rule::Prefix("zzz".into())], vec![]))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, LoadError::UnknownTool { .. }));
+    }
+
+    #[test]
+    fn asking_without_an_approval_channel_fails_at_load() {
+        let llm = Never;
+        let input = NoInput;
+        let err = Host::builder(&llm, &input)
+            .model(model())
+            .bundle(FsBundle::new(".", false))
+            .bundle(PolicyBundle::new(
+                vec![],
+                vec![Rule::Name(name("read_file"))],
+            ))
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, LoadError::AskWithoutApprovals { .. }));
+    }
+
+    #[test]
+    fn a_valid_policy_installs_the_plugin() {
+        let (approval, _questions) = ApprovalChannel::channel(None);
+        let llm = Never;
+        let input = NoInput;
+        let host = Host::builder(&llm, &input)
+            .model(model())
+            .bundle(FsBundle::new(".", false))
+            .bundle(PolicyBundle::new(
+                vec![],
+                vec![Rule::Name(name("read_file"))],
+            ))
+            .approvals(Some(&approval))
+            .build()
+            .unwrap();
+        assert_eq!(host.extensions().names().collect::<Vec<_>>(), ["permission"]);
+    }
+
+    #[test]
+    fn a_bundle_registers_tools_and_duplicates_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Never;
+        let input = NoInput;
+        let mut host = Host::builder(&llm, &input)
+            .model(model())
+            .bundle(FsBundle::new(dir.path(), true))
+            .build()
+            .unwrap();
+        assert!(host.tools().contains(&name("read_file")));
+        assert!(host.tools().contains(&name("run_shell")));
+        assert!(
+            host.tools_mut()
+                .register(Arc::new(ReadFile::new(dir.path())))
+                .is_err()
+        );
     }
 }

@@ -65,6 +65,11 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    /// Registered tool names, in deterministic (name) order.
+    pub fn names(&self) -> impl Iterator<Item = &ToolName> + '_ {
+        self.tools.keys()
+    }
+
     pub fn get(&self, name: &ToolName) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }

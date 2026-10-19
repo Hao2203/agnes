@@ -9,8 +9,10 @@
 
 use agnes_core::message::ToolCall;
 use agnes_core::tool::ToolName;
+use std::fmt;
 
-use crate::ext::{Plugin, Verdict};
+use crate::ext::{Bundle, Plugin, Verdict};
+use crate::host::{Host, LoadError};
 
 /// 一条工具名匹配规则：精确或前缀。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,15 @@ impl Rule {
         match self {
             Rule::Name(name) => name == tool_name,
             Rule::Prefix(prefix) => tool_name.as_str().starts_with(prefix),
+        }
+    }
+}
+
+impl fmt::Display for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Rule::Name(name) => write!(f, "`{name}`"),
+            Rule::Prefix(prefix) => write!(f, "`{prefix}*`"),
         }
     }
 }
@@ -60,6 +71,47 @@ impl Plugin for PermissionPlugin {
             return Some(Verdict::Ask);
         }
         None
+    }
+}
+
+/// 权限装载单元：先校验规则，再注册 [`PermissionPlugin`]。
+///
+/// 校验发生在装载期而不是第一次调用时：规则必须能命中至少一个已注册
+/// 的工具（否则它永远不会生效）；配了 ask 就必须接通审批口（否则每次
+/// 命中都只会 fail-closed 拒绝）。
+pub struct PolicyBundle {
+    deny: Vec<Rule>,
+    ask: Vec<Rule>,
+}
+
+impl PolicyBundle {
+    pub fn new(deny: Vec<Rule>, ask: Vec<Rule>) -> Self {
+        Self { deny, ask }
+    }
+}
+
+impl Bundle for PolicyBundle {
+    fn name(&self) -> &'static str {
+        "permission"
+    }
+
+    fn install(&self, host: &mut Host<'_>) -> Result<(), LoadError> {
+        for rule in self.deny.iter().chain(&self.ask) {
+            if !host.tools().names().any(|name| rule.matches(name)) {
+                return Err(LoadError::UnknownTool {
+                    bundle: self.name(),
+                    rule: rule.to_string(),
+                });
+            }
+        }
+        if !self.ask.is_empty() && !host.has_approvals() {
+            return Err(LoadError::AskWithoutApprovals {
+                bundle: self.name(),
+            });
+        }
+        host.extensions_mut()
+            .register(PermissionPlugin::new(self.deny.clone(), self.ask.clone()));
+        Ok(())
     }
 }
 

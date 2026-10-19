@@ -8,9 +8,11 @@
 //! - 注册可回收：长期注册拿 [`Registration`] 手柄显式撤销，临时注册用
 //!   [`Extensions::scope`]，离开作用域按注册的逆序撤销。
 
+mod bundle;
 mod decision;
 mod plugin;
 
+pub use bundle::{Bundle, Empty};
 pub use decision::{ApprovalOutcome, Blocked, Denied, Gate, Settlement, Verdict};
 pub use plugin::{Notice, Plugin};
 
