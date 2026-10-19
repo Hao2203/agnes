@@ -18,6 +18,7 @@
 mod driver;
 
 pub mod approval;
+pub mod ext;
 pub mod permission;
 pub mod plugin;
 pub mod tools;
