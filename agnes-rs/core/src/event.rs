@@ -1,9 +1,10 @@
-//! 运行时事件词汇 —— 一条按发生顺序记录的日志，消息也是事件。
+//! 运行时事件词汇 —— 一条按发生顺序记录的日志，消息与配置也是事件。
 //!
-//! 会话里发生的一切都是一个 [`Event`]，由 [`Context`](crate::context::Context)
-//! 按发生顺序记账：turn 边界、模型往返（step）边界、工具执行、
-//! 以及消息本身（[`Event::Message`]）。因为消息也是事件，
-//! `Context::events()` 任何时候都能复原完整的先后顺序。
+//! 会话里发生的一切都是一个 [`Event`]，由 [`Log`](crate::log::Log) 按发生
+//! 顺序记账：模型侧配置（[`Event::Header`]）、turn 边界、模型往返（step）
+//! 边界、工具执行、以及消息本身（[`Event::Message`]）。因为一切都是事件，
+//! `Log::events()` 任何时候都能复原完整的先后顺序，一次请求也能从日志
+//! 单独推导出来。
 //!
 //! 提示：turn/step 的生命周期事件都由机器在推进时铸造；唯一的例外
 //! 是工具执行的开始/结束 —— 只有宿主知道调用什么时候真开始、真结束
@@ -11,6 +12,7 @@
 //! [`crate::turn::Turn::tool_finished`] 喂回机器）。
 
 use crate::content::Content;
+use crate::header::Header;
 use crate::llm::StopReason;
 use crate::message::{Message, TokenUsage, ToolCall, ToolCallId};
 use crate::turn::{Outcome, StepNumber, StepOutcome};
@@ -19,9 +21,12 @@ use crate::turn::{Outcome, StepNumber, StepOutcome};
 ///
 /// 序列化是耐久日志的格式契约：变体名是 `snake_case`，未知变体在反序列
 /// 化时被拒绝（fail closed）—— 读不懂的日志不猜，直接拒载。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
+    /// 模型侧配置（系统提示与工具环境）生效：每个 turn 开局记一条，
+    /// 日志里最后一条就是这一轮请求的依据。
+    Header(Header),
     /// turn 开始：一条用户请求进入 agent 循环。
     TurnStart,
     /// 一个 step 开始（一次模型往返）。
@@ -82,6 +87,10 @@ mod tests {
         let step = StepNumber::FIRST;
         let first_call = call("c1");
         vec![
+            Event::Header(crate::header::Header::new(
+                SystemPrompt::new("sys"),
+                crate::header::Environment::default(),
+            )),
             Event::TurnStart,
             Event::StepStart { step },
             Event::MessageStart { step },

@@ -110,8 +110,8 @@ impl<'a> Host<'a> {
         let started_at = Timestamp::now();
         let goal = config.goal.clone();
         let tools = config
-            .context
-            .environment()
+            .header
+            .environment
             .tools()
             .iter()
             .map(|spec| spec.name.clone())
@@ -143,12 +143,12 @@ impl<'a> Host<'a> {
         let steps_used = closed.steps_used();
         let usage = closed.usage();
         let pending_user_messages = closed.take_unapplied_user_messages();
-        let context = closed.into_context();
+        let log = closed.into_log();
         let summary = RunSummary {
             outcome: outcome.clone(),
             steps_used,
             usage,
-            context,
+            log,
             pending_user_messages,
             started_at,
             finished_at,

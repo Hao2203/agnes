@@ -269,9 +269,10 @@ mod tests {
         );
 
         let config = agnes_core::turn::AgentConfig {
-            context: agnes_core::context::Context::new(
+            log: agnes_core::log::Log::default(),
+            header: agnes_core::header::Header::new(
                 SystemPrompt::new("sys"),
-                agnes_core::context::Environment::default(),
+                agnes_core::header::Environment::default(),
             ),
             goal: Content::try_from("flip").unwrap(),
             budget: agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
@@ -335,7 +336,7 @@ mod tests {
     fn build<S>(turn: &agnes_core::turn::Turn<S>, model: &ModelName) -> LlmRequest {
         LlmRequest {
             model: model.clone(),
-            prompt: Prompt::from_context(turn.context()),
+            prompt: Prompt::from_log(turn.log()),
         }
     }
 }

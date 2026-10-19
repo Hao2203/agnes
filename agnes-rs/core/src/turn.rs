@@ -14,15 +14,16 @@
 //!
 //! 只有推进阶段的信息才进机器：完整响应、工具调用的开始与结果、打断。
 //! 流式增量不走这里 —— 适配器把产生中的消息直报宿主界面。发生的一切
-//! 都写进 [`Context`] 的有序日志（消息也是事件）；插话随时缓存、在下一个
-//! step 边界生效；turn 在最终答复、打断或 step 预算耗尽时收场，其
-//! [`Outcome`] 就是整个 run 的结果。
+//! 都写进 [`Log`] 的有序日志（消息、系统提示与工具环境都是事件）；插话
+//! 随时缓存、在下一个 step 边界生效；turn 在最终答复、打断或 step 预算
+//! 耗尽时收场，其 [`Outcome`] 就是整个 run 的结果。
 
 use crate::config::StepBudget;
 use crate::content::Content;
-use crate::context::Context;
 use crate::event::Event;
+use crate::header::Header;
 use crate::llm::{LlmResponse, StopReason};
+use crate::log::{EventIndex, Log};
 use crate::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolCallId, ToolOutput};
 use agnes_util::NonEmpty;
 use std::collections::{BTreeMap, VecDeque};
@@ -30,11 +31,12 @@ use std::fmt;
 use std::mem;
 use std::num::NonZeroU32;
 
-/// 把一个 turn 带起来的全部输入：会话上下文（系统提示、环境）、
-/// 开局的用户消息，以及最多可以启动多少个模型往返。
+/// 把一个 turn 带起来的全部输入：已有的会话日志、这一轮生效的模型侧
+/// 配置、开局的用户消息，以及最多可以启动多少个模型往返。
 #[derive(Debug)]
 pub struct AgentConfig {
-    pub context: Context,
+    pub log: Log,
+    pub header: Header,
     pub goal: Content,
     pub budget: StepBudget,
 }
@@ -42,9 +44,9 @@ pub struct AgentConfig {
 /// 机器交给外层执行的动作 —— 机器只产生动作，从不执行 IO。
 #[derive(Debug)]
 pub enum Action {
-    /// 把事件上报给界面/日志（机器已经把它写进 Context 日志）。
-    Report(Event),
-    /// 发起一次模型调用：宿主的 RequestBuilder 从 Context 构造出请求。
+    /// 日志追加了一条：位置即游标，事件本体留在 [`Log::events`] 里。
+    Recorded(EventIndex),
+    /// 发起一次模型调用：宿主的 RequestBuilder 从日志构造出请求。
     CallModel,
     /// 执行一个工具调用；产生的 `tool_started` 与结果要喂回机器。
     /// 一次只派发一个，按模型给出的顺序。
@@ -111,7 +113,7 @@ pub enum StepOutcome {
 /// 共享内核：机器各阶段都携带的会话与统计状态，外加待执行的动作队列。
 #[derive(Debug)]
 struct Core {
-    context: Context,
+    log: Log,
     budget: StepBudget,
     usage: TokenUsage,
     steps_started: u32,
@@ -120,18 +122,18 @@ struct Core {
 }
 
 impl Core {
-    /// 记录一批转移事件：入账并排队报告 —— 每个转移经此落账。
+    /// 记录一批转移事件：入账并排队通知 —— 每个转移经此落账。
     fn note(&mut self, events: Vec<Event>) {
         for event in events {
-            self.context.record(event.clone());
-            self.actions.push_back(Action::Report(event));
+            let index = self.log.record(event);
+            self.actions.push_back(Action::Recorded(index));
         }
     }
 
-    /// 记录一个机器自己的事件并入队报告（等同逐个 note）。
+    /// 记录一个机器自己的事件并入队通知（等同单条 note）。
     fn emit(&mut self, event: Event) {
-        self.context.record(event.clone());
-        self.actions.push_back(Action::Report(event));
+        let index = self.log.record(event);
+        self.actions.push_back(Action::Recorded(index));
     }
 }
 
@@ -195,28 +197,31 @@ impl<Phase> Turn<Phase> {
         self.core.steps_started
     }
 
-    pub fn context(&self) -> &Context {
-        &self.core.context
+    pub fn log(&self) -> &Log {
+        &self.core.log
     }
 }
 
 impl Turn<AwaitingMessage> {
-    /// 开始 turn：goal 先入账（用户先说话），随后 turn_start、第一个 step
-    /// 的开启事件 —— 外层从动作里见到 `CallModel` 就发起首次调用。
+    /// 开始 turn：先记录这一轮生效的模型侧配置（header），再让 goal 入账
+    /// （用户先说话），随后 turn_start、第一个 step 的开启事件 —— 外层从
+    /// 动作里见到 `CallModel` 就发起首次调用。
     pub fn start(config: AgentConfig) -> Self {
         let AgentConfig {
-            context,
+            log,
+            header,
             goal,
             budget,
         } = config;
         let mut core = Core {
-            context,
+            log,
             budget,
             usage: TokenUsage::default(),
             steps_started: 0,
             buffered_user_messages: Vec::new(),
             actions: VecDeque::new(),
         };
+        core.emit(Event::Header(header));
         core.emit(Event::Message(Message::User { content: goal }));
         core.emit(Event::TurnStart);
         let phase = begin_step(&mut core);
@@ -494,10 +499,9 @@ impl Turn<Closed> {
         mem::take(&mut self.core.buffered_user_messages)
     }
 
-    /// 收场后的会话 —— 系统提示、环境、完整的有序日志；
-    /// 作为下一个 [`AgentConfig`] 即可延续会话。
-    pub fn into_context(self) -> Context {
-        self.core.context
+    /// 收场后的会话日志；作为下一个 [`AgentConfig`] 的 `log` 即可延续会话。
+    pub fn into_log(self) -> Log {
+        self.core.log
     }
 }
 
@@ -544,7 +548,7 @@ fn begin_step(core: &mut Core) -> AwaitingMessage {
 mod tests {
     use super::*;
     use crate::config::SystemPrompt;
-    use crate::context::Environment;
+    use crate::header::{Environment, Header};
     use crate::llm::Prompt;
     use crate::message::{ToolArguments, ToolOutput};
     use crate::tool::ToolName;
@@ -558,7 +562,8 @@ mod tests {
 
     fn config(budget: u32) -> AgentConfig {
         AgentConfig {
-            context: Context::new(SystemPrompt::new("be brief"), Environment::default()),
+            log: Log::default(),
+            header: Header::new(SystemPrompt::new("be brief"), Environment::default()),
             goal: content("flip the flag"),
             budget: StepBudget::new(TestNonZeroU32::new(budget).unwrap()),
         }
@@ -608,6 +613,7 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
+                Event::Header(_) => "header",
                 Event::TurnStart => "turn_start",
                 Event::StepStart { .. } => "step_start",
                 Event::MessageStart { .. } => "message_start",
@@ -627,9 +633,12 @@ mod tests {
         let mut shapes = Vec::new();
         let mut calls = 0;
         let mut tools = Vec::new();
-        for action in std::iter::from_fn(|| turn.poll_actions()) {
+        while let Some(action) = turn.poll_actions() {
             match action {
-                Action::Report(event) => shapes.extend(shape(std::slice::from_ref(&event))),
+                Action::Recorded(index) => {
+                    let event = turn.log().event(index).expect("通知指向日志内");
+                    shapes.extend(shape(std::slice::from_ref(event)));
+                }
                 Action::CallModel => calls += 1,
                 Action::RunTool(tool_call) => tools.push(tool_call.id.as_str().to_owned()),
             }
@@ -644,13 +653,19 @@ mod tests {
 
         assert_eq!(
             shapes,
-            vec!["message", "turn_start", "step_start", "message_start"]
+            vec![
+                "header",
+                "message",
+                "turn_start",
+                "step_start",
+                "message_start"
+            ]
         );
         assert_eq!(calls, 1);
         assert!(tools.is_empty());
         assert_eq!(turn.steps_used(), 1);
 
-        let prompt = Prompt::from_context(turn.context());
+        let prompt = Prompt::from_log(turn.log());
         assert_eq!(prompt.input.len(), 2);
         assert!(matches!(prompt.input[0], Message::System { .. }));
         assert!(
@@ -809,7 +824,7 @@ mod tests {
             ]
         );
 
-        let prompt = Prompt::from_context(turn.context());
+        let prompt = Prompt::from_log(turn.log());
         // system, goal, assistant(tool calls), tool result, injected user
         assert_eq!(prompt.input.len(), 5);
         assert!(matches!(&prompt.input[3], Message::ToolResult { .. }));
@@ -836,7 +851,7 @@ mod tests {
         assert_eq!(calls, 0);
         assert_eq!(turn.outcome(), &Outcome::Interrupted);
         // 被丢弃的响应从未入账
-        assert_eq!(turn.context().messages().count(), 1);
+        assert_eq!(turn.log().messages().count(), 1);
     }
 
     #[test]
@@ -894,10 +909,7 @@ mod tests {
         else {
             panic!("expected NextStep");
         };
-        assert_eq!(
-            shape(turn.context().events()).last(),
-            Some(&"message_start")
-        );
+        assert_eq!(shape(turn.log().events()).last(), Some(&"message_start"));
     }
 
     #[test]
@@ -948,8 +960,9 @@ mod tests {
         // 答复入账后，插话紧接着入账，并开了下一个 step
         assert_eq!(turn.steps_used(), 2);
         assert_eq!(
-            shape(turn.context().events()),
+            shape(turn.log().events()),
             vec![
+                "header",
                 "message",
                 "turn_start",
                 "step_start",
@@ -965,7 +978,7 @@ mod tests {
         );
 
         // 下一次模型调用看得见这条插话
-        let prompt = Prompt::from_context(turn.context());
+        let prompt = Prompt::from_log(turn.log());
         assert!(prompt.input.iter().any(
             |message| matches!(message, Message::User { content } if content.as_str() == "one more thing")
         ));
@@ -1004,7 +1017,7 @@ mod tests {
             turn.take_unapplied_user_messages(),
             vec![content("too late")]
         );
-        assert_eq!(turn.context().messages().count(), 2);
+        assert_eq!(turn.log().messages().count(), 2);
     }
 
     #[test]
@@ -1032,8 +1045,9 @@ mod tests {
         let _ = drain(&mut turn);
 
         assert_eq!(
-            shape(turn.context().events()),
+            shape(turn.log().events()),
             vec![
+                "header",
                 "message",
                 "turn_start",
                 "step_start",
@@ -1052,7 +1066,7 @@ mod tests {
                 "turn_end"
             ]
         );
-        let messages: Vec<&Message> = turn.context().messages().collect();
+        let messages: Vec<&Message> = turn.log().messages().collect();
         assert_eq!(messages.len(), 4);
         assert!(matches!(messages[0], Message::User { .. }));
         assert!(matches!(messages[1], Message::Assistant(_)));

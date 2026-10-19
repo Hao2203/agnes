@@ -1,16 +1,19 @@
 //! 会话日志的文件实现：JSONL、单写者、崩溃后补写恢复。
 //!
-//! 格式 v1（每行一个 JSON 对象）：
+//! 格式 v2（每行一个 JSON 对象；首行是版本标记，之后全是事件记录）：
 //!
 //! ```text
-//! {"kind":"header","format":1,"system":"…","environment":{"tools":[…]}}
-//! {"kind":"record","seq":1,"time":"2026-10-19T…","event":{…}}
+//! {"kind":"meta","format":2}
+//! {"kind":"record","seq":1,"time":"2026-10-19T…","event":{"header":{…}}}
 //! ```
+//!
+//! 系统提示与工具环境不是单独的一行：它们是事件（`Event::Header`），
+//! 每个 turn 记一条 —— 所以日志是唯一状态，恢复不需要比对任何旁路配置。
 //!
 //! 规则：
 //!
 //! - `seq` 从 1 起严格连续；不连续 = 损坏，拒绝加载（fail closed）。
-//! - 读不懂的 `format` 拒绝加载，不猜。
+//! - 读不懂的 `format` 拒绝加载，不猜；v1 文件（首行 `kind:"header"`）同样拒载。
 //! - 只有**最后一行**允许是撕裂的半行（崩溃时没写完）：丢弃并截断到物理
 //!   有效前缀；其他位置的不完整行是损坏。
 //! - 恢复 = 补写收尾事件（形状与 [`Turn::interrupted`] 一致），**绝不重写**
@@ -23,9 +26,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use agnes_core::config::SystemPrompt;
-use agnes_core::context::Environment;
 use agnes_core::event::Event;
+use agnes_core::log::Log;
 use agnes_core::message::{AssistantMessage, Message, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::turn::{Outcome, StepNumber, StepOutcome};
 use agnes_io::session::{SessionError, SessionLog};
@@ -35,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
 /// 本实现写出的格式版本。
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// 未执行的调用补位时用的理由，与 core 的打断路径保持一致。
 const NOT_RUN: &str = "not run: the user interrupted the agent";
@@ -46,8 +48,6 @@ pub enum OpenError {
     AlreadyOpen { path: PathBuf },
     #[error("unsupported session format {found}; this build understands {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
-    #[error("session does not match this run: {detail}")]
-    HeaderMismatch { detail: String },
     #[error("corrupt session at line {line}: {detail}")]
     Corrupt { line: usize, detail: String },
     #[error("failed to encode a session record: {0}")]
@@ -69,7 +69,7 @@ impl From<SessionError> for OpenError {
 /// 收尾事件（空 = 日志本来就完整）。
 pub struct Opened {
     pub session: SessionFile,
-    pub events: Vec<Event>,
+    pub log: Log,
     pub repairs: Vec<Event>,
 }
 
@@ -77,7 +77,7 @@ impl fmt::Debug for Opened {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Opened")
             .field("path", &self.session.path)
-            .field("events", &self.events.len())
+            .field("events", &self.log.events().len())
             .field("repairs", &self.repairs.len())
             .finish()
     }
@@ -93,13 +93,10 @@ pub struct SessionFile {
 impl SessionFile {
     /// 打开或新建一个会话文件。
     ///
-    /// 已存在时校验头（系统提示与工具集必须与本次运行一致）与记录连续性，
-    /// 然后补齐上一次崩溃留下的未收尾事件；返回的 `events` 已经包含补写。
-    pub async fn open_or_create(
-        path: impl Into<PathBuf>,
-        system: SystemPrompt,
-        environment: Environment,
-    ) -> Result<Opened, OpenError> {
+    /// 已存在时校验版本标记与记录连续性，然后补齐上一次崩溃留下的未收尾
+    /// 事件；返回的 `log` 已经包含补写。系统提示与工具环境不再单独校验 ——
+    /// 它们在日志里，随每个 turn 的 header 事件入账。
+    pub async fn open_or_create(path: impl Into<PathBuf>) -> Result<Opened, OpenError> {
         let path = path.into();
         let std_file = std::fs::OpenOptions::new()
             .read(true)
@@ -126,23 +123,14 @@ impl SessionFile {
         }
 
         let mut writer = BufWriter::new(tokio::fs::File::from_std(std_file));
-        let mut events: Vec<Event> = parsed.records.into_iter().map(|r| r.event).collect();
-
-        match parsed.header {
-            Some(header) => check_header(&header, &system, &environment)?,
-            None => {
-                let header = Header {
-                    format: FORMAT,
-                    system,
-                    environment,
-                };
-                write_line(&mut writer, &Line::Header(header)).await?;
-            }
+        if parsed.meta.is_none() {
+            write_line(&mut writer, &Line::Meta(Meta { format: FORMAT })).await?;
         }
         if needs_newline {
             writer.write_all(b"\n").await?;
         }
 
+        let events: Vec<Event> = parsed.records.into_iter().map(|r| r.event).collect();
         let mut session = SessionFile {
             path,
             writer,
@@ -156,11 +144,12 @@ impl SessionFile {
                 .map_err(OpenError::from)?;
         }
         session.flush().await.map_err(OpenError::from)?;
-        events.extend(repairs.iter().cloned());
 
+        let mut log_events = events;
+        log_events.extend(repairs.iter().cloned());
         Ok(Opened {
             session,
-            events,
+            log: Log::restore(log_events),
             repairs,
         })
     }
@@ -206,15 +195,13 @@ async fn write_line(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Line {
-    Header(Header),
+    Meta(Meta),
     Record(Record),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Header {
+struct Meta {
     format: u32,
-    system: SystemPrompt,
-    environment: Environment,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -225,7 +212,7 @@ struct Record {
 }
 
 struct Parsed {
-    header: Option<Header>,
+    meta: Option<Meta>,
     records: Vec<Record>,
     /// 物理有效前缀的字节长度（末尾撕裂行之前）。
     valid_len: usize,
@@ -234,7 +221,7 @@ struct Parsed {
 }
 
 fn parse(raw: &str) -> Result<Parsed, OpenError> {
-    let mut header: Option<Header> = None;
+    let mut meta: Option<Meta> = None;
     let mut records: Vec<Record> = Vec::new();
     let mut offset = 0;
     let mut valid_len = 0;
@@ -254,22 +241,52 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
             continue;
         }
 
-        match serde_json::from_str::<Line>(text) {
-            Ok(Line::Header(parsed_header)) => {
-                if header.is_some() || !records.is_empty() {
+        // 语法都读不通只可能是末尾撕裂的写入；能解析成 JSON 但语义不对
+        // （未知 kind、坏字段、旧格式）一律拒载。
+        let value: serde_json::Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) if end == raw.len() => {
+                return Ok(Parsed {
+                    meta,
+                    records,
+                    valid_len,
+                    torn: true,
+                });
+            }
+            Err(err) => {
+                return Err(OpenError::Corrupt {
+                    line: line_no,
+                    detail: err.to_string(),
+                });
+            }
+        };
+        let line: Line = serde_json::from_value(value).map_err(|err| OpenError::Corrupt {
+            line: line_no,
+            detail: err.to_string(),
+        })?;
+
+        match line {
+            Line::Meta(found) => {
+                if meta.is_some() || !records.is_empty() {
                     return Err(OpenError::Corrupt {
                         line: line_no,
-                        detail: "the header must be the first line".into(),
+                        detail: "the version marker must be the first line".into(),
                     });
                 }
-                header = Some(parsed_header);
+                if found.format != FORMAT {
+                    return Err(OpenError::UnsupportedVersion {
+                        found: found.format,
+                        supported: FORMAT,
+                    });
+                }
+                meta = Some(found);
                 valid_len = end;
             }
-            Ok(Line::Record(record)) => {
-                if header.is_none() {
+            Line::Record(record) => {
+                if meta.is_none() {
                     return Err(OpenError::Corrupt {
                         line: line_no,
-                        detail: "record before the header".into(),
+                        detail: "record before the version marker".into(),
                     });
                 }
                 let expected = records.len() as u64 + 1;
@@ -282,65 +299,16 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
                 records.push(record);
                 valid_len = end;
             }
-            Err(err) => {
-                // 只有最后一行可能是撕裂的写入；中间的不完整行是损坏。
-                if end == raw.len() {
-                    return Ok(Parsed {
-                        header,
-                        records,
-                        valid_len,
-                        torn: true,
-                    });
-                }
-                return Err(OpenError::Corrupt {
-                    line: line_no,
-                    detail: err.to_string(),
-                });
-            }
         }
         offset = end;
     }
 
     Ok(Parsed {
-        header,
+        meta,
         records,
         valid_len,
         torn: false,
     })
-}
-
-fn check_header(
-    header: &Header,
-    system: &SystemPrompt,
-    environment: &Environment,
-) -> Result<(), OpenError> {
-    if header.format != FORMAT {
-        return Err(OpenError::UnsupportedVersion {
-            found: header.format,
-            supported: FORMAT,
-        });
-    }
-    if header.system.as_str() != system.as_str() {
-        return Err(OpenError::HeaderMismatch {
-            detail: "the system prompt changed since the session was created".into(),
-        });
-    }
-    let stored = tool_names(&header.environment);
-    let live = tool_names(environment);
-    if stored != live {
-        return Err(OpenError::HeaderMismatch {
-            detail: format!("the tool set changed: stored {stored:?}, live {live:?}"),
-        });
-    }
-    Ok(())
-}
-
-fn tool_names(environment: &Environment) -> Vec<&str> {
-    environment
-        .tools()
-        .iter()
-        .map(|spec| spec.name.as_str())
-        .collect()
 }
 
 // —— 崩溃恢复 ——
@@ -434,10 +402,11 @@ mod tests {
     use super::*;
     use agnes_core::config::{StepBudget, SystemPrompt};
     use agnes_core::content::Content;
-    use agnes_core::context::Context;
+    use agnes_core::header::{Environment, Header};
     use agnes_core::llm::{LlmResponse, StopReason};
+    use agnes_core::log::Log;
     use agnes_core::message::{TokenUsage, ToolArguments};
-    use agnes_core::tool::{JsonSchema, ToolName, ToolSpec};
+    use agnes_core::tool::ToolName;
     use agnes_core::turn::{AgentConfig, AwaitingMessage, MessageReplied, ToolsAdvanced, Turn};
     use agnes_util::NonEmpty;
     use std::num::NonZeroU32;
@@ -445,14 +414,6 @@ mod tests {
 
     fn system() -> SystemPrompt {
         SystemPrompt::new("sys")
-    }
-
-    fn spec(name: &str) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from_str(name).unwrap(),
-            description: "".into(),
-            parameters: JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
-        }
     }
 
     fn call(id: &str) -> ToolCall {
@@ -465,7 +426,8 @@ mod tests {
 
     fn config() -> AgentConfig {
         AgentConfig {
-            context: Context::new(system(), Environment::default()),
+            log: Log::default(),
+            header: Header::new(system(), Environment::default()),
             goal: Content::try_from("take notes").unwrap(),
             budget: StepBudget::new(NonZeroU32::new(4).unwrap()),
         }
@@ -496,9 +458,9 @@ mod tests {
             panic!("expected the batch to stay open")
         };
 
-        let prefix = turn.context().events().to_vec();
+        let prefix = turn.log().events().to_vec();
         let closed = turn.interrupted();
-        let closer = closed.context().events()[prefix.len()..].to_vec();
+        let closer = closed.into_log().events()[prefix.len()..].to_vec();
         (prefix, closer)
     }
 
@@ -511,9 +473,9 @@ mod tests {
     #[test]
     fn repairs_close_a_step_that_never_saw_a_response() {
         let turn = Turn::<AwaitingMessage>::start(config());
-        let prefix = turn.context().events().to_vec();
+        let prefix = turn.log().events().to_vec();
         let closed = turn.interrupted();
-        let expected = closed.context().events()[prefix.len()..].to_vec();
+        let expected = closed.into_log().events()[prefix.len()..].to_vec();
         assert_eq!(repairs(&prefix), expected);
     }
 
@@ -534,13 +496,9 @@ mod tests {
         let path = dir.path().join("s.jsonl");
 
         let Opened {
-            mut session,
-            events,
-            ..
-        } = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-            .await
-            .unwrap();
-        assert!(events.is_empty());
+            mut session, log, ..
+        } = SessionFile::open_or_create(path.as_path()).await.unwrap();
+        assert!(log.events().is_empty());
         session
             .append(Timestamp::now(), &Event::TurnStart)
             .await
@@ -567,15 +525,13 @@ mod tests {
         drop(session);
 
         let Opened {
-            events,
+            log,
             repairs,
             mut session,
-        } = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 3);
+        } = SessionFile::open_or_create(path.as_path()).await.unwrap();
+        assert_eq!(log.events().len(), 3);
         assert!(repairs.is_empty());
-        assert!(matches!(events[0], Event::TurnStart));
+        assert!(matches!(log.events()[0], Event::TurnStart));
         session.flush().await.unwrap();
     }
 
@@ -585,10 +541,7 @@ mod tests {
         let path = dir.path().join("s.jsonl");
         let (prefix, expected) = half_finished_turn();
 
-        let Opened { mut session, .. } =
-            SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-                .await
-                .unwrap();
+        let Opened { mut session, .. } = SessionFile::open_or_create(path.as_path()).await.unwrap();
         for event in &prefix {
             session.append(Timestamp::now(), event).await.unwrap();
         }
@@ -597,14 +550,12 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
 
         let Opened {
-            events,
+            log,
             repairs,
             mut session,
-        } = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-            .await
-            .unwrap();
+        } = SessionFile::open_or_create(path.as_path()).await.unwrap();
         assert_eq!(repairs, expected);
-        assert_eq!(events.len(), prefix.len() + repairs.len());
+        assert_eq!(log.events().len(), prefix.len() + repairs.len());
 
         // 只追加：原文件是现在文件的前缀
         session.flush().await.unwrap();
@@ -617,13 +568,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let raw = concat!(
-            "{\"kind\":\"header\",\"format\":1,\"system\":\"sys\",\"environment\":{\"tools\":[]}}\n",
+            "{\"kind\":\"meta\",\"format\":2}\n",
             "{\"kind\":\"record\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
             "{\"kind\":\"record\",\"seq\":3,\"time\":\"2026-10-19T00:00:01Z\",\"event\":\"turn_start\"}\n",
         );
         std::fs::write(&path, raw).unwrap();
 
-        let err = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
+        let err = SessionFile::open_or_create(path.as_path())
             .await
             .unwrap_err();
         assert!(matches!(err, OpenError::Corrupt { line: 3, .. }));
@@ -633,22 +584,46 @@ mod tests {
     async fn a_future_format_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
-        std::fs::write(
-            &path,
-            "{\"kind\":\"header\",\"format\":2,\"system\":\"sys\",\"environment\":{\"tools\":[]}}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":3}\n").unwrap();
 
-        let err = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
+        let err = SessionFile::open_or_create(path.as_path())
             .await
             .unwrap_err();
         assert!(matches!(
             err,
             OpenError::UnsupportedVersion {
-                found: 2,
+                found: 3,
                 supported: FORMAT
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_v1_header_line_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let raw = concat!(
+            "{\"kind\":\"header\",\"format\":1,\"system\":\"sys\",\"environment\":{\"tools\":[]}}\n",
+            "{\"kind\":\"record\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
+        );
+        std::fs::write(&path, raw).unwrap();
+
+        let err = SessionFile::open_or_create(path.as_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenError::Corrupt { line: 1, .. }));
+    }
+
+    #[tokio::test]
+    async fn a_new_file_starts_with_the_version_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let Opened { mut session, .. } = SessionFile::open_or_create(path.as_path()).await.unwrap();
+        session.flush().await.unwrap();
+        drop(session);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw, "{\"kind\":\"meta\",\"format\":2}\n");
     }
 
     #[tokio::test]
@@ -656,24 +631,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let raw = concat!(
-            "{\"kind\":\"header\",\"format\":1,\"system\":\"sys\",\"environment\":{\"tools\":[]}}\n",
+            "{\"kind\":\"meta\",\"format\":2}\n",
             "{\"kind\":\"record\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
             "{\"kind\":\"record\",\"seq\":2",
         );
         std::fs::write(&path, raw).unwrap();
 
         let Opened {
-            events,
+            log,
             repairs,
             mut session,
-        } = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-            .await
-            .unwrap();
+        } = SessionFile::open_or_create(path.as_path()).await.unwrap();
         // 撕裂行被丢弃；剩下的半个 turn 被补上收尾
         assert_eq!(repairs.len(), 1);
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], Event::TurnStart));
-        assert!(matches!(events[1], Event::TurnEnd { .. }));
+        assert_eq!(log.events().len(), 2);
+        assert!(matches!(log.events()[0], Event::TurnStart));
+        assert!(matches!(log.events()[1], Event::TurnEnd { .. }));
 
         session
             .append(
@@ -688,12 +661,9 @@ mod tests {
         drop(session);
 
         // 截断 + 追加之后仍然是一个可解析的日志
-        let Opened {
-            events, repairs, ..
-        } = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 3);
+        let Opened { log, repairs, .. } =
+            SessionFile::open_or_create(path.as_path()).await.unwrap();
+        assert_eq!(log.events().len(), 3);
         assert!(repairs.is_empty());
     }
 
@@ -701,42 +671,11 @@ mod tests {
     async fn a_second_writer_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
-        let _first = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-            .await
-            .unwrap();
+        let _first = SessionFile::open_or_create(path.as_path()).await.unwrap();
 
-        let err = SessionFile::open_or_create(path.as_path(), system(), Environment::default())
+        let err = SessionFile::open_or_create(path.as_path())
             .await
             .unwrap_err();
         assert!(matches!(err, OpenError::AlreadyOpen { .. }));
-    }
-
-    #[tokio::test]
-    async fn a_changed_header_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.jsonl");
-        drop(
-            SessionFile::open_or_create(path.as_path(), system(), Environment::default())
-                .await
-                .unwrap(),
-        );
-
-        let err = SessionFile::open_or_create(
-            path.as_path(),
-            SystemPrompt::new("another system prompt"),
-            Environment::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpenError::HeaderMismatch { .. }));
-
-        let err = SessionFile::open_or_create(
-            path.as_path(),
-            system(),
-            Environment::new(vec![spec("note")]),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpenError::HeaderMismatch { .. }));
     }
 }

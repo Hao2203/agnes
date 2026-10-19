@@ -19,9 +19,10 @@ use agnes_agent::tools::FsBundle;
 use agnes_agent::{Event, Sink};
 use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
-use agnes_core::context::{Context, Environment};
 use agnes_core::event::Event as CoreEvent;
+use agnes_core::header::{Environment, Header};
 use agnes_core::llm::StopReason;
+use agnes_core::log::Log;
 use agnes_core::tool::ToolName;
 use agnes_core::turn::{AgentConfig, Outcome};
 use agnes_io::input::Input;
@@ -167,7 +168,12 @@ async fn real_main() -> anyhow::Result<()> {
                 deny,
                 ask,
             )?;
-            let config = agent_config(goal, session_context(host.tools()), cli.max_steps)?;
+            let config = agent_config(
+                goal,
+                Log::default(),
+                session_header(host.tools()),
+                cli.max_steps,
+            )?;
             let summary = host.run(config, &mut printer, None).await?;
             print_summary(&summary);
         }
@@ -200,9 +206,9 @@ async fn real_main() -> anyhow::Result<()> {
 
             // 会话文件（可选）：存在即恢复，不存在即新建。
             let mut session_file = None;
-            let mut restored = None;
+            let mut log = Log::default();
             if let Some(path) = cli.session.as_deref() {
-                let opened = open_session(path, &host).await?;
+                let opened = open_session(path).await?;
                 if opened.repairs.is_empty() {
                     println!("(session: {})", path.display());
                 } else {
@@ -212,17 +218,10 @@ async fn real_main() -> anyhow::Result<()> {
                         opened.repairs.len()
                     );
                 }
-                restored = Some(opened.events);
+                log = opened.log;
                 session_file = Some(opened.session);
             }
-            let mut context = match restored {
-                Some(events) => Context::restore(
-                    SystemPrompt::new(SYSTEM_PROMPT),
-                    Environment::new(host.tools().specs()),
-                    events,
-                ),
-                None => session_context(host.tools()),
-            };
+            let header = session_header(host.tools());
 
             loop {
                 print!("agnes> ");
@@ -230,7 +229,7 @@ async fn real_main() -> anyhow::Result<()> {
                 match input.next().await {
                     Line::Exit => break,
                     Line::Reset => {
-                        context.reset();
+                        log.reset();
                         match cli.session.as_deref() {
                             // 日志只追加：`/new` 轮转到下一个空闲的兄弟文件。
                             Some(path) => {
@@ -238,13 +237,9 @@ async fn real_main() -> anyhow::Result<()> {
                                     file.flush().await.context("closing the session")?;
                                 }
                                 let next = rotate(path);
-                                let opened = open_session(&next, &host).await?;
+                                let opened = open_session(&next).await?;
                                 println!("(session cleared — new file: {})", next.display());
-                                context = Context::restore(
-                                    SystemPrompt::new(SYSTEM_PROMPT),
-                                    Environment::new(host.tools().specs()),
-                                    opened.events,
-                                );
+                                log = opened.log;
                                 session_file = Some(opened.session);
                             }
                             None => println!("(session cleared)"),
@@ -252,22 +247,23 @@ async fn real_main() -> anyhow::Result<()> {
                     }
                     Line::Task(goal) => {
                         input.begin_run();
-                        let result = match agent_config(goal, context.clone(), cli.max_steps) {
-                            Ok(config) => {
-                                let session = session_file
-                                    .as_mut()
-                                    .map(|file| file as &mut dyn SessionLog);
-                                host.run(config, &mut EventPrinter::new(model.clone()), session)
-                                    .await
-                                    .map_err(anyhow::Error::new)
-                            }
-                            Err(err) => Err(err),
-                        };
+                        let result =
+                            match agent_config(goal, log.clone(), header.clone(), cli.max_steps) {
+                                Ok(config) => {
+                                    let session = session_file
+                                        .as_mut()
+                                        .map(|file| file as &mut dyn SessionLog);
+                                    host.run(config, &mut EventPrinter::new(model.clone()), session)
+                                        .await
+                                        .map_err(anyhow::Error::new)
+                                }
+                                Err(err) => Err(err),
+                            };
                         input.end_run();
                         match result {
                             Ok(summary) => {
                                 print_summary(&summary);
-                                context = summary.context;
+                                log = summary.log;
                                 // 没来得及生效的插话排回队列，下一行接着跑
                                 for message in summary.pending_user_messages {
                                     input.push(crate::input::Line::Task(message));
@@ -283,10 +279,10 @@ async fn real_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A fresh session: the system prompt plus the tools this host offers, which
-/// are recorded on the context as its environment.
-fn session_context(registry: &ToolRegistry) -> Context {
-    Context::new(
+/// The fixed wiring every run needs: the header this host offers (system
+/// prompt plus tools) and the request transform.
+fn session_header(registry: &ToolRegistry) -> Header {
+    Header::new(
         SystemPrompt::new(SYSTEM_PROMPT),
         Environment::new(registry.specs()),
     )
@@ -368,17 +364,10 @@ fn parse_rule(spec: &str) -> anyhow::Result<Rule> {
     }
 }
 
-async fn open_session(
-    path: &Path,
-    host: &agnes_agent::Host<'_>,
-) -> anyhow::Result<agnes_session_file::Opened> {
-    SessionFile::open_or_create(
-        path,
-        SystemPrompt::new(SYSTEM_PROMPT),
-        Environment::new(host.tools().specs()),
-    )
-    .await
-    .with_context(|| format!("opening session `{}`", path.display()))
+async fn open_session(path: &Path) -> anyhow::Result<agnes_session_file::Opened> {
+    SessionFile::open_or_create(path)
+        .await
+        .with_context(|| format!("opening session `{}`", path.display()))
 }
 
 /// 会话文件不可重写：`/new` 轮转到下一个空闲的兄弟文件。
@@ -425,13 +414,19 @@ fn spawn_approver(input: Arc<UserInput>, mut questions: mpsc::UnboundedReceiver<
     });
 }
 
-fn agent_config(goal: Content, context: Context, max_steps: u32) -> anyhow::Result<AgentConfig> {
+fn agent_config(
+    goal: Content,
+    log: Log,
+    header: Header,
+    max_steps: u32,
+) -> anyhow::Result<AgentConfig> {
     let budget: StepBudget = max_steps
         .to_string()
         .parse()
         .context("invalid --max-steps")?;
     Ok(AgentConfig {
-        context,
+        log,
+        header,
         goal,
         budget,
     })
@@ -446,9 +441,10 @@ impl EventPrinter {
         Self { model }
     }
 
-    /// Renders one event from the context log.
+    /// Renders one event from the session log.
     fn recorded(&self, event: &CoreEvent) {
         match event {
+            CoreEvent::Header(_) => {}
             CoreEvent::TurnStart => println!("─ turn ─"),
             CoreEvent::MessageStart { .. } => println!("→ model call"),
             CoreEvent::MessageEnd { stop, .. } => {

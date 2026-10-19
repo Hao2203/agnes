@@ -11,8 +11,8 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
-  `turn_end`）全程记入 `Context` 的事件日志，消息本身也是事件，
-  完整顺序随时可复原
+  `turn_end`）全程记入 `Log` 的事件日志；消息、系统提示与工具环境都是
+  事件，完整顺序随时可复原，一次请求也能从日志单独推导
 - 宿主扩展内核：门禁 / 结果 / 观察三类类型化钩子，拒绝单调
   （插件无法把拒绝变回放行），注册可回收，装载期校验配置
 - 工具调用可走审批流：`allowed-once | rejected | cancelled | unavailable`，
@@ -81,8 +81,8 @@ agnes> exit
 agnes chat --session ./notes/session.jsonl
 ```
 
-- `/new`：清空此前对话（保留系统提示）；带 `--session` 时轮转到新的兄弟
-  文件，因为日志只追加
+- `/new`：清空会话日志（系统提示与工具环境由下一轮重新记录一条 header）；
+  带 `--session` 时轮转到新的兄弟文件，因为日志只追加
 - `exit`、`quit` 或 EOF：退出会话
 - `Ctrl-C`：任务运行中中断任务并保留会话；在提示符处则退出
 - 运行期间输入的消息会排队，在下一个 step 边界注入；如果模型已经给出
@@ -158,8 +158,8 @@ util ← core ← io ← agent ← cli
 ### 关键设计
 
 - **类型状态机**：`Turn<AwaitingMessage>` → `Turn<AwaitingTools>` →
-  `Turn<Closed>`；转移消耗当前状态，把发生的事写进 `Context`（消息与
-  生命周期事件），并返回下一个状态。动态状态只存在于宿主驱动。
+  `Turn<Closed>`；转移消耗当前状态，把发生的事写进 `Log`（消息、系统提示/
+  工具环境与生命周期事件），并返回下一个状态。动态状态只存在于宿主驱动。
 - **宿主扩展内核**：`Plugin` 用类型化钩子表态 —— 门禁（`gate`，只能
   拒绝或要求审批，`Allow` 不可表达）、结果折叠（`settle`，挡回并以反馈
   替换）、只读观察（`observe`）。折叠取最强结果，注册顺序因此无法把
@@ -174,16 +174,17 @@ util ← core ← io ← agent ← cli
   承载，`ApprovalOutcome` 只有 `AllowedOnce` 会放行。
 - **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型（拒绝、
   挡回、超时同样如此）；只有模型或传输错误会中止运行。
-- **Context 即账本**：系统提示、环境（tools）以及一条按发生顺序记录
-  的事件日志；消息也是事件（`Event::Message`），因此任意时刻的完整顺序
-  都能从 `Context::events()` 复原。`RunSummary.context` 可直接传回
-  下一次运行。
+- **日志即账本**：`Log` 是唯一状态，没有旁路的 header 字段 —— 系统提示与
+  工具环境以 `Event::Header` 在每个 turn 开局入账，消息也是事件
+  （`Event::Message`）。`Prompt::from_log` 由最后一条 header 构造系统提示
+  与工具表，因此一次请求完全可以从日志复原；`RunSummary.log` 可直接传回
+  下一次运行。工具集变化只需新 turn 记一条新 header，不需要额外校验。
 - **日志耐久**：每个上报事件先追加到会话文件、再上报宿主；每个模型请求
-  前与收场时 `flush`（fsync）。恢复时校验 `seq` 连续性与头信息，并
-  **补写**未收尾的 step/turn（与 `Turn::interrupted` 同形），从不重写
-  已有记录。
+  前与收场时 `flush`（fsync）。格式 v2（首行版本标记，之后全是事件记录），
+  恢复时校验 `seq` 连续性并**补写**未收尾的 step/turn（与 `Turn::interrupted`
+  同形），从不重写已有记录；旧格式拒载。
 - **转换者由宿主决定**：`core` 不组装提示词；驱动器在每次模型调用前用
-  宿主的 `RequestBuilder` 把 `Context` 转成 `LlmRequest`。
+  宿主的 `RequestBuilder` 把 `Log` 转成 `LlmRequest`。
 - **两阶段可中断**：等待模型消息与等待工具执行都能被打断，且都会以
   `turn_end` 收尾——工具阶段必须补齐每个调用的结果。
 

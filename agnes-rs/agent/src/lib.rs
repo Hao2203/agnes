@@ -8,7 +8,7 @@
 //!
 //! 宿主用 [`Host`] 装配：模型、输入、工具、扩展内核、审批口与会话日志在
 //! 装载期一次性解析。驱动从不自己组装提示词：[`RequestBuilder`] 是宿主
-//! 的转换者，在每次模型调用前由它把 Context 变成请求。
+//! 的转换者，在每次模型调用前由它把日志变成请求。
 //!
 //! 工具执行前先过扩展内核（[`ext`]）：插件用类型化钩子表态（门禁 /
 //! 结果 / 观察），执行权在系统 —— 放行执行、拒绝则以合成失败结果推进
@@ -28,9 +28,9 @@ pub use host::{Host, HostBuilder, LoadError};
 
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
-use agnes_core::context::Context;
 use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::{LlmRequest, Prompt, RequestBuilder};
+use agnes_core::log::Log;
 use agnes_core::message::{TokenUsage, ToolCall, ToolCallId};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::Outcome;
@@ -49,7 +49,7 @@ pub enum AgentError {
     Session(#[from] agnes_io::session::SessionError),
 }
 
-/// 标准转换者：Context 的标准投影（[`Prompt::from_context`]）加模型名。
+/// 标准转换者：日志的标准投影（[`Prompt::from_log`]）加模型名。
 /// 对提示词有想法的宿主自己实现 [`RequestBuilder`]。
 #[derive(Debug, Clone)]
 pub struct StandardRequestBuilder {
@@ -63,15 +63,15 @@ impl StandardRequestBuilder {
 }
 
 impl RequestBuilder for StandardRequestBuilder {
-    fn build(&self, context: &Context) -> LlmRequest {
+    fn build(&self, log: &Log) -> LlmRequest {
         LlmRequest {
             model: self.model.clone(),
-            prompt: Prompt::from_context(context),
+            prompt: Prompt::from_log(log),
         }
     }
 }
 
-/// 运行期间的上报：run 级生命周期事件、Context 日志的镜像事件，以及
+/// 运行期间的上报：run 级生命周期事件、日志的镜像事件，以及
 /// 插件语义的宿主事件 —— 插件的面貌只长在这里，core 不见。
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -124,8 +124,8 @@ impl<F: FnMut(&Event)> Sink for F {
 
 /// 一次完整 turn 的结果。
 ///
-/// `context` 是收场后的会话 —— 系统提示、环境、完整的有序日志；
-/// 喂回下一个 [`agnes_core::turn::AgentConfig`] 即可延续会话。
+/// `log` 是收场后的会话日志（系统提示与工具环境也在其中，作为事件）；
+/// 喂回下一个 [`agnes_core::turn::AgentConfig`] 的 `log` 即可延续会话。
 /// `pending_user_messages` 是没来得及生效的插话（预算耗尽、最后一次答复
 /// 时仍没轮到），宿主接着用。
 #[derive(Debug, Clone)]
@@ -133,7 +133,7 @@ pub struct RunSummary {
     pub outcome: Outcome,
     pub steps_used: u32,
     pub usage: TokenUsage,
-    pub context: Context,
+    pub log: Log,
     pub pending_user_messages: Vec<Content>,
     pub started_at: Timestamp,
     pub finished_at: Timestamp,
@@ -162,7 +162,7 @@ mod tests {
     use crate::ext::{Notice, Plugin, Settlement};
     use crate::permission::{PermissionPlugin, Rule};
     use agnes_core::config::{StepBudget, SystemPrompt};
-    use agnes_core::context::Environment;
+    use agnes_core::header::{Environment, Header};
     use agnes_core::llm::{LlmResponse, StopReason};
     use agnes_core::message::{Message, ToolArguments, ToolOutput};
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
@@ -258,7 +258,8 @@ mod tests {
 
     fn config_with(tools: Vec<ToolSpec>, budget: u32) -> agnes_core::turn::AgentConfig {
         agnes_core::turn::AgentConfig {
-            context: Context::new(SystemPrompt::new("sys"), Environment::new(tools)),
+            log: Log::default(),
+            header: Header::new(SystemPrompt::new("sys"), Environment::new(tools)),
             goal: Content::try_from("take a note").unwrap(),
             budget: StepBudget::new(NonZeroU32::new(budget).unwrap()),
         }
@@ -319,6 +320,7 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
+                CoreEvent::Header(_) => "header",
                 CoreEvent::TurnStart => "turn_start",
                 CoreEvent::StepStart { .. } => "step_start",
                 CoreEvent::MessageStart { .. } => "message_start",
@@ -333,8 +335,8 @@ mod tests {
             .collect()
     }
 
-    fn messages_of(context: &Context) -> Vec<&Message> {
-        context.messages().collect()
+    fn messages_of(log: &Log) -> Vec<&Message> {
+        log.messages().collect()
     }
 
     #[tokio::test]
@@ -373,11 +375,11 @@ mod tests {
         );
 
         // 会话消息：goal、工具调用、工具结果、最终答复
-        let messages = messages_of(&summary.context);
+        let messages = messages_of(&summary.log);
         assert_eq!(messages.len(), 4);
         assert!(matches!(messages[0], Message::User { .. }));
         assert!(matches!(messages[3], Message::Assistant(_)));
-        assert_eq!(summary.context.system().as_str(), "sys");
+        assert_eq!(summary.log.header().unwrap().system.as_str(), "sys");
 
         // 驱动按顺序上报了整个生命周期
         let events = &sink.0;
@@ -385,6 +387,7 @@ mod tests {
         assert_eq!(
             shape(&recorded(events)),
             vec![
+                "header",
                 "message",
                 "turn_start",
                 "step_start",
@@ -408,8 +411,8 @@ mod tests {
             Some(Event::Finished { outcome, .. })
                 if matches!(outcome, Outcome::Answered { .. })
         ));
-        // 上报的核心事件就是 Context 日志里的那些
-        assert_eq!(recorded(events).len(), summary.context.events().len());
+        // 上报的核心事件就是日志里的那些
+        assert_eq!(recorded(events).len(), summary.log.events().len());
         assert!(summary.pending_user_messages.is_empty());
     }
 
@@ -464,7 +467,7 @@ mod tests {
 
         // 落盘顺序就是上报顺序，且一个不落
         assert_eq!(*events.lock().unwrap(), recorded(&sink.0));
-        assert_eq!(events.lock().unwrap().len(), summary.context.events().len());
+        assert_eq!(events.lock().unwrap().len(), summary.log.events().len());
         // 每个模型调用前 + 收场各一次
         assert!(*flushes.lock().unwrap() >= 2);
     }
@@ -547,8 +550,8 @@ mod tests {
     }
 
     impl RequestBuilder for PrimingRequests {
-        fn build(&self, context: &Context) -> LlmRequest {
-            let mut prompt = Prompt::from_context(context);
+        fn build(&self, log: &Log) -> LlmRequest {
+            let mut prompt = Prompt::from_log(log);
             prompt.tools.clear();
             prompt.input.insert(
                 0,
@@ -587,7 +590,7 @@ mod tests {
             Message::User { content } if content.as_str() == "<system> be extra brief"
         ));
         // 环境仍在会话里，未被破坏
-        assert_eq!(summary.context.environment().tools().len(), 1);
+        assert_eq!(summary.log.header().unwrap().environment.tools().len(), 1);
     }
 
     /// 测试直接驱动的输入：消息队列 + 停止通道。
@@ -697,7 +700,7 @@ mod tests {
             CoreEvent::UserMessagesInjected { messages } if messages.len() == 1
         )));
         // 注入的消息属于继续的会话上下文
-        let messages = messages_of(&summary.context);
+        let messages = messages_of(&summary.log);
         assert_eq!(messages.len(), 5);
         assert!(matches!(
             messages[3],
@@ -724,15 +727,13 @@ mod tests {
         assert_eq!(summary.steps_used, 1);
         assert_eq!(summary.usage, TokenUsage::default());
         // 只剩 goal —— 被丢弃的响应从未入账
-        assert_eq!(messages_of(&summary.context).len(), 1);
-        assert!(matches!(
-            messages_of(&summary.context)[0],
-            Message::User { .. }
-        ));
+        assert_eq!(messages_of(&summary.log).len(), 1);
+        assert!(matches!(messages_of(&summary.log)[0], Message::User { .. }));
         // turn 被干净地收场，不是悬着
         assert_eq!(
-            shape(summary.context.events()),
+            shape(summary.log.events()),
             vec![
+                "header",
                 "message",
                 "turn_start",
                 "step_start",
@@ -742,7 +743,7 @@ mod tests {
             ]
         );
         assert!(matches!(
-            summary.context.events().last(),
+            summary.log.events().last(),
             Some(CoreEvent::TurnEnd {
                 outcome: Outcome::Interrupted,
                 ..
@@ -784,7 +785,7 @@ mod tests {
         assert_eq!(summary.steps_used, 1);
         assert_eq!(llm.requests().len(), 1); // 没有后续模型调用
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
-        let messages = messages_of(&summary.context);
+        let messages = messages_of(&summary.log);
         // goal, assistant (tool calls), tool result, interrupted tool result
         assert_eq!(messages.len(), 4);
         assert!(matches!(
@@ -854,7 +855,7 @@ mod tests {
             summary.pending_user_messages,
             vec![Content::try_from("too late for this run").unwrap()]
         );
-        assert_eq!(messages_of(&summary.context).len(), 2);
+        assert_eq!(messages_of(&summary.log).len(), 2);
     }
 
     // —— 插件：权限链驱动宿主 FSM ——
@@ -915,7 +916,7 @@ mod tests {
         let summary = host.run(config(8), &mut sink, None).await.unwrap();
 
         assert!(
-            matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. } if !output.is_error)
+            matches!(&messages_of(&summary.log)[2], Message::ToolResult { output, .. } if !output.is_error)
         );
         assert_eq!(*seen.lock().unwrap(), vec!["ran"]);
     }
@@ -946,7 +947,7 @@ mod tests {
         // 工具确实跑过；入账的是反馈，仍然是那一个调用的一条结果
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
         assert!(
-            matches!(&messages_of(&summary.context)[2], Message::ToolResult { output, .. }
+            matches!(&messages_of(&summary.log)[2], Message::ToolResult { output, .. }
                 if output.is_error && output.content.contains("the note was rejected"))
         );
         assert!(
@@ -981,7 +982,7 @@ mod tests {
         // 工具没跑
         assert!(recorder.calls.lock().unwrap().is_empty());
         // core 日志里是一次普通的失败工具
-        let messages = messages_of(&summary.context);
+        let messages = messages_of(&summary.log);
         assert_eq!(messages.len(), 4);
         assert!(matches!(&messages[2], Message::ToolResult { output, .. }
                 if output.is_error && output.content.contains("denied by policy")));
@@ -997,6 +998,7 @@ mod tests {
         assert_eq!(
             shape(&recorded(&sink.0)),
             vec![
+                "header",
                 "message",
                 "turn_start",
                 "step_start",
@@ -1090,7 +1092,7 @@ mod tests {
         reviewer.await.unwrap();
 
         assert!(recorder.calls.lock().unwrap().is_empty());
-        let messages = messages_of(&summary.context);
+        let messages = messages_of(&summary.log);
         assert!(matches!(&messages[2], Message::ToolResult { output, .. }
                 if output.is_error && output.content.contains("denied by approval: the approval was refused")));
         assert!(sink.0.iter().any(|event| matches!(
@@ -1154,7 +1156,7 @@ mod tests {
             }
         )));
         // 合成错误结果补位，会话完整
-        let messages = messages_of(&summary.context);
+        let messages = messages_of(&summary.log);
         assert_eq!(messages.len(), 3);
         assert!(matches!(&messages[2], Message::ToolResult { output, .. }
                 if output.is_error && output.content.contains("interrupted")));

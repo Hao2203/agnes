@@ -1,14 +1,14 @@
 //! Model-call data: the semantic prompt, the concrete request, and the
-//! builder ("the converter") a host supplies to turn session state into one.
+//! builder ("the converter") a host supplies to turn the session log into one.
 //!
-//! `core` never assembles a request itself — a task exposes its [`Context`]
-//! and the host's [`RequestBuilder`] decides what the model sees: which
-//! messages, which tools, any extra priming. The async seam that carries the
-//! request lives in `agnes-io`.
+//! `core` never assembles a request itself — a task exposes its [`Log`] and
+//! the host's [`RequestBuilder`] decides what the model sees: which messages,
+//! which tools, any extra priming. The async seam that carries the request
+//! lives in `agnes-io`.
 
 use crate::config::ModelName;
 use crate::content::Content;
-use crate::context::Context;
+use crate::log::Log;
 use crate::message::{Message, TokenUsage, ToolCall};
 use crate::tool::ToolSpec;
 use agnes_util::NonEmpty;
@@ -26,27 +26,36 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// The standard projection of a context: its system prompt, then every
-    /// message in the log, in order, then the environment's tools.
-    pub fn from_context(context: &Context) -> Self {
-        let mut input = Vec::with_capacity(context.messages().count() + 1);
-        input.push(Message::System {
-            content: context.system().clone(),
-        });
-        input.extend(context.messages().cloned());
+    /// The standard projection of a log: its most recent header (system
+    /// prompt and tools), then every message in the log, in order.
+    ///
+    /// A log without a header — only reachable from a hand-built log, never
+    /// from [`crate::turn::Turn::start`] — projects to no system prompt and no
+    /// tools.
+    pub fn from_log(log: &Log) -> Self {
+        let header = log.header();
+        let mut input = Vec::with_capacity(log.messages().count() + 1);
+        if let Some(header) = header {
+            input.push(Message::System {
+                content: header.system.clone(),
+            });
+        }
+        input.extend(log.messages().cloned());
         Self {
             input,
-            tools: context.environment().tools().to_vec(),
+            tools: header
+                .map(|header| header.environment.tools().to_vec())
+                .unwrap_or_default(),
         }
     }
 }
 
-/// Turns a [`Context`] into a concrete request. Hosts supply one and the
-/// driver asks it for a request before every model call, so the shape of the
-/// prompt is entirely the host's business — [`Prompt::from_context`] is the
-/// standard projection, not a requirement.
+/// Turns a [`Log`] into a concrete request. Hosts supply one and the driver
+/// asks it for a request before every model call, so the shape of the prompt
+/// is entirely the host's business — [`Prompt::from_log`] is the standard
+/// projection, not a requirement.
 pub trait RequestBuilder {
-    fn build(&self, context: &Context) -> LlmRequest;
+    fn build(&self, log: &Log) -> LlmRequest;
 }
 
 /// The concrete request the seam carries: the semantic [`Prompt`] plus the
@@ -85,7 +94,7 @@ pub struct LlmResponse {
 mod tests {
     use super::*;
     use crate::config::SystemPrompt;
-    use crate::context::Environment;
+    use crate::header::{Environment, Header};
     use crate::tool::{JsonSchema, ToolName};
     use std::str::FromStr;
 
@@ -98,19 +107,20 @@ mod tests {
     }
 
     #[test]
-    fn the_standard_projection_prepends_the_system_prompt_and_keeps_order() {
-        let mut context = Context::new(
+    fn the_standard_projection_uses_the_header_and_keeps_order() {
+        let mut log = Log::default();
+        log.record(crate::event::Event::Header(Header::new(
             SystemPrompt::new("be brief"),
             Environment::new(vec![spec("read_file")]),
-        );
-        context.record(crate::event::Event::Message(Message::User {
+        )));
+        log.record(crate::event::Event::Message(Message::User {
             content: Content::try_from("hello").unwrap(),
         }));
-        context.record(crate::event::Event::Message(Message::Assistant(
+        log.record(crate::event::Event::Message(Message::Assistant(
             crate::message::AssistantMessage::Text(Content::try_from("hi").unwrap()),
         )));
 
-        let prompt = Prompt::from_context(&context);
+        let prompt = Prompt::from_log(&log);
         assert_eq!(prompt.input.len(), 3);
         assert!(
             matches!(&prompt.input[0], Message::System { content } if content.as_str() == "be brief")
@@ -121,5 +131,37 @@ mod tests {
         assert!(matches!(&prompt.input[2], Message::Assistant(_)));
         assert_eq!(prompt.tools.len(), 1);
         assert_eq!(prompt.tools[0].name.as_str(), "read_file");
+    }
+
+    #[test]
+    fn a_later_header_replaces_the_prompt_and_the_tools() {
+        let mut log = Log::default();
+        log.record(crate::event::Event::Header(Header::new(
+            SystemPrompt::new("old"),
+            Environment::new(vec![spec("read_file")]),
+        )));
+        log.record(crate::event::Event::Header(Header::new(
+            SystemPrompt::new("new"),
+            Environment::default(),
+        )));
+
+        let prompt = Prompt::from_log(&log);
+        assert!(
+            matches!(&prompt.input[0], Message::System { content } if content.as_str() == "new")
+        );
+        assert!(prompt.tools.is_empty());
+    }
+
+    #[test]
+    fn a_log_without_a_header_projects_no_system_prompt_and_no_tools() {
+        let mut log = Log::default();
+        log.record(crate::event::Event::Message(Message::User {
+            content: Content::try_from("hello").unwrap(),
+        }));
+
+        let prompt = Prompt::from_log(&log);
+        assert_eq!(prompt.input.len(), 1);
+        assert!(matches!(&prompt.input[0], Message::User { .. }));
+        assert!(prompt.tools.is_empty());
     }
 }

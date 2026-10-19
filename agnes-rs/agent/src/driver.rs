@@ -15,8 +15,8 @@ use std::mem;
 use std::time::Duration;
 
 use agnes_core::content::Content;
-use agnes_core::context::Context;
 use agnes_core::llm::{LlmRequest, LlmResponse, RequestBuilder};
+use agnes_core::log::Log;
 use agnes_core::message::{ToolCall, ToolCallId, ToolOutput};
 use agnes_core::turn::{
     Action, AwaitingMessage, AwaitingTools, Closed, MessageReplied, ToolsAdvanced, Turn,
@@ -69,11 +69,11 @@ impl Machine {
         }
     }
 
-    fn context(&self) -> &Context {
+    fn log(&self) -> &Log {
         match self {
-            Machine::AwaitingMessage(turn) => turn.context(),
-            Machine::AwaitingTools(turn) => turn.context(),
-            Machine::Closed(turn) => turn.context(),
+            Machine::AwaitingMessage(turn) => turn.log(),
+            Machine::AwaitingTools(turn) => turn.log(),
+            Machine::Closed(turn) => turn.log(),
             Machine::Transient => unreachable!("中转状态不可观察"),
         }
     }
@@ -341,31 +341,30 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     async fn pump_actions(&mut self) -> Result<(), AgentError> {
         while let Some(action) = self.machine.poll_actions() {
             match action {
-                Action::Report(event) => {
+                Action::Recorded(index) => {
+                    let event = self
+                        .machine
+                        .log()
+                        .event(index)
+                        .expect("记录通知指向日志之外的位置");
                     // 先入账、再上报：模型可见的东西一定已经在日志里。
-                    self.record(&event).await?;
-                    self.ports.extensions.observe(&Notice::Core(&event));
+                    if let Some(session) = self.outlets.session.as_mut() {
+                        session.append(Timestamp::now(), event).await?;
+                    }
+                    self.ports.extensions.observe(&Notice::Core(event));
                     self.outlets.sink.event(&Event::Recorded {
                         at: Timestamp::now(),
-                        event,
+                        event: event.clone(),
                     });
                 }
                 Action::CallModel => {
                     // 提交边界：请求发出前，日志已经耐久。
                     self.flush_session().await?;
-                    let request = self.ports.requests.build(self.machine.context());
+                    let request = self.ports.requests.build(self.machine.log());
                     self.state = Waiting::AwaitingModel { request };
                 }
                 Action::RunTool(call) => self.dispatch_tool(call),
             }
-        }
-        Ok(())
-    }
-
-    /// 报告类动作落进会话日志（尽力而为；`flush` 才承诺持久）。
-    async fn record(&mut self, event: &agnes_core::event::Event) -> Result<(), AgentError> {
-        if let Some(session) = self.outlets.session.as_mut() {
-            session.append(Timestamp::now(), event).await?;
         }
         Ok(())
     }
