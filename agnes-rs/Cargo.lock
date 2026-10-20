@@ -59,7 +59,6 @@ dependencies = [
  "async-trait",
  "http",
  "jiff",
- "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -111,9 +110,6 @@ dependencies = [
 [[package]]
 name = "agnes-util"
 version = "0.1.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "anstream"

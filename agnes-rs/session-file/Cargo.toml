@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 agnes-core.workspace = true
 agnes-io.workspace = true
+agnes-util.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 serde.workspace = true
@@ -16,7 +17,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
-agnes-util.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 

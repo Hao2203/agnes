@@ -18,6 +18,7 @@
 
 mod driver;
 mod host;
+mod log;
 
 pub mod approval;
 pub mod ext;
@@ -25,13 +26,13 @@ pub mod permission;
 pub mod tools;
 
 pub use host::{Host, HostBuilder, LoadError};
+pub use log::Log;
 
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
 use agnes_core::event::Event as CoreEvent;
-use agnes_core::llm::{LlmRequest, Prompt, RequestBuilder};
-use agnes_core::log::Log;
-use agnes_core::message::{TokenUsage, ToolCall, ToolCallId};
+use agnes_core::llm::{LlmRequest, Prompt};
+use agnes_core::message::{Message, TokenUsage, ToolCall, ToolCallId};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::Outcome;
 use agnes_io::llm::LlmError;
@@ -49,7 +50,13 @@ pub enum AgentError {
     Session(#[from] agnes_io::session::SessionError),
 }
 
-/// 标准转换者：日志的标准投影（[`Prompt::from_log`]）加模型名。
+/// 把会话日志转换成具体请求。宿主提供一个，驱动在每次模型调用前询问它 ——
+/// 提示词长什么样完全是宿主的事，[`Prompt::from_events`] 只是标准投影。
+pub trait RequestBuilder {
+    fn build(&self, log: &Log) -> LlmRequest;
+}
+
+/// 标准转换者：日志的标准投影（[`Prompt::from_events`]）加模型名。
 /// 对提示词有想法的宿主自己实现 [`RequestBuilder`]。
 #[derive(Debug, Clone)]
 pub struct StandardRequestBuilder {
@@ -66,7 +73,7 @@ impl RequestBuilder for StandardRequestBuilder {
     fn build(&self, log: &Log) -> LlmRequest {
         LlmRequest {
             model: self.model.clone(),
-            prompt: Prompt::from_log(log),
+            prompt: Prompt::from_events(log.events()),
         }
     }
 }
@@ -80,8 +87,8 @@ pub enum Event {
         goal: Content,
         tools: Vec<ToolName>,
     },
-    /// Agent 循环里发生的一条核心事件 —— turn/step 生命周期或消息，
-    /// 按发生顺序转发。
+    /// Agent 循环里发生的一条核心事件 —— turn/step 生命周期或消息；
+    /// 驱动已把它记入日志，再按发生顺序转发。
     Recorded {
         at: Timestamp,
         event: CoreEvent,
@@ -124,9 +131,9 @@ impl<F: FnMut(&Event)> Sink for F {
 
 /// 一次完整 turn 的结果。
 ///
-/// `log` 是收场后的会话日志（系统提示与工具环境也在其中，作为事件）；
-/// 喂回下一个 [`agnes_core::turn::AgentConfig`] 的 `log` 即可延续会话。
-/// `pending_user_messages` 是没来得及生效的插话（预算耗尽、最后一次答复
+/// `log` 是驱动记录下来的会话日志（系统提示与工具环境也在其中，作为
+/// 事件）；作为下一次 [`Host::run`] 的 `log` 参数即可延续会话。
+/// `pending_messages` 是没来得及生效的注入消息（预算耗尽、最后一次答复
 /// 时仍没轮到），宿主接着用。
 #[derive(Debug, Clone)]
 pub struct RunSummary {
@@ -134,7 +141,7 @@ pub struct RunSummary {
     pub steps_used: u32,
     pub usage: TokenUsage,
     pub log: Log,
-    pub pending_user_messages: Vec<Content>,
+    pub pending_messages: Vec<Message>,
     pub started_at: Timestamp,
     pub finished_at: Timestamp,
 }
@@ -259,7 +266,6 @@ mod tests {
 
     fn config_with(tools: Vec<ToolSpec>, budget: u32) -> agnes_core::turn::AgentConfig {
         agnes_core::turn::AgentConfig {
-            log: Log::default(),
             header: Header::new(SystemPrompt::new("sys"), Environment::new(tools)),
             goal: Content::try_from("take a note").unwrap(),
             budget: StepBudget::new(NonZeroU32::new(budget).unwrap()),
@@ -331,7 +337,7 @@ mod tests {
                 CoreEvent::ToolExecutionStart { .. } => "tool_start",
                 CoreEvent::ToolExecutionEnd { .. } => "tool_end",
                 CoreEvent::StepEnd { .. } => "step_end",
-                CoreEvent::UserMessagesInjected { .. } => "user_injected",
+                CoreEvent::MessagesInjected { .. } => "messages_injected",
                 CoreEvent::TurnEnd { .. } => "turn_end",
             })
             .collect()
@@ -355,7 +361,10 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -415,7 +424,7 @@ mod tests {
         ));
         // 上报的核心事件就是日志里的那些
         assert_eq!(recorded(events).len(), summary.log.events().len());
-        assert!(summary.pending_user_messages.is_empty());
+        assert!(summary.pending_messages.is_empty());
     }
 
     /// 记录落盘事件、审计记录与 flush 次数的会话日志。
@@ -475,7 +484,7 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), &mut sink, Some(&mut session))
+            .run(config(8), Log::default(), &mut sink, Some(&mut session))
             .await
             .unwrap();
 
@@ -517,7 +526,7 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        host.run(config(8), &mut sink, Some(&mut session))
+        host.run(config(8), Log::default(), &mut sink, Some(&mut session))
             .await
             .unwrap();
         reviewer.await.unwrap();
@@ -563,7 +572,12 @@ mod tests {
             .unwrap();
 
         let err = host
-            .run(config(4), &mut Collector(Vec::new()), Some(&mut session))
+            .run(
+                config(4),
+                Log::default(),
+                &mut Collector(Vec::new()),
+                Some(&mut session),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Llm(_)));
@@ -608,7 +622,10 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
         assert!(
             recorded(&sink.0)
@@ -635,7 +652,7 @@ mod tests {
             .build()
             .unwrap();
         let err = host
-            .run(config(4), &mut Collector(Vec::new()), None)
+            .run(config(4), Log::default(), &mut Collector(Vec::new()), None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -652,7 +669,7 @@ mod tests {
 
     impl RequestBuilder for PrimingRequests {
         fn build(&self, log: &Log) -> LlmRequest {
-            let mut prompt = Prompt::from_log(log);
+            let mut prompt = Prompt::from_events(log.events());
             prompt.tools.clear();
             prompt.input.insert(
                 0,
@@ -679,7 +696,10 @@ mod tests {
 
         let config = config_with(host.tools().specs(), 4);
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config, &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config, Log::default(), &mut sink, None)
+            .await
+            .unwrap();
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));
 
         let requests = llm.requests();
@@ -777,7 +797,10 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -798,7 +821,7 @@ mod tests {
         // 注入事件随日志上报
         assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
-            CoreEvent::UserMessagesInjected { messages } if messages.len() == 1
+            CoreEvent::MessagesInjected { messages } if messages.len() == 1
         )));
         // 注入的消息属于继续的会话上下文
         let messages = messages_of(&summary.log);
@@ -807,7 +830,7 @@ mod tests {
             messages[3],
             Message::User { content } if content.as_str() == "also update the readme"
         ));
-        assert!(summary.pending_user_messages.is_empty());
+        assert!(summary.pending_messages.is_empty());
     }
 
     #[tokio::test]
@@ -821,7 +844,10 @@ mod tests {
             tokio::task::yield_now().await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(host.run(config(4), &mut sink, None), interrupter);
+        let (result, ()) = tokio::join!(
+            host.run(config(4), Log::default(), &mut sink, None),
+            interrupter
+        );
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
@@ -879,7 +905,10 @@ mod tests {
             tokio::task::yield_now().await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(host.run(config(8), &mut sink, None), interrupter);
+        let (result, ()) = tokio::join!(
+            host.run(config(8), Log::default(), &mut sink, None),
+            interrupter
+        );
         let summary = result.unwrap();
 
         assert_eq!(summary.outcome, Outcome::Interrupted);
@@ -912,7 +941,10 @@ mod tests {
         let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(4), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(4), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         let requests = llm.requests();
         assert_eq!(requests.len(), 2);
@@ -927,10 +959,10 @@ mod tests {
             }
         );
         assert_eq!(summary.steps_used, 2);
-        assert!(summary.pending_user_messages.is_empty());
+        assert!(summary.pending_messages.is_empty());
         assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
-            CoreEvent::UserMessagesInjected { messages } if messages.len() == 1
+            CoreEvent::MessagesInjected { messages } if messages.len() == 1
         )));
     }
 
@@ -943,7 +975,10 @@ mod tests {
         let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(1), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(1), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             summary.outcome,
@@ -951,10 +986,12 @@ mod tests {
                 reply: Content::try_from("all done").unwrap()
             }
         );
-        // 插话没有进会话；会话里只有 goal 和答复
+        // 注入没有进会话；会话里只有 goal 和答复
         assert_eq!(
-            summary.pending_user_messages,
-            vec![Content::try_from("too late for this run").unwrap()]
+            summary.pending_messages,
+            vec![Message::User {
+                content: Content::try_from("too late for this run").unwrap()
+            }]
         );
         assert_eq!(messages_of(&summary.log).len(), 2);
     }
@@ -1014,7 +1051,10 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         assert!(
             matches!(&messages_of(&summary.log)[2], Message::ToolResult { output, .. } if !output.is_error)
@@ -1043,7 +1083,10 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         // 工具确实跑过；入账的是反馈，仍然是那一个调用的一条结果
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
@@ -1078,7 +1121,10 @@ mod tests {
             .unwrap();
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
 
         // 工具没跑
         assert!(recorder.calls.lock().unwrap().is_empty());
@@ -1147,7 +1193,10 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
         reviewer.await.unwrap();
 
         // 批准后工具真正运行了
@@ -1189,7 +1238,10 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
         reviewer.await.unwrap();
 
         assert!(recorder.calls.lock().unwrap().is_empty());
@@ -1236,7 +1288,10 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
             input.interrupt();
         };
-        let (result, ()) = tokio::join!(host.run(config(8), &mut sink, None), interrupter);
+        let (result, ()) = tokio::join!(
+            host.run(config(8), Log::default(), &mut sink, None),
+            interrupter
+        );
         let summary = result.unwrap();
         drop(kept_questions);
 
@@ -1282,7 +1337,10 @@ mod tests {
             .build()
             .unwrap();
         let mut sink = Collector(Vec::new());
-        let summary = host.run(config(8), &mut sink, None).await.unwrap();
+        let summary = host
+            .run(config(8), Log::default(), &mut sink, None)
+            .await
+            .unwrap();
         drop(kept_questions);
 
         assert!(matches!(summary.outcome, Outcome::Answered { .. }));

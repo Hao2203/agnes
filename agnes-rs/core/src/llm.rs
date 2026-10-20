@@ -1,14 +1,13 @@
 //! Model-call data: the semantic prompt, the concrete request, and the
-//! builder ("the converter") a host supplies to turn the session log into one.
+//! standard projection from a sequence of runtime events.
 //!
-//! `core` never assembles a request itself — a task exposes its [`Log`] and
-//! the host's [`RequestBuilder`] decides what the model sees: which messages,
-//! which tools, any extra priming. The async seam that carries the request
-//! lives in `agnes-io`.
+//! `core` never assembles a request itself — the host decides what the model
+//! sees: which messages, which tools, any extra priming. The async seam that
+//! carries the request lives in `agnes-io`.
 
 use crate::config::ModelName;
 use crate::content::Content;
-use crate::log::Log;
+use crate::event::Event;
 use crate::message::{Message, TokenUsage, ToolCall};
 use crate::tool::ToolSpec;
 use agnes_util::NonEmpty;
@@ -26,21 +25,31 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// The standard projection of a log: its most recent header (system
-    /// prompt and tools), then every message in the log, in order.
+    /// The standard projection of a sequence of runtime events: the most
+    /// recent header (system prompt and tools), then every message, in order.
     ///
-    /// A log without a header — only reachable from a hand-built log, never
-    /// from [`crate::turn::Turn::start`] — projects to no system prompt and no
-    /// tools.
-    pub fn from_log(log: &Log) -> Self {
-        let header = log.header();
-        let mut input = Vec::with_capacity(log.messages().count() + 1);
+    /// Events without a header — a hand-built or restored history whose driver
+    /// has not yet recorded this turn's header — project to no system prompt
+    /// and no tools.
+    pub fn from_events(events: &[Event]) -> Self {
+        let header = events.iter().rev().find_map(|event| match event {
+            Event::Header(header) => Some(header),
+            _ => None,
+        });
+        let messages = events
+            .iter()
+            .filter(|event| matches!(event, Event::Message(_)))
+            .count();
+        let mut input = Vec::with_capacity(messages + 1);
         if let Some(header) = header {
             input.push(Message::System {
                 content: header.system.clone(),
             });
         }
-        input.extend(log.messages().cloned());
+        input.extend(events.iter().filter_map(|event| match event {
+            Event::Message(message) => Some(message.clone()),
+            _ => None,
+        }));
         Self {
             input,
             tools: header
@@ -48,14 +57,6 @@ impl Prompt {
                 .unwrap_or_default(),
         }
     }
-}
-
-/// Turns a [`Log`] into a concrete request. Hosts supply one and the driver
-/// asks it for a request before every model call, so the shape of the prompt
-/// is entirely the host's business — [`Prompt::from_log`] is the standard
-/// projection, not a requirement.
-pub trait RequestBuilder {
-    fn build(&self, log: &Log) -> LlmRequest;
 }
 
 /// The concrete request the seam carries: the semantic [`Prompt`] plus the
@@ -69,8 +70,7 @@ pub struct LlmRequest {
 /// Why the model stopped — carrying the data that distinguishes the case,
 /// so impossible combinations (tool use without calls, a final answer
 /// without content) cannot be constructed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     /// The model produced a final answer; guaranteed non-empty.
     Completed { content: Content },
@@ -110,19 +110,20 @@ mod tests {
 
     #[test]
     fn the_standard_projection_uses_the_header_and_keeps_order() {
-        let mut log = Log::default();
-        log.record(crate::event::Event::Header(Header::new(
-            SystemPrompt::new("be brief"),
-            Environment::new(vec![spec("read_file")]),
-        )));
-        log.record(crate::event::Event::Message(Message::User {
-            content: Content::try_from("hello").unwrap(),
-        }));
-        log.record(crate::event::Event::Message(Message::Assistant(
-            crate::message::AssistantMessage::Text(Content::try_from("hi").unwrap()),
-        )));
+        let events = vec![
+            Event::Header(Header::new(
+                SystemPrompt::new("be brief"),
+                Environment::new(vec![spec("read_file")]),
+            )),
+            Event::Message(Message::User {
+                content: Content::try_from("hello").unwrap(),
+            }),
+            Event::Message(Message::Assistant(crate::message::AssistantMessage::Text(
+                Content::try_from("hi").unwrap(),
+            ))),
+        ];
 
-        let prompt = Prompt::from_log(&log);
+        let prompt = Prompt::from_events(&events);
         assert_eq!(prompt.input.len(), 3);
         assert!(
             matches!(&prompt.input[0], Message::System { content } if content.as_str() == "be brief")
@@ -137,17 +138,18 @@ mod tests {
 
     #[test]
     fn a_later_header_replaces_the_prompt_and_the_tools() {
-        let mut log = Log::default();
-        log.record(crate::event::Event::Header(Header::new(
-            SystemPrompt::new("old"),
-            Environment::new(vec![spec("read_file")]),
-        )));
-        log.record(crate::event::Event::Header(Header::new(
-            SystemPrompt::new("new"),
-            Environment::default(),
-        )));
+        let events = vec![
+            Event::Header(Header::new(
+                SystemPrompt::new("old"),
+                Environment::new(vec![spec("read_file")]),
+            )),
+            Event::Header(Header::new(
+                SystemPrompt::new("new"),
+                Environment::default(),
+            )),
+        ];
 
-        let prompt = Prompt::from_log(&log);
+        let prompt = Prompt::from_events(&events);
         assert!(
             matches!(&prompt.input[0], Message::System { content } if content.as_str() == "new")
         );
@@ -155,13 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn a_log_without_a_header_projects_no_system_prompt_and_no_tools() {
-        let mut log = Log::default();
-        log.record(crate::event::Event::Message(Message::User {
+    fn events_without_a_header_project_no_system_prompt_and_no_tools() {
+        let events = vec![Event::Message(Message::User {
             content: Content::try_from("hello").unwrap(),
-        }));
+        })];
 
-        let prompt = Prompt::from_log(&log);
+        let prompt = Prompt::from_events(&events);
         assert_eq!(prompt.input.len(), 1);
         assert!(matches!(&prompt.input[0], Message::User { .. }));
         assert!(prompt.tools.is_empty());

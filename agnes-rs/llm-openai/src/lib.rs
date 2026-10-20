@@ -79,6 +79,7 @@ mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::content::Content;
+    use agnes_core::event::Event;
     use agnes_core::llm::Prompt;
     use agnes_core::message::Message;
     use std::num::NonZeroU32;
@@ -274,7 +275,6 @@ mod tests {
         );
 
         let config = agnes_core::turn::AgentConfig {
-            log: agnes_core::log::Log::default(),
             header: agnes_core::header::Header::new(
                 SystemPrompt::new("sys"),
                 agnes_core::header::Environment::default(),
@@ -284,51 +284,70 @@ mod tests {
         };
         let model = ModelName::from_str("gpt-test").unwrap();
         let mut turn = agnes_core::turn::Turn::start(config);
-        let mut request = build(&turn, &model);
-        while turn.poll_actions().is_some() {}
+        let mut events = Vec::new();
+        let mut request_slot = None;
+        let mut call_slot = None;
+        pump(
+            &mut turn,
+            &mut events,
+            &model,
+            &mut request_slot,
+            &mut call_slot,
+        );
+        let request = request_slot
+            .take()
+            .expect("the first model call is requested");
 
         let response = Llm::complete(&openai, &request).await.unwrap();
         let agnes_core::turn::MessageReplied::Tools { mut turn } = turn.model_responded(response)
         else {
             panic!("expected Tools");
         };
-        let mut call: Option<agnes_core::message::ToolCall> = None;
-        while let Some(action) = turn.poll_actions() {
-            match action {
-                agnes_core::turn::Action::CallModel => {
-                    request = build(&turn, &model);
-                }
-                agnes_core::turn::Action::RunTool(run) => call = Some(run),
-                _ => {}
-            }
-        }
+        pump(
+            &mut turn,
+            &mut events,
+            &model,
+            &mut request_slot,
+            &mut call_slot,
+        );
         assert!(
             matches!(
-                &call,
+                &call_slot,
                 Some(tool) if tool.id.as_str() == "call_1" && tool.name.as_str() == "flag"
             ),
             "第一个响应应该派发 flag 调用"
         );
 
-        let call = call.unwrap();
+        let call = call_slot.take().unwrap();
         turn.tool_started(&call.id);
         let agnes_core::turn::ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(call.id, agnes_core::message::ToolOutput::success("ok"))
         else {
             panic!("expected NextStep");
         };
-        while let Some(action) = turn.poll_actions() {
-            if let agnes_core::turn::Action::CallModel = action {
-                request = build(&turn, &model);
-            }
-        }
+        pump(
+            &mut turn,
+            &mut events,
+            &model,
+            &mut request_slot,
+            &mut call_slot,
+        );
+        let request = request_slot
+            .take()
+            .expect("the second model call is requested");
 
         let response = Llm::complete(&openai, &request).await.unwrap();
         let agnes_core::turn::MessageReplied::Closed { mut turn } = turn.model_responded(response)
         else {
             panic!("expected Closed");
         };
-        while turn.poll_actions().is_some() {}
+        pump(
+            &mut turn,
+            &mut events,
+            &model,
+            &mut request_slot,
+            &mut call_slot,
+        );
         assert_eq!(
             turn.outcome(),
             &agnes_core::turn::Outcome::Answered {
@@ -337,11 +356,28 @@ mod tests {
         );
     }
 
-    /// 在见到 `Action::CallModel` 的当下，用会话状态构造具体请求。
-    fn build<S>(turn: &agnes_core::turn::Turn<S>, model: &ModelName) -> LlmRequest {
+    /// 像驱动一样消费动作：事件按序收集，`CallModel` 时用事件序列构造请求。
+    fn pump<S>(
+        turn: &mut agnes_core::turn::Turn<S>,
+        events: &mut Vec<Event>,
+        model: &ModelName,
+        request: &mut Option<LlmRequest>,
+        call: &mut Option<agnes_core::message::ToolCall>,
+    ) {
+        while let Some(action) = turn.poll_actions() {
+            match action {
+                agnes_core::turn::Action::Record(event) => events.push(event),
+                agnes_core::turn::Action::CallModel => *request = Some(build(events, model)),
+                agnes_core::turn::Action::RunTool(run) => *call = Some(run),
+            }
+        }
+    }
+
+    /// 在见到 `Action::CallModel` 的当下，用已有事件构造具体请求。
+    fn build(events: &[Event], model: &ModelName) -> LlmRequest {
         LlmRequest {
             model: model.clone(),
-            prompt: Prompt::from_log(turn.log()),
+            prompt: Prompt::from_events(events),
         }
     }
 }

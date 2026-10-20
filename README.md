@@ -11,8 +11,8 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
-  `turn_end`）全程记入 `Log` 的事件日志；消息、系统提示与工具环境都是
-  事件，完整顺序随时可复原，一次请求也能从日志单独推导
+  `turn_end`）以事件动作交给下游，由驱动按序记入 `Log`；消息、系统提示与
+  工具环境都是事件，完整顺序随时可复原，一次请求也能从日志单独推导
 - 宿主扩展内核：门禁 / 结果 / 观察三类类型化钩子，拒绝单调
   （插件无法把拒绝变回放行），注册可回收，装载期校验配置
 - 工具调用可走审批流：`allowed-once | rejected | cancelled | unavailable`，
@@ -23,7 +23,7 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 - 边界处一次性解析：模型名、URL、API key、工具名等都是强类型
 - 秘密保护：API key 由 `secrecy` 承载，调试输出不泄露明文
 - 内置沙箱化的文件工具，以及默认关闭的 shell 工具
-- 运行中可中断、可注入用户消息，turn 预算防止失控循环
+- 运行中可中断、可注入消息（角色由 `Message` 保留），turn 预算防止失控循环
 
 ## 快速开始
 
@@ -148,19 +148,20 @@ util ← core ← io ← agent ← cli
 | crate | 职责 |
 | --- | --- |
 | `agnes-util` | 零依赖基础类型：`NonEmpty<T>`、`EmptyError` |
-| `agnes-core` | 纯领域模型与类型状态机，无 I/O、无异步 |
+| `agnes-core` | 纯领域模型与类型状态机，无 I/O、无异步、不含序列化 |
 | `agnes-io` | 异步端口 trait：`Llm`、`Tool`、`HttpTransport`、`Input`、`SessionLog` |
 | `agnes-llm-openai` | OpenAI Chat Completions 协议适配，泛型于传输层 |
 | `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器 |
-| `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写 |
-| `agnes-agent` | 宿主装配（`Host`）、驱动状态机、扩展内核与内置工具 |
+| `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写；线格式（wire）定义在此 |
+| `agnes-agent` | 宿主装配（`Host`）、驱动状态机、会话日志 `Log`、扩展内核与内置工具 |
 | `agnes-cli` | 二进制 `agnes`：参数解析、REPL、审批与终端渲染 |
 
 ### 关键设计
 
 - **类型状态机**：`Turn<AwaitingMessage>` → `Turn<AwaitingTools>` →
-  `Turn<Closed>`；转移消耗当前状态，把发生的事写进 `Log`（消息、系统提示/
-  工具环境与生命周期事件），并返回下一个状态。动态状态只存在于宿主驱动。
+  `Turn<Closed>`；转移消耗当前状态，把发生的事作为事件动作交给下游（消息、
+  系统提示/工具环境与生命周期事件），由驱动按序记入 `Log`，并返回下一个
+  状态。core 不持有日志；动态状态只存在于宿主驱动。
 - **宿主扩展内核**：`Plugin` 用类型化钩子表态 —— 门禁（`gate`，只能
   拒绝或要求审批，`Allow` 不可表达）、结果折叠（`settle`，挡回并以反馈
   替换）、只读观察（`observe`）。折叠取最强结果，注册顺序因此无法把
@@ -175,21 +176,27 @@ util ← core ← io ← agent ← cli
   承载，`ApprovalOutcome` 只有 `AllowedOnce` 会放行。
 - **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型（拒绝、
   挡回、超时同样如此）；只有模型或传输错误会中止运行。
-- **日志即账本**：`Log` 是唯一状态，没有旁路的 header 字段 —— 系统提示与
-  工具环境以 `Event::Header` 在每个 turn 开局入账，消息也是事件
-  （`Event::Message`）。`Prompt::from_log` 由最后一条 header 构造系统提示
-  与工具表，因此一次请求完全可以从日志复原；`RunSummary.log` 可直接传回
-  下一次运行。工具集变化只需新 turn 记一条新 header，不需要额外校验。
+- **日志即账本**：`Log` 类型位于宿主侧（`agnes-agent`），由驱动持有，是唯一
+  状态；core 只产生事件动作。没有旁路的 header 字段 —— 系统提示与工具环境
+  以 `Event::Header` 在每个 turn 开局入账，消息也是事件
+  （`Event::Message`），运行中注入同样是带角色的消息事件。
+  `Prompt::from_events` 由最后一条 header 构造系统提示与工具表，
+  因此一次请求完全可以从日志复原；`RunSummary.log` 可直接传回下一次运行。
+  工具集变化只需新 turn 记一条新 header，不需要额外校验。
 - **日志耐久**：每个上报事件先追加到会话文件、再上报宿主；每个模型请求
-  前与收场时 `flush`（fsync）。格式 v3：首行版本标记，之后是 `core` 事件行
+  前与收场时 `flush`（fsync）。格式 v4：首行版本标记，之后是 `core` 事件行
   与 `host` 审计行（审批问询/决定、中止原因），共享一个连续 `seq`；恢复时
   校验连续性并**补写**未收尾的 step/turn（与 `Turn::interrupted` 同形），
-  从不重写已有记录；旧格式拒载。
+  从不重写已有记录；旧格式（含 v3）拒载。
 - **审计与可追溯**：`MessageEnd` 记录产生该消息的模型（适配器从请求回带），
   切换模型后日志仍能归因；审批落定与 run 中止原因不扩 core 词汇，作为
   `HostEvent` 与事件一起落盘。
 - **转换者由宿主决定**：`core` 不组装提示词；驱动器在每次模型调用前用
-  宿主的 `RequestBuilder` 把 `Log` 转成 `LlmRequest`。
+  宿主侧的 `RequestBuilder`（`agnes-agent`）把 `Log` 转成 `LlmRequest`。
+- **格式由上层定义**：core（连同 io 的审计词汇）的类型不实现序列化 ——
+  会话的 JSONL 形状由 `agnes-session-file` 的 `wire` 层定义（同
+  `agnes-llm-openai` 的 `wire.rs`），校验与拒载规则跟着格式走，领域词汇
+  保持格式无关。
 - **两阶段可中断**：等待模型消息与等待工具执行都能被打断，且都会以
   `turn_end` 收尾——工具阶段必须补齐每个调用的结果。
 

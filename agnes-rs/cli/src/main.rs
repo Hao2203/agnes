@@ -16,13 +16,13 @@ use tokio::sync::mpsc;
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
 use agnes_agent::permission::{PolicyBundle, Rule};
 use agnes_agent::tools::FsBundle;
-use agnes_agent::{Event, Sink};
+use agnes_agent::{Event, Log, Sink};
 use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::event::Event as CoreEvent;
 use agnes_core::header::{Environment, Header};
 use agnes_core::llm::StopReason;
-use agnes_core::log::Log;
+use agnes_core::message::Message;
 use agnes_core::tool::ToolName;
 use agnes_core::turn::{AgentConfig, Outcome};
 use agnes_io::input::Input;
@@ -168,13 +168,8 @@ async fn real_main() -> anyhow::Result<()> {
                 deny,
                 ask,
             )?;
-            let config = agent_config(
-                goal,
-                Log::default(),
-                session_header(host.tools()),
-                cli.max_steps,
-            )?;
-            let summary = host.run(config, &mut printer, None).await?;
+            let config = agent_config(goal, session_header(host.tools()), cli.max_steps)?;
+            let summary = host.run(config, Log::default(), &mut printer, None).await?;
             print_summary(&summary);
         }
         Some(Command::Chat) | None => {
@@ -221,7 +216,7 @@ async fn real_main() -> anyhow::Result<()> {
                 if !opened.notes.is_empty() {
                     println!("(recovered {} audit note(s))", opened.notes.len());
                 }
-                log = opened.log;
+                log = Log::restore(opened.events);
                 session_file = Some(opened.session);
             }
             let header = session_header(host.tools());
@@ -242,7 +237,7 @@ async fn real_main() -> anyhow::Result<()> {
                                 let next = rotate(path);
                                 let opened = open_session(&next).await?;
                                 println!("(session cleared — new file: {})", next.display());
-                                log = opened.log;
+                                log = Log::restore(opened.events);
                                 session_file = Some(opened.session);
                             }
                             None => println!("(session cleared)"),
@@ -250,26 +245,39 @@ async fn real_main() -> anyhow::Result<()> {
                     }
                     Line::Task(goal) => {
                         input.begin_run();
-                        let result =
-                            match agent_config(goal, log.clone(), header.clone(), cli.max_steps) {
-                                Ok(config) => {
-                                    let session = session_file
-                                        .as_mut()
-                                        .map(|file| file as &mut dyn SessionLog);
-                                    host.run(config, &mut EventPrinter::new(model.clone()), session)
-                                        .await
-                                        .map_err(anyhow::Error::new)
-                                }
-                                Err(err) => Err(err),
-                            };
+                        let result = match agent_config(goal, header.clone(), cli.max_steps) {
+                            Ok(config) => {
+                                let session = session_file
+                                    .as_mut()
+                                    .map(|file| file as &mut dyn SessionLog);
+                                host.run(
+                                    config,
+                                    log.clone(),
+                                    &mut EventPrinter::new(model.clone()),
+                                    session,
+                                )
+                                .await
+                                .map_err(anyhow::Error::new)
+                            }
+                            Err(err) => Err(err),
+                        };
                         input.end_run();
                         match result {
                             Ok(summary) => {
                                 print_summary(&summary);
                                 log = summary.log;
-                                // 没来得及生效的插话排回队列，下一行接着跑
-                                for message in summary.pending_user_messages {
-                                    input.push(crate::input::Line::Task(message));
+                                // 没来得及生效的注入排回队列，下一行接着跑。
+                                // 终端输入只有用户消息；其他角色理论不会出现，
+                                // 但不要静默丢弃。
+                                for message in summary.pending_messages {
+                                    match message {
+                                        Message::User { content } => {
+                                            input.push(crate::input::Line::Task(content));
+                                        }
+                                        other => {
+                                            eprintln!("note: unused injected message: {other:?}");
+                                        }
+                                    }
                                 }
                             }
                             Err(err) => eprintln!("error: {err:#}"),
@@ -417,18 +425,12 @@ fn spawn_approver(input: Arc<UserInput>, mut questions: mpsc::UnboundedReceiver<
     });
 }
 
-fn agent_config(
-    goal: Content,
-    log: Log,
-    header: Header,
-    max_steps: u32,
-) -> anyhow::Result<AgentConfig> {
+fn agent_config(goal: Content, header: Header, max_steps: u32) -> anyhow::Result<AgentConfig> {
     let budget: StepBudget = max_steps
         .to_string()
         .parse()
         .context("invalid --max-steps")?;
     Ok(AgentConfig {
-        log,
         header,
         goal,
         budget,
@@ -466,7 +468,7 @@ impl EventPrinter {
             // messages are rendered by the summary; the injected marker is
             // handled above; step/turn closes carry no extra news
             CoreEvent::Message(_)
-            | CoreEvent::UserMessagesInjected { .. }
+            | CoreEvent::MessagesInjected { .. }
             | CoreEvent::StepStart { .. }
             | CoreEvent::StepEnd { .. }
             | CoreEvent::TurnEnd { .. } => {}
@@ -498,7 +500,7 @@ impl Sink for EventPrinter {
                 }
             }
             Event::Recorded { event, .. } => match event {
-                CoreEvent::UserMessagesInjected { messages, .. } => {
+                CoreEvent::MessagesInjected { messages, .. } => {
                     println!("  ▸ injected {} queued message(s)", messages.len());
                 }
                 other => self.recorded(other),
@@ -532,9 +534,12 @@ fn print_summary(summary: &agnes_agent::RunSummary) {
         "[{seconds}s, {} step(s), {}]",
         summary.steps_used, summary.usage
     );
-    // 单次 run：没生效的插话已经无处可去，提示一下别静默丢失
-    for message in &summary.pending_user_messages {
-        eprintln!("note: unused queued message: {message}");
+    // 单次 run：没生效的注入已经无处可去，提示一下别静默丢失
+    for message in &summary.pending_messages {
+        match message {
+            Message::User { content } => eprintln!("note: unused queued message: {content}"),
+            other => eprintln!("note: unused injected message: {other:?}"),
+        }
     }
 }
 

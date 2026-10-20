@@ -67,19 +67,6 @@ impl FromStr for ModelName {
     }
 }
 
-impl serde::Serialize for ModelName {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ModelName {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-        raw.parse().map_err(serde::de::Error::custom)
-    }
-}
-
 /// The system prompt of an agent run. Cloned when sessions are continued;
 /// short prompts are stored inline and longer ones are refcounted.
 #[derive(Clone, PartialEq, Eq)]
@@ -98,19 +85,6 @@ impl SystemPrompt {
 impl fmt::Debug for SystemPrompt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("SystemPrompt").field(&self.as_str()).finish()
-    }
-}
-
-impl serde::Serialize for SystemPrompt {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for SystemPrompt {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self::new(raw))
     }
 }
 

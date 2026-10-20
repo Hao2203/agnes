@@ -10,7 +10,7 @@ use crate::config::SystemPrompt;
 use crate::tool::ToolSpec;
 
 /// The model-side configuration in force for a turn.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     pub system: SystemPrompt,
     pub environment: Environment,
@@ -27,7 +27,7 @@ impl Header {
 
 /// What the run can act with: the tools on offer. Grows with the needs of
 /// hosts.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Environment {
     tools: Vec<ToolSpec>,
 }

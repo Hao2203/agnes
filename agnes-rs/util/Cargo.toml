@@ -5,11 +5,5 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[dependencies]
-serde = { workspace = true, optional = true }
-
-[features]
-serde = ["dep:serde"]
-
 [lints]
 workspace = true

@@ -1,9 +1,9 @@
 //! 运行时事件词汇 —— 一条按发生顺序记录的日志，消息与配置也是事件。
 //!
-//! 会话里发生的一切都是一个 [`Event`]，由 [`Log`](crate::log::Log) 按发生
-//! 顺序记账：模型侧配置（[`Event::Header`]）、turn 边界、模型往返（step）
-//! 边界、工具执行、以及消息本身（[`Event::Message`]）。因为一切都是事件，
-//! `Log::events()` 任何时候都能复原完整的先后顺序，一次请求也能从日志
+//! 会话里发生的一切都是一个 [`Event`]，由机器作为动作交给下游，按发生
+//! 顺序记入日志：模型侧配置（[`Event::Header`]）、turn 边界、模型往返
+//! （step）边界、工具执行、以及消息本身（[`Event::Message`]）。因为一切
+//! 都是事件，日志任何时候都能复原完整的先后顺序，一次请求也能从事件序列
 //! 单独推导出来。
 //!
 //! 提示：turn/step 的生命周期事件都由机器在推进时铸造；唯一的例外
@@ -11,18 +11,13 @@
 //! （它用 [`crate::turn::Turn::tool_started`] /
 //! [`crate::turn::Turn::tool_finished`] 喂回机器）。
 
-use crate::content::Content;
 use crate::header::Header;
 use crate::llm::StopReason;
 use crate::message::{Message, TokenUsage, ToolCall, ToolCallId};
 use crate::turn::{Outcome, StepNumber, StepOutcome};
 
 /// 运行时日志里的一条，按发生顺序。
-///
-/// 序列化是耐久日志的格式契约：变体名是 `snake_case`，未知变体在反序列
-/// 化时被拒绝（fail closed）—— 读不懂的日志不猜，直接拒载。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// 模型侧配置（系统提示与工具环境）生效：每个 turn 开局记一条，
     /// 日志里最后一条就是这一轮请求的依据。
@@ -33,7 +28,7 @@ pub enum Event {
     StepStart { step: StepNumber },
     /// step 开始生成模型消息。
     MessageStart { step: StepNumber },
-    /// 一条消息进入会话：goal、注入的用户消息、模型消息、工具结果。
+    /// 一条消息进入会话：goal、注入的消息、模型消息、工具结果。
     Message(Message),
     /// step 的模型消息完成。
     MessageEnd {
@@ -56,122 +51,9 @@ pub enum Event {
         step: StepNumber,
         outcome: StepOutcome,
     },
-    /// 运行中被插话、在 step 边界生效的用户消息（随后逐条作为
-    /// [`Event::Message`] 入账）。
-    UserMessagesInjected { messages: Vec<Content> },
+    /// 运行中被注入、在 step 边界生效的消息（不一定是用户发出 —— 角色
+    /// 由 [`Message`] 保留；随后逐条作为 [`Event::Message`] 入账）。
+    MessagesInjected { messages: Vec<Message> },
     /// turn 收场 —— 结果就是整个 run 的结果。
     TurnEnd { outcome: Outcome },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::SystemPrompt;
-    use crate::message::{AssistantMessage, ToolOutput};
-    use crate::tool::ToolName;
-    use agnes_util::NonEmpty;
-    use std::str::FromStr;
-
-    fn content(text: &str) -> Content {
-        Content::try_from(text).unwrap()
-    }
-
-    fn call(id: &str) -> ToolCall {
-        ToolCall {
-            id: ToolCallId::new(id),
-            name: ToolName::from_str("note").unwrap(),
-            arguments: crate::message::ToolArguments::new(r#"{"text":"hi"}"#),
-        }
-    }
-
-    /// 每个变体各来一条，覆盖嵌套的消息与结果形状。
-    fn every_variant() -> Vec<Event> {
-        let step = StepNumber::FIRST;
-        let first_call = call("c1");
-        vec![
-            Event::Header(crate::header::Header::new(
-                SystemPrompt::new("sys"),
-                crate::header::Environment::default(),
-            )),
-            Event::TurnStart,
-            Event::StepStart { step },
-            Event::MessageStart { step },
-            Event::Message(Message::System {
-                content: SystemPrompt::new("sys"),
-            }),
-            Event::Message(Message::User {
-                content: content("go"),
-            }),
-            Event::Message(Message::Assistant(AssistantMessage::Text(content("hi")))),
-            Event::Message(Message::Assistant(AssistantMessage::ToolCalls {
-                content: None,
-                calls: NonEmpty::new(first_call.clone()),
-            })),
-            Event::Message(Message::ToolResult {
-                call_id: first_call.id.clone(),
-                output: ToolOutput::success("noted"),
-            }),
-            Event::MessageEnd {
-                step,
-                model: crate::config::ModelName::from_str("test-model").unwrap(),
-                stop: StopReason::ToolUse {
-                    content: None,
-                    calls: NonEmpty::new(first_call),
-                },
-                usage: TokenUsage {
-                    input: 3,
-                    output: 4,
-                },
-            },
-            Event::ToolExecutionStart {
-                step,
-                call: call("c2"),
-            },
-            Event::ToolExecutionEnd {
-                step,
-                call_id: ToolCallId::new("c2"),
-                is_error: true,
-            },
-            Event::StepEnd {
-                step,
-                outcome: StepOutcome::ToolUse,
-            },
-            Event::UserMessagesInjected {
-                messages: vec![content("also")],
-            },
-            Event::TurnEnd {
-                outcome: Outcome::Answered {
-                    reply: content("done"),
-                },
-            },
-        ]
-    }
-
-    #[test]
-    fn every_event_variant_round_trips() {
-        for event in every_variant() {
-            let json = serde_json::to_string(&event).unwrap();
-            let back: Event = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, event, "round trip failed for {json}");
-        }
-    }
-
-    #[test]
-    fn invalid_payloads_are_refused() {
-        // 空内容
-        assert!(serde_json::from_str::<Content>(r#""""#).is_err());
-        // 空工具调用集合 —— NonEmpty 的构造器不可绕过
-        assert!(
-            serde_json::from_str::<StopReason>(r#"{"tool_use":{"content":null,"calls":[]}}"#)
-                .is_err()
-        );
-        // step 编号不能为 0
-        assert!(serde_json::from_str::<Event>(r#"{"step_start":{"step":0}}"#).is_err());
-        // 工具名不能带空白
-        assert!(serde_json::from_str::<ToolName>(r#""a b""#).is_err());
-        // 参数模式必须是对象
-        assert!(serde_json::from_str::<crate::tool::JsonSchema>("[1,2]").is_err());
-        // 未知事件变体：读不懂就拒载，不静默丢弃
-        assert!(serde_json::from_str::<Event>(r#"{"future_event":{}}"#).is_err());
-    }
 }

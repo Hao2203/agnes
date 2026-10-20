@@ -9,7 +9,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use agnes_core::config::ModelName;
-use agnes_core::llm::RequestBuilder;
 use agnes_core::turn::{AgentConfig, Turn};
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
@@ -20,7 +19,7 @@ use jiff::Timestamp;
 use crate::approval::ApprovalChannel;
 use crate::driver::{Driver, Outlets, Ports};
 use crate::ext::{Bundle, Extensions, Plugin};
-use crate::{AgentError, Event, RunSummary, Sink, StandardRequestBuilder};
+use crate::{AgentError, Event, Log, RequestBuilder, RunSummary, Sink, StandardRequestBuilder};
 
 /// 装载期的失败：自包含的配置错误在这里暴露。
 #[derive(Debug, thiserror::Error)]
@@ -94,8 +93,8 @@ impl<'a> Host<'a> {
     ///
     /// 控制：运行中随时可打断（[`InputPort::interrupted`]）—— 模型响应、
     /// 工具执行、审批挂起三个等待点都适用，in-flight 的 future 就地丢弃；
-    /// 运行中的插话（[`InputPort::drain`]）由机器缓存、在下一个 step 边界
-    /// 生效，没生效的随 [`RunSummary::pending_user_messages`] 还给宿主。
+    /// 运行中的注入（[`InputPort::drain`] 的用户消息）由机器缓存、在下一个
+    /// step 边界生效，没生效的随 [`RunSummary::pending_messages`] 还给宿主。
     ///
     /// 工具调用先过扩展内核的门禁折叠 —— 拒绝以合成失败结果推进机器、
     /// `Ask` 则走审批口问询挂起（未接线即拒绝）；结果入账前再过一次
@@ -104,6 +103,7 @@ impl<'a> Host<'a> {
     pub async fn run(
         &mut self,
         config: AgentConfig,
+        log: Log,
         sink: &mut dyn Sink,
         session: Option<&mut dyn SessionLog>,
     ) -> Result<RunSummary, AgentError> {
@@ -135,27 +135,25 @@ impl<'a> Host<'a> {
             session,
         };
         let turn = Turn::start(config);
-        // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）。
-        let mut closed = Driver::new(turn, ports, outlets).run().await?;
+        let mut log = log;
+        // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
+        // 由驱动记录，宿主保留所有权。
+        let closed = Driver::new(&mut log, ports, outlets).run(turn).await?;
 
         let finished_at = Timestamp::now();
-        let outcome = closed.outcome().clone();
-        let steps_used = closed.steps_used();
-        let usage = closed.usage();
-        let pending_user_messages = closed.take_unapplied_user_messages();
-        let log = closed.into_log();
+        let result = closed.into_result();
         let summary = RunSummary {
-            outcome: outcome.clone(),
-            steps_used,
-            usage,
+            outcome: result.outcome.clone(),
+            steps_used: result.steps_used,
+            usage: result.usage,
             log,
-            pending_user_messages,
+            pending_messages: result.unapplied,
             started_at,
             finished_at,
         };
         sink.event(&Event::Finished {
             at: finished_at,
-            outcome,
+            outcome: result.outcome,
         });
         Ok(summary)
     }

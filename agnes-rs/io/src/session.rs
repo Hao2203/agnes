@@ -18,7 +18,6 @@ use agnes_core::message::ToolCallId;
 use agnes_core::tool::ToolName;
 use async_trait::async_trait;
 use jiff::Timestamp;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -30,8 +29,7 @@ pub enum SessionError {
 
 /// How an approval ask settled. Fail-closed: only
 /// [`ApprovalOutcome::AllowedOnce`] lets the call run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     /// Explicitly approved once.
     AllowedOnce,
@@ -54,8 +52,7 @@ impl ApprovalOutcome {
 ///
 /// They never extend [`Event`]: plugins and approvals are host semantics, and
 /// core stays closed. The session format interleaves both by one sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     /// An approval question was handed to the answerer.
     ApprovalRequested { call_id: ToolCallId, tool: ToolName },

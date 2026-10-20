@@ -1,2 +1,2 @@
-# Learned Preferences
-See [learned-preferences/taste.md](learned-preferences/taste.md)
+# Root Taste
+See [root-taste/taste.md](root-taste/taste.md)
