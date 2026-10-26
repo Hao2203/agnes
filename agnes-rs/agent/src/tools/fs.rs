@@ -10,6 +10,7 @@ use agnes_io::tool::Tool;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt as _;
 
+use super::parse_arguments;
 use super::text::{MAX_OUTPUT_BYTES, MAX_OUTPUT_CHARS, MAX_READ_BYTES, truncate};
 
 /// Resolves `relative` under `root`, rejecting absolute paths and any `..`
@@ -105,9 +106,7 @@ impl Tool for ReadFile {
     }
 
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-        let args: PathArgs = arguments
-            .parse()
-            .map_err(|source| ToolError::BadArguments { source })?;
+        let args: PathArgs = parse_arguments(arguments)?;
         let path = resolve_under(&self.root, &args.path)?;
         let file = tokio::fs::File::open(&path)
             .await
@@ -184,9 +183,7 @@ impl Tool for WriteFile {
     }
 
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-        let args: WriteArgs = arguments
-            .parse()
-            .map_err(|source| ToolError::BadArguments { source })?;
+        let args: WriteArgs = parse_arguments(arguments)?;
         let path = resolve_under(&self.root, &args.path)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -252,9 +249,7 @@ impl Tool for ListDir {
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
         const MAX_ENTRIES: usize = 10_000;
 
-        let args: ListArgs = arguments
-            .parse()
-            .map_err(|source| ToolError::BadArguments { source })?;
+        let args: ListArgs = parse_arguments(arguments)?;
         let display = args.path.as_deref().unwrap_or(".");
         let path = resolve_under(&self.root, display)?;
         let mut reader = tokio::fs::read_dir(&path)

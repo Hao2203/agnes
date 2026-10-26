@@ -44,7 +44,6 @@ dependencies = [
  "agnes-util",
  "cold-string",
  "secrecy",
- "serde",
  "serde_json",
  "thiserror",
  "url",

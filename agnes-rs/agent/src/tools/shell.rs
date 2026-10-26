@@ -12,6 +12,7 @@ use agnes_core::tool::{ToolError, ToolSpec};
 use agnes_io::tool::Tool;
 use async_trait::async_trait;
 
+use super::parse_arguments;
 use super::text::{MAX_OUTPUT_CHARS, truncate};
 
 /// Hard cap on one command; a hung shell cannot hang the agent loop.
@@ -60,9 +61,7 @@ impl Tool for Shell {
     }
 
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-        let args: ShellArgs = arguments
-            .parse()
-            .map_err(|source| ToolError::BadArguments { source })?;
+        let args: ShellArgs = parse_arguments(arguments)?;
         let child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&args.command)

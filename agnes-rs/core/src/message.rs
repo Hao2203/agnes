@@ -13,7 +13,6 @@ use crate::config::SystemPrompt;
 use crate::content::Content;
 use agnes_util::NonEmpty;
 use cold_string::ArcColdString;
-use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -66,7 +65,8 @@ impl Hash for ToolCallId {
 }
 
 /// Raw JSON arguments of a tool call, not yet parsed against the tool's
-/// schema. Parsing happens inside the tool (parse at the boundary).
+/// schema. The core only carries the text; parsing happens inside the tool
+/// (parse at the boundary).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ToolArguments(ArcColdString);
 
@@ -77,13 +77,6 @@ impl ToolArguments {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-
-    /// # Errors
-    ///
-    /// Returns the JSON error when the arguments do not match `T`.
-    pub fn parse<T: DeserializeOwned>(&self) -> serde_json::Result<T> {
-        serde_json::from_str(self.0.as_str())
     }
 }
 
@@ -201,19 +194,6 @@ pub enum Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
-
-    #[test]
-    fn tool_arguments_parse_against_concrete_type() {
-        #[derive(Deserialize)]
-        struct Args {
-            path: String,
-        }
-        let args = ToolArguments::new(r#"{"path": "a.txt"}"#);
-        let parsed: Args = args.parse().unwrap();
-        assert_eq!(parsed.path, "a.txt");
-        assert!(ToolArguments::new("not json").parse::<Args>().is_err());
-    }
 
     #[test]
     fn token_usage_accumulates_saturating() {
