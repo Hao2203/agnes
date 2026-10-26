@@ -1,0 +1,4 @@
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "blocks the executor; use tokio::time::sleep" },
+  { path = "std::process::Command::output", reason = "blocking; use tokio::process::Command" },
+]

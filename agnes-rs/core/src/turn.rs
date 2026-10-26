@@ -24,10 +24,10 @@ use crate::config::StepBudget;
 use crate::content::Content;
 use crate::event::Event;
 use crate::header::Header;
-use crate::llm::{LlmResponse, StopReason};
+use crate::llm::{LlmResponse, StopKind, StopReason};
 use crate::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolCallId, ToolOutput};
 use agnes_util::NonEmpty;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
 use std::num::NonZeroU32;
@@ -55,12 +55,14 @@ pub enum Action {
 }
 
 /// turn 怎么收场 —— 也是整个 run 的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 模型给出最终答复。
-    Answered { reply: Content },
+    /// 模型给出最终答复（答复文本属于日志里的消息，不在这里重复）。
+    Answered,
     /// 模型输出触顶。
     LengthExceeded,
+    /// 提供方的内容过滤器中止了响应。
+    ContentFiltered,
     /// 用户打断；日志留着收场前的每一步。
     Interrupted,
     /// step 预算耗尽，不再有下一个模型往返。
@@ -87,6 +89,18 @@ impl StepNumber {
     }
 }
 
+impl From<NonZeroU32> for StepNumber {
+    fn from(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<StepNumber> for NonZeroU32 {
+    fn from(value: StepNumber) -> Self {
+        value.0
+    }
+}
+
 impl fmt::Display for StepNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -94,15 +108,17 @@ impl fmt::Display for StepNumber {
 }
 
 /// 一个 step 怎么收尾。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepOutcome {
-    /// 模型给出答复。收件箱非空且预算允许时 turn 会续跑，否则随之收场。
-    Answered { reply: Content },
-    /// 模型要工具：turn 开下一个 step 接着走。
+    /// 模型给出最终答复。
+    Answered,
+    /// 模型要求工具，工具结果已全部补齐。
     ToolUse,
-    /// 模型输出触顶。
+    /// 模型因长度限制停下。
     LengthExceeded,
-    /// 用户打断。
+    /// 模型被内容过滤拦下。
+    ContentFiltered,
+    /// 用户中断。
     Interrupted,
 }
 
@@ -118,7 +134,7 @@ struct Core {
 
 impl Core {
     /// 把一批转移事件交给下游记账，保持传入顺序。
-    fn note(&mut self, events: Vec<Event>) {
+    fn note(&mut self, events: impl IntoIterator<Item = Event>) {
         for event in events {
             self.actions.push_back(Action::Record(event));
         }
@@ -126,7 +142,7 @@ impl Core {
 
     /// 记录一个机器自己的事件（等同单条 note）。
     fn emit(&mut self, event: Event) {
-        self.actions.push_back(Action::Record(event));
+        self.note([event]);
     }
 }
 
@@ -136,27 +152,45 @@ pub struct AwaitingMessage {
     step: StepNumber,
 }
 
-/// 阶段：等工具结果 —— 调用按模型给出的顺序派发给宿主，结果按 id 落位。
+/// 一个调用槽位：调用与它的完成标记绑在一起，顺序即模型给出的顺序。
+#[derive(Debug, Clone)]
+struct CallSlot {
+    call: ToolCall,
+    finished: bool,
+}
+
+/// 阶段：等工具结果 —— 调用按模型给出的顺序派发给宿主，结果按槽位落位。
 #[derive(Debug)]
 pub struct AwaitingTools {
     step: StepNumber,
-    calls: NonEmpty<ToolCall>,
-    /// 已交给宿主的调用数。
+    slots: NonEmpty<CallSlot>,
+    /// 已交给宿主的槽位数。
     dispatched: usize,
-    outputs: BTreeMap<ToolCallId, ToolOutput>,
 }
 
 impl AwaitingTools {
     /// 把下一个调用交给宿主执行；全部派发完则返回 None。
     fn take_next(&mut self) -> Option<ToolCall> {
-        let call = self.calls.as_ref().get(self.dispatched)?.clone();
+        let slot = self.slots.as_ref().get(self.dispatched)?;
         self.dispatched += 1;
-        Some(call)
+        Some(slot.call.clone())
     }
 
-    /// 是否所有派发过的调用都有了结果。
+    /// 当前 in-flight 的槽位（刚派发、尚未收到结果的那个）。
+    fn in_flight(&self) -> Option<&CallSlot> {
+        let index = self.dispatched.checked_sub(1)?;
+        self.slots.as_ref().get(index)
+    }
+
+    /// 当前 in-flight 的槽位，可变。
+    fn in_flight_mut(&mut self) -> Option<&mut CallSlot> {
+        let index = self.dispatched.checked_sub(1)?;
+        self.slots.make_mut().get_mut(index)
+    }
+
+    /// 是否所有调用都有了结果。
     fn results_complete(&self) -> bool {
-        self.outputs.len() == self.calls.len()
+        self.slots.iter().all(|slot| slot.finished)
     }
 }
 
@@ -190,15 +224,6 @@ impl<Phase> Turn<Phase> {
     /// 从动作队列取走一个待执行动作（FIFO）；队列空了返回 None。
     pub fn poll_actions(&mut self) -> Option<Action> {
         self.core.actions.pop_front()
-    }
-
-    pub fn usage(&self) -> TokenUsage {
-        self.core.usage
-    }
-
-    /// 已启动的 step 数。
-    pub fn steps_used(&self) -> u32 {
-        self.core.steps_started
     }
 }
 
@@ -246,10 +271,14 @@ impl Turn<AwaitingMessage> {
             usage,
         } = response;
         core.usage = core.usage.saturating_add(usage);
-        let stop = stop_reason.clone();
+        let stop = StopKind::from(&stop_reason);
         match stop_reason {
             StopReason::ToolUse { content, calls } => {
-                core.note(vec![
+                let slots = calls.map(|call| CallSlot {
+                    call: call.clone(),
+                    finished: false,
+                });
+                core.note([
                     Event::Message(Message::Assistant(AssistantMessage::ToolCalls {
                         content,
                         calls: calls.clone(),
@@ -263,9 +292,8 @@ impl Turn<AwaitingMessage> {
                 ]);
                 let mut tools = AwaitingTools {
                     step,
-                    calls,
+                    slots,
                     dispatched: 0,
-                    outputs: BTreeMap::new(),
                 };
                 // 一次只派发一个；下一个等结果喂回后再排队。
                 if let Some(call) = tools.take_next() {
@@ -276,8 +304,7 @@ impl Turn<AwaitingMessage> {
                 }
             }
             StopReason::Completed { content } => {
-                let reply = content.clone();
-                core.note(vec![
+                core.note([
                     Event::Message(Message::Assistant(AssistantMessage::Text(content))),
                     Event::MessageEnd {
                         step,
@@ -287,9 +314,7 @@ impl Turn<AwaitingMessage> {
                     },
                     Event::StepEnd {
                         step,
-                        outcome: StepOutcome::Answered {
-                            reply: reply.clone(),
-                        },
+                        outcome: StepOutcome::Answered,
                     },
                 ]);
                 // 收件箱里有话就不收场：注入后在这个 turn 里开下一个 step。
@@ -297,7 +322,7 @@ impl Turn<AwaitingMessage> {
                 if !core.buffered_messages.is_empty() && core.budget.allows(core.steps_started) {
                     let messages = mem::take(&mut core.buffered_messages);
                     core.emit(Event::MessagesInjected {
-                        messages: messages.clone(),
+                        count: messages.len(),
                     });
                     for message in messages {
                         core.emit(Event::Message(message));
@@ -308,15 +333,13 @@ impl Turn<AwaitingMessage> {
                     };
                 }
                 core.emit(Event::TurnEnd {
-                    outcome: Outcome::Answered {
-                        reply: reply.clone(),
-                    },
+                    outcome: Outcome::Answered,
                 });
                 MessageReplied::Closed {
                     turn: Turn {
                         core,
                         phase: Closed {
-                            outcome: Outcome::Answered { reply },
+                            outcome: Outcome::Answered,
                         },
                     },
                 }
@@ -351,6 +374,36 @@ impl Turn<AwaitingMessage> {
                     },
                 }
             }
+            StopReason::ContentFiltered { content } => {
+                let mut events = Vec::with_capacity(3);
+                if let Some(content) = content {
+                    events.push(Event::Message(Message::Assistant(AssistantMessage::Text(
+                        content,
+                    ))));
+                }
+                events.push(Event::MessageEnd {
+                    step,
+                    model,
+                    stop,
+                    usage,
+                });
+                events.push(Event::StepEnd {
+                    step,
+                    outcome: StepOutcome::ContentFiltered,
+                });
+                core.note(events);
+                core.emit(Event::TurnEnd {
+                    outcome: Outcome::ContentFiltered,
+                });
+                MessageReplied::Closed {
+                    turn: Turn {
+                        core,
+                        phase: Closed {
+                            outcome: Outcome::ContentFiltered,
+                        },
+                    },
+                }
+            }
         }
     }
 
@@ -359,7 +412,7 @@ impl Turn<AwaitingMessage> {
     #[must_use]
     pub fn interrupted(self) -> Turn<Closed> {
         let Turn { mut core, phase } = self;
-        core.note(vec![Event::StepEnd {
+        core.note([Event::StepEnd {
             step: phase.step,
             outcome: StepOutcome::Interrupted,
         }]);
@@ -382,16 +435,10 @@ impl Turn<AwaitingTools> {
         self.core.buffered_messages.push(message);
     }
 
-    /// 宿主开始执行已派发的调用：`tool_execution_start`；
-    /// 未知 id 被忽略。
-    pub fn tool_started(&mut self, call_id: &ToolCallId) {
-        let Some(call) = self
-            .phase
-            .calls
-            .iter()
-            .find(|call| call.id == *call_id)
-            .cloned()
-        else {
+    /// 宿主开始执行刚派发的调用：`tool_execution_start`。只认当前
+    /// in-flight 的槽位；没有在飞调用时是空操作。
+    pub fn tool_started(&mut self) {
+        let Some(call) = self.phase.in_flight().map(|slot| slot.call.clone()) else {
             return;
         };
         let step = self.phase.step;
@@ -399,26 +446,31 @@ impl Turn<AwaitingTools> {
     }
 
     /// 一个结果落位：可能仍在执行（下一个调用已排队），可能结算并启动
-    /// 下一个 step（注入在此生效），可能预算耗尽收场。未知 id 被忽略
-    /// （原样交还，不加事件）。
+    /// 下一个 step（注入在此生效），可能预算耗尽收场。
+    ///
+    /// 只接受当前 in-flight 槽位且 id 匹配的结果；重复结果、未知 id 与
+    /// 未派发调用一律幂等忽略，不产生事件，也不污染日志。
     pub fn tool_finished(self, call_id: ToolCallId, output: ToolOutput) -> ToolsAdvanced {
         let Turn {
             mut core,
             mut phase,
         } = self;
-        if !phase.calls.iter().any(|call| call.id == call_id) {
+        let Some(slot) = phase.in_flight_mut() else {
+            return ToolsAdvanced::Ongoing {
+                turn: Turn { core, phase },
+            };
+        };
+        if slot.call.id != call_id || slot.finished {
             return ToolsAdvanced::Ongoing {
                 turn: Turn { core, phase },
             };
         }
-        let is_error = output.is_error;
+        slot.finished = true;
         let step = phase.step;
-        phase.outputs.insert(call_id.clone(), output.clone());
-        core.note(vec![
+        core.note([
             Event::ToolExecutionEnd {
                 step,
                 call_id: call_id.clone(),
-                is_error,
             },
             Event::Message(Message::ToolResult {
                 call_id: call_id.clone(),
@@ -436,7 +488,7 @@ impl Turn<AwaitingTools> {
         }
 
         // 全部落位：结算 step。
-        core.note(vec![Event::StepEnd {
+        core.note([Event::StepEnd {
             step,
             outcome: StepOutcome::ToolUse,
         }]);
@@ -445,7 +497,7 @@ impl Turn<AwaitingTools> {
         let messages = mem::take(&mut core.buffered_messages);
         if !messages.is_empty() {
             core.emit(Event::MessagesInjected {
-                messages: messages.clone(),
+                count: messages.len(),
             });
             for message in messages {
                 core.emit(Event::Message(message));
@@ -474,19 +526,18 @@ impl Turn<AwaitingTools> {
     #[must_use]
     pub fn interrupted(self) -> Turn<Closed> {
         let Turn { mut core, phase } = self;
-        let mut events = Vec::new();
-        for call in phase.calls.iter() {
-            if phase.outputs.contains_key(&call.id) {
+        let mut events = Vec::with_capacity(phase.slots.len().saturating_mul(2).saturating_add(1));
+        for slot in phase.slots.iter() {
+            if slot.finished {
                 continue;
             }
             events.push(Event::ToolExecutionEnd {
                 step: phase.step,
-                call_id: call.id.clone(),
-                is_error: true,
+                call_id: slot.call.id.clone(),
             });
             events.push(Event::Message(Message::ToolResult {
-                call_id: call.id.clone(),
-                output: ToolOutput::error("not run: the user interrupted the agent"),
+                call_id: slot.call.id.clone(),
+                output: ToolOutput::not_run(),
             }));
         }
         events.push(Event::StepEnd {
@@ -559,10 +610,7 @@ fn begin_step(core: &mut Core) -> AwaitingMessage {
     let number = core.steps_started + 1;
     core.steps_started = number;
     let step = StepNumber::new(NonZeroU32::new(number).expect("step count fits a u32"));
-    core.note(vec![
-        Event::StepStart { step },
-        Event::MessageStart { step },
-    ]);
+    core.note([Event::StepStart { step }, Event::MessageStart { step }]);
     core.actions.push_back(Action::CallModel);
     AwaitingMessage { step }
 }
@@ -680,6 +728,23 @@ mod tests {
         })
     }
 
+    fn step_starts(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::StepStart { .. }))
+            .count()
+    }
+
+    fn total_usage(events: &[Event]) -> TokenUsage {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::MessageEnd { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .fold(TokenUsage::default(), TokenUsage::saturating_add)
+    }
+
     fn user(text: &str) -> Message {
         Message::User {
             content: content(text),
@@ -704,7 +769,7 @@ mod tests {
         );
         assert_eq!(calls, 1);
         assert!(tools.is_empty());
-        assert_eq!(turn.steps_used(), 1);
+        assert_eq!(step_starts(&events), 1);
 
         let prompt = Prompt::from_events(&events);
         assert_eq!(prompt.input.len(), 2);
@@ -731,7 +796,7 @@ mod tests {
         assert_eq!(tools, vec!["c1"]);
 
         // 第一个结果落位之前，第二个调用不派发
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::Ongoing { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {
@@ -754,7 +819,7 @@ mod tests {
         };
         let _ = drain(&mut turn, &mut events);
 
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {
@@ -775,7 +840,7 @@ mod tests {
         );
         assert_eq!(calls, 1);
         assert!(tools.is_empty());
-        assert_eq!(turn.steps_used(), 2);
+        assert_eq!(step_starts(&events), 2);
     }
 
     #[test]
@@ -796,12 +861,11 @@ mod tests {
         );
         assert_eq!(calls, 0);
         assert!(tools.is_empty());
-        assert_eq!(
-            turn.outcome(),
-            &Outcome::Answered {
-                reply: content("done it")
-            }
-        );
+        assert_eq!(turn.outcome(), &Outcome::Answered);
+        assert!(messages_of(&events).any(
+            |message| matches!(message, Message::Assistant(AssistantMessage::Text(content))
+                if content.as_str() == "done it")
+        ));
     }
 
     #[test]
@@ -816,7 +880,7 @@ mod tests {
             panic!("expected Tools");
         };
         let _ = drain(&mut turn, &mut events);
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::Closed { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {
@@ -830,7 +894,7 @@ mod tests {
         );
         assert_eq!(calls, 0);
         assert_eq!(turn.outcome(), &Outcome::BudgetExhausted);
-        assert_eq!(turn.steps_used(), 1);
+        assert_eq!(step_starts(&events), 1);
     }
 
     #[test]
@@ -852,7 +916,7 @@ mod tests {
         // 先入缓存，不动状态
         assert!(drain(&mut turn, &mut events).0.is_empty());
 
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {
@@ -921,7 +985,7 @@ mod tests {
         };
         let _ = drain(&mut turn, &mut events);
         turn.inject(user("hold on"));
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let mut turn = turn.interrupted();
         let (shapes, _calls, _tools) = drain(&mut turn, &mut events);
 
@@ -947,7 +1011,7 @@ mod tests {
         };
         let _ = drain(&mut turn, &mut events);
 
-        turn.tool_started(&ToolCallId::new("nope"));
+        // 未知 id 的结果被忽略，不产生事件
         let ToolsAdvanced::Ongoing { mut turn } =
             turn.tool_finished(ToolCallId::new("nope"), ToolOutput::success("x"))
         else {
@@ -959,7 +1023,7 @@ mod tests {
         assert!(tools.is_empty());
 
         // 状态未被扰动：真实结果照常落位
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {
@@ -967,6 +1031,88 @@ mod tests {
         };
         let _ = drain(&mut turn, &mut events);
         assert_eq!(shape(&events).last(), Some(&"message_start"));
+    }
+
+    #[test]
+    fn duplicate_call_ids_still_complete_without_livelock() {
+        let mut turn = Turn::start(config(4));
+        let mut events = Vec::new();
+        let _ = drain(&mut turn, &mut events);
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("dup"), call("dup")])))
+        else {
+            panic!("expected Tools");
+        };
+        let (_, calls, tools) = drain(&mut turn, &mut events);
+        assert_eq!(calls, 0);
+        assert_eq!(tools, vec!["dup"]);
+
+        // 第一个结果落位后派发第二个同 id 调用
+        turn.tool_started();
+        let ToolsAdvanced::Ongoing { mut turn } =
+            turn.tool_finished(ToolCallId::new("dup"), output())
+        else {
+            panic!("expected Ongoing");
+        };
+        let (_, _, tools) = drain(&mut turn, &mut events);
+        assert_eq!(tools, vec!["dup"]);
+
+        // 第二个结果按当前槽位落位，turn 不活锁
+        turn.tool_started();
+        let ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(ToolCallId::new("dup"), output())
+        else {
+            panic!("expected NextStep");
+        };
+        let _ = drain(&mut turn, &mut events);
+        assert_eq!(shape(&events).last(), Some(&"message_start"));
+    }
+
+    #[test]
+    fn a_stale_result_for_the_previous_call_is_ignored() {
+        let mut turn = Turn::start(config(4));
+        let mut events = Vec::new();
+        let _ = drain(&mut turn, &mut events);
+        let MessageReplied::Tools { mut turn } =
+            turn.model_responded(response(tool_use(vec![call("c1"), call("c2")])))
+        else {
+            panic!("expected Tools");
+        };
+        let _ = drain(&mut turn, &mut events);
+
+        turn.tool_started();
+        let ToolsAdvanced::Ongoing { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected Ongoing");
+        };
+        let _ = drain(&mut turn, &mut events);
+
+        // c1 的重复结果在 c2 在飞时被忽略，不产生第二条结果事件
+        let ToolsAdvanced::Ongoing { mut turn } =
+            turn.tool_finished(ToolCallId::new("c1"), output())
+        else {
+            panic!("expected Ongoing");
+        };
+        let (shapes, calls, tools) = drain(&mut turn, &mut events);
+        assert!(shapes.is_empty());
+        assert_eq!(calls, 0);
+        assert!(tools.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolExecutionEnd { .. }))
+                .count(),
+            1
+        );
+
+        turn.tool_started();
+        let ToolsAdvanced::NextStep { mut turn } =
+            turn.tool_finished(ToolCallId::new("c2"), output())
+        else {
+            panic!("expected NextStep");
+        };
+        let _ = drain(&mut turn, &mut events);
     }
 
     #[test]
@@ -980,7 +1126,7 @@ mod tests {
             panic!("expected Tools");
         };
         let _ = drain(&mut turn, &mut events);
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {
@@ -994,13 +1140,13 @@ mod tests {
         let _ = drain(&mut turn, &mut events);
 
         assert_eq!(
-            turn.usage(),
+            total_usage(&events),
             TokenUsage {
                 input: 2,
                 output: 2
             }
         );
-        assert_eq!(turn.steps_used(), 2);
+        assert_eq!(step_starts(&events), 2);
     }
 
     #[test]
@@ -1017,7 +1163,7 @@ mod tests {
         let _ = drain(&mut turn, &mut events);
 
         // 答复入账后，注入紧接着入账，并开了下一个 step
-        assert_eq!(turn.steps_used(), 2);
+        assert_eq!(step_starts(&events), 2);
         assert_eq!(
             shape(&events),
             vec![
@@ -1051,12 +1197,11 @@ mod tests {
         };
         let _ = drain(&mut turn, &mut events);
         let result = turn.into_result();
-        assert_eq!(
-            result.outcome,
-            Outcome::Answered {
-                reply: content("second answer")
-            }
-        );
+        assert_eq!(result.outcome, Outcome::Answered);
+        assert!(messages_of(&events).any(
+            |message| matches!(message, Message::Assistant(AssistantMessage::Text(content))
+                if content.as_str() == "second answer")
+        ));
         assert!(result.unapplied.is_empty());
     }
 
@@ -1074,7 +1219,7 @@ mod tests {
         let _ = drain(&mut turn, &mut events);
 
         let result = turn.into_result();
-        assert!(matches!(result.outcome, Outcome::Answered { .. }));
+        assert!(matches!(result.outcome, Outcome::Answered));
         assert_eq!(result.unapplied, vec![user("too late")]);
         assert_eq!(messages_of(&events).count(), 2);
     }
@@ -1090,7 +1235,7 @@ mod tests {
             panic!("expected Tools");
         };
         let _ = drain(&mut turn, &mut events);
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), output())
         else {

@@ -1,9 +1,9 @@
 //! 会话日志的文件实现：JSONL、单写者、崩溃后补写恢复。
 //!
-//! 格式 v4（每行一个 JSON 对象；首行是版本标记，之后是两种记录）：
+//! 格式 v5（每行一个 JSON 对象；首行是版本标记，之后是两种记录）：
 //!
 //! ```text
-//! {"kind":"meta","format":4}
+//! {"kind":"meta","format":5}
 //! {"kind":"core","seq":1,"time":"2026-10-19T…","event":{"header":{…}}}
 //! {"kind":"host","seq":2,"time":"…","event":{"approval_requested":{…}}}
 //! ```
@@ -17,7 +17,7 @@
 //! 规则：
 //!
 //! - `seq` 从 1 起严格连续（跨两种行）；不连续 = 损坏，拒绝加载（fail closed）。
-//! - 读不懂的 `format` 拒绝加载，不猜；旧格式（v1/v2/v3）同样拒载。
+//! - 读不懂的 `format` 拒绝加载，不猜；旧格式（v1–v4）同样拒载。
 //! - `event` 载荷的具体形状由 [`wire`] 定义（core 的类型不实现序列化）：
 //!   未知变体与非法载荷一律拒载，不猜。
 //! - 只有**最后一行**允许是撕裂的半行（崩溃时没写完）：丢弃并截断到物理
@@ -30,45 +30,56 @@
 
 mod wire;
 
-use std::collections::HashSet;
+pub use wire::WireError;
+
 use std::fmt;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use agnes_core::event::Event;
-use agnes_core::message::{AssistantMessage, Message, ToolCall, ToolCallId, ToolOutput};
+use agnes_core::message::{AssistantMessage, Message, ToolCall, ToolOutput};
 use agnes_core::turn::{Outcome, StepNumber, StepOutcome};
 use agnes_io::session::{HostEvent, SessionError, SessionLog};
 use async_trait::async_trait;
 use jiff::Timestamp;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 /// 本实现写出的格式版本。
-pub const FORMAT: u32 = 4;
-
-/// 未执行的调用补位时用的理由，与 core 的打断路径保持一致。
-const NOT_RUN: &str = "not run: the user interrupted the agent";
+pub const FORMAT: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OpenError {
     #[error("session `{}` is already open by another process", path.display())]
     AlreadyOpen { path: PathBuf },
     #[error("unsupported session format {found}; this build understands {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
-    #[error("corrupt session at line {line}: {detail}")]
-    Corrupt { line: usize, detail: String },
-    #[error("failed to encode a session record: {0}")]
-    Encode(String),
+    #[error("corrupt session at line {line}: {reason}")]
+    Corrupt {
+        line: usize,
+        #[source]
+        reason: CorruptReason,
+    },
+    #[error(transparent)]
+    Session(#[from] SessionError),
     #[error("session i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-impl From<SessionError> for OpenError {
-    fn from(err: SessionError) -> Self {
-        match err {
-            SessionError::Io(err) => OpenError::Io(err),
-            SessionError::Format(detail) => OpenError::Encode(detail),
-        }
-    }
+/// Why a session line could not be accepted.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CorruptReason {
+    #[error("invalid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Shape(#[from] WireError),
+    #[error("the version marker must be the first line")]
+    MarkerNotFirst,
+    #[error("record before the version marker")]
+    RecordBeforeMarker,
+    #[error("expected seq {expected}, found {found}")]
+    Sequence { expected: u64, found: u64 },
 }
 
 /// 一条宿主审计记录（审批问询/决定、失败原因），带落盘时间。
@@ -103,6 +114,9 @@ pub struct SessionFile {
     path: PathBuf,
     writer: BufWriter<tokio::fs::File>,
     next_seq: u64,
+    /// 一次写失败之后，缓冲区里可能留有半行；拒绝继续写，避免把损坏
+    /// 留在文件中间。
+    poisoned: bool,
 }
 
 impl SessionFile {
@@ -111,34 +125,58 @@ impl SessionFile {
     /// 已存在时校验版本标记与记录连续性，然后补齐上一次崩溃留下的未收尾
     /// 事件；返回的 `events` 已经包含补写。系统提示与工具环境不再单独校验
     /// —— 它们在事件序列里，随每个 turn 的 header 事件入账。
+    ///
+    /// # Errors
+    ///
+    /// 文件被其他进程占用、格式过旧/未知、记录损坏，或底层 I/O 失败。
     pub async fn open_or_create(path: impl Into<PathBuf>) -> Result<Opened, OpenError> {
         let path = path.into();
-        let std_file = std::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&path)?;
-        if let Err(err) = std_file.try_lock() {
-            return Err(match err {
-                std::fs::TryLockError::WouldBlock => OpenError::AlreadyOpen { path },
-                std::fs::TryLockError::Error(err) => OpenError::Io(err),
-            });
-        }
+        let open_path = path.clone();
+        // 打开、加锁、整份读取、解析与撕裂尾截断都是阻塞工作；不要占着
+        // executor 线程做。
+        let (std_file, parsed) = tokio::task::spawn_blocking(move || {
+            let std_file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(&open_path)?;
+            if let Err(err) = std_file.try_lock() {
+                return Err(match err {
+                    std::fs::TryLockError::WouldBlock => OpenError::AlreadyOpen { path: open_path },
+                    std::fs::TryLockError::Error(err) => OpenError::Io(err),
+                });
+            }
 
-        let mut reader = tokio::fs::File::from_std(std_file.try_clone()?);
-        let mut raw = String::new();
-        reader.read_to_string(&mut raw).await?;
-        drop(reader);
+            let mut reader = std_file.try_clone()?;
+            let mut raw = String::new();
+            reader.read_to_string(&mut raw)?;
+            drop(reader);
 
-        let parsed = parse(&raw)?;
-        let needs_newline = parsed.valid_len > 0 && !raw[..parsed.valid_len].ends_with('\n');
-        if parsed.torn {
-            // 只截掉从未写过一整行的尾巴；已有记录一个字节都不动。
-            std_file.set_len(parsed.valid_len as u64)?;
-        }
+            let parsed = parse(&raw)?;
+            if parsed.torn {
+                // 只截掉从未写过一整行的尾巴；已有记录一个字节都不动。
+                let valid_len = u64::try_from(parsed.valid_len).map_err(|_| {
+                    OpenError::Io(std::io::Error::other(
+                        "the session file offset does not fit into u64",
+                    ))
+                })?;
+                std_file.set_len(valid_len)?;
+            }
+            Ok((std_file, parsed))
+        })
+        .await
+        .map_err(|err| OpenError::Io(std::io::Error::other(err)))??;
+
+        let Parsed {
+            meta,
+            entries,
+            needs_newline,
+            ..
+        } = parsed;
+        let next_seq = entries.last().map_or(0, Entry::seq);
 
         let mut writer = BufWriter::new(tokio::fs::File::from_std(std_file));
-        if parsed.meta.is_none() {
+        if meta.is_none() {
             write_line(
                 &mut writer,
                 &wire::Line::Meta(wire::Meta { format: FORMAT }),
@@ -149,9 +187,13 @@ impl SessionFile {
             writer.write_all(b"\n").await?;
         }
 
-        let mut events = Vec::new();
-        let mut notes = Vec::new();
-        for entry in parsed.entries {
+        let note_count = entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Host { .. }))
+            .count();
+        let mut events = Vec::with_capacity(entries.len().saturating_sub(note_count));
+        let mut notes = Vec::with_capacity(note_count);
+        for entry in entries {
             match entry {
                 Entry::Core { event, .. } => events.push(event),
                 Entry::Host { note, .. } => notes.push(note),
@@ -160,7 +202,8 @@ impl SessionFile {
         let mut session = SessionFile {
             path,
             writer,
-            next_seq: (events.len() + notes.len()) as u64,
+            next_seq,
+            poisoned: false,
         };
         let repairs = repairs(&events);
         for repair in &repairs {
@@ -183,46 +226,84 @@ impl SessionFile {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Serializes and appends one record. Only a successful write advances the
+    /// sequence; a failed write poisons the handle.
+    async fn write_record(&mut self, line: &wire::Line) -> Result<(), SessionError> {
+        if self.poisoned {
+            return Err(SessionError::Poisoned);
+        }
+        let bytes = encode_line(line)?;
+        match self.writer.write_all(&bytes).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.poisoned = true;
+                Err(SessionError::Io(err))
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl SessionLog for SessionFile {
     async fn append(&mut self, at: Timestamp, event: &Event) -> Result<(), SessionError> {
-        self.next_seq += 1;
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(SessionError::SequenceExhausted)?;
         let record = wire::CoreRecord {
-            seq: self.next_seq,
+            seq,
             time: at,
             event: event.into(),
         };
-        write_line(&mut self.writer, &wire::Line::Core(record)).await
+        self.write_record(&wire::Line::Core(record)).await?;
+        self.next_seq = seq;
+        Ok(())
     }
 
     async fn append_host(&mut self, at: Timestamp, event: &HostEvent) -> Result<(), SessionError> {
-        self.next_seq += 1;
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(SessionError::SequenceExhausted)?;
         let record = wire::HostRecord {
-            seq: self.next_seq,
+            seq,
             time: at,
             event: event.into(),
         };
-        write_line(&mut self.writer, &wire::Line::Host(record)).await
+        self.write_record(&wire::Line::Host(record)).await?;
+        self.next_seq = seq;
+        Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), SessionError> {
-        self.writer.flush().await?;
-        self.writer.get_ref().sync_all().await?;
+        if self.poisoned {
+            return Err(SessionError::Poisoned);
+        }
+        if let Err(err) = self.writer.flush().await {
+            self.poisoned = true;
+            return Err(SessionError::Io(err));
+        }
+        if let Err(err) = self.writer.get_ref().sync_all().await {
+            self.poisoned = true;
+            return Err(SessionError::Io(err));
+        }
         Ok(())
     }
+}
+
+fn encode_line(line: &wire::Line) -> Result<Vec<u8>, SessionError> {
+    let mut bytes = serde_json::to_vec(line).map_err(|err| SessionError::Encode(Box::new(err)))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 async fn write_line(
     writer: &mut BufWriter<tokio::fs::File>,
     line: &wire::Line,
 ) -> Result<(), SessionError> {
-    let mut bytes =
-        serde_json::to_vec(line).map_err(|err| SessionError::Format(err.to_string()))?;
-    bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    Ok(())
+    let bytes = encode_line(line)?;
+    writer.write_all(&bytes).await.map_err(SessionError::Io)
 }
 
 // —— 格式 ——
@@ -249,26 +330,31 @@ struct Parsed {
     valid_len: usize,
     /// 最后一行是否是被丢弃的半行。
     torn: bool,
+    /// 有效前缀末尾是否缺少换行（恢复时要补一个）。
+    needs_newline: bool,
+}
+
+fn account_line(line: &str, valid_len: &mut usize, last_had_newline: &mut bool) {
+    *valid_len += line.len();
+    *last_had_newline = line.ends_with('\n');
+}
+
+fn needs_newline(valid_len: usize, last_had_newline: bool) -> bool {
+    valid_len > 0 && !last_had_newline
 }
 
 fn parse(raw: &str) -> Result<Parsed, OpenError> {
     let mut meta: Option<u32> = None;
     let mut entries: Vec<Entry> = Vec::new();
-    let mut offset = 0;
     let mut valid_len = 0;
-    let mut line_no = 0;
+    let mut last_had_newline = false;
 
-    while offset < raw.len() {
-        let end = raw[offset..]
-            .find('\n')
-            .map(|at| offset + at + 1)
-            .unwrap_or(raw.len());
-        let text = raw[offset..end].trim();
-        line_no += 1;
+    for (index, line) in raw.split_inclusive('\n').enumerate() {
+        let line_no = index + 1;
+        let text = line.trim();
 
         if text.is_empty() {
-            offset = end;
-            valid_len = end;
+            account_line(line, &mut valid_len, &mut last_had_newline);
             continue;
         }
 
@@ -276,32 +362,34 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
         // （未知 kind、坏字段、旧格式）一律拒载。
         let value: serde_json::Value = match serde_json::from_str(text) {
             Ok(value) => value,
-            Err(_) if end == raw.len() => {
+            Err(_) if !line.ends_with('\n') => {
                 return Ok(Parsed {
                     meta,
                     entries,
                     valid_len,
                     torn: true,
+                    needs_newline: needs_newline(valid_len, last_had_newline),
                 });
             }
             Err(err) => {
                 return Err(OpenError::Corrupt {
                     line: line_no,
-                    detail: err.to_string(),
+                    reason: CorruptReason::Json(err),
                 });
             }
         };
-        let line: wire::Line = serde_json::from_value(value).map_err(|err| OpenError::Corrupt {
-            line: line_no,
-            detail: err.to_string(),
-        })?;
+        let wire_line: wire::Line =
+            serde_json::from_value(value).map_err(|err| OpenError::Corrupt {
+                line: line_no,
+                reason: CorruptReason::Json(err),
+            })?;
 
-        let entry = match line {
+        let entry = match wire_line {
             wire::Line::Meta(found) => {
                 if meta.is_some() || !entries.is_empty() {
                     return Err(OpenError::Corrupt {
                         line: line_no,
-                        detail: "the version marker must be the first line".into(),
+                        reason: CorruptReason::MarkerNotFirst,
                     });
                 }
                 if found.format != FORMAT {
@@ -311,31 +399,24 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
                     });
                 }
                 meta = Some(found.format);
-                valid_len = end;
-                offset = end;
+                account_line(line, &mut valid_len, &mut last_had_newline);
                 continue;
             }
             wire::Line::Core(record) => Entry::Core {
                 seq: record.seq,
-                event: record
-                    .event
-                    .try_into()
-                    .map_err(|detail| OpenError::Corrupt {
-                        line: line_no,
-                        detail,
-                    })?,
+                event: record.event.try_into().map_err(|err| OpenError::Corrupt {
+                    line: line_no,
+                    reason: CorruptReason::Shape(err),
+                })?,
             },
             wire::Line::Host(record) => Entry::Host {
                 seq: record.seq,
                 note: Note {
                     at: record.time,
-                    event: record
-                        .event
-                        .try_into()
-                        .map_err(|detail| OpenError::Corrupt {
-                            line: line_no,
-                            detail,
-                        })?,
+                    event: record.event.try_into().map_err(|err| OpenError::Corrupt {
+                        line: line_no,
+                        reason: CorruptReason::Shape(err),
+                    })?,
                 },
             },
         };
@@ -343,19 +424,27 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
         if meta.is_none() {
             return Err(OpenError::Corrupt {
                 line: line_no,
-                detail: "record before the version marker".into(),
+                reason: CorruptReason::RecordBeforeMarker,
             });
         }
-        let expected = entries.len() as u64 + 1;
+        let expected = u64::try_from(entries.len())
+            .map_err(|_| {
+                OpenError::Io(std::io::Error::other(
+                    "the session entry count does not fit into u64",
+                ))
+            })?
+            .saturating_add(1);
         if entry.seq() != expected {
             return Err(OpenError::Corrupt {
                 line: line_no,
-                detail: format!("expected seq {expected}, found {}", entry.seq()),
+                reason: CorruptReason::Sequence {
+                    expected,
+                    found: entry.seq(),
+                },
             });
         }
         entries.push(entry);
-        valid_len = end;
-        offset = end;
+        account_line(line, &mut valid_len, &mut last_had_newline);
     }
 
     Ok(Parsed {
@@ -363,6 +452,7 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
         entries,
         valid_len,
         torn: false,
+        needs_newline: needs_newline(valid_len, last_had_newline),
     })
 }
 
@@ -377,44 +467,49 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
 ///
 /// 完整收场的日志返回空。
 pub fn repairs(events: &[Event]) -> Vec<Event> {
+    struct Slot {
+        call: ToolCall,
+        finished: bool,
+    }
+
     let mut turn_open = false;
     let mut open_step: Option<StepNumber> = None;
-    let mut declared: Vec<ToolCall> = Vec::new();
-    let mut resulted: HashSet<ToolCallId> = HashSet::new();
+    let mut declared: Vec<Slot> = Vec::new();
 
     for event in events {
         match event {
             Event::TurnStart => {
                 turn_open = true;
                 open_step = None;
-                declared.clear();
-                resulted.clear();
             }
             Event::TurnEnd { .. } => {
                 turn_open = false;
                 open_step = None;
-                declared.clear();
-                resulted.clear();
             }
-            Event::StepStart { step } => {
-                open_step = Some(*step);
-                declared.clear();
-                resulted.clear();
-            }
-            Event::StepEnd { .. } => {
-                open_step = None;
-                declared.clear();
-                resulted.clear();
-            }
+            Event::StepStart { step } => open_step = Some(*step),
+            Event::StepEnd { .. } => open_step = None,
             Event::Message(Message::Assistant(AssistantMessage::ToolCalls { calls, .. })) => {
-                declared = calls.to_vec();
-                resulted.clear();
+                declared = calls
+                    .iter()
+                    .map(|call| Slot {
+                        call: call.clone(),
+                        finished: false,
+                    })
+                    .collect();
+                continue;
             }
             Event::Message(Message::ToolResult { call_id, .. }) => {
-                resulted.insert(call_id.clone());
+                if let Some(slot) = declared
+                    .iter_mut()
+                    .find(|slot| slot.call.id == *call_id && !slot.finished)
+                {
+                    slot.finished = true;
+                }
+                continue;
             }
-            _ => {}
+            _ => continue,
         }
+        declared.clear();
     }
 
     let Some(step) = open_step else {
@@ -427,19 +522,18 @@ pub fn repairs(events: &[Event]) -> Vec<Event> {
         };
     };
 
-    let mut closers = Vec::new();
-    for call in declared {
-        if resulted.contains(&call.id) {
+    let mut closers = Vec::with_capacity(declared.len().saturating_mul(2).saturating_add(2));
+    for slot in declared {
+        if slot.finished {
             continue;
         }
         closers.push(Event::ToolExecutionEnd {
             step,
-            call_id: call.id.clone(),
-            is_error: true,
+            call_id: slot.call.id.clone(),
         });
         closers.push(Event::Message(Message::ToolResult {
-            call_id: call.id,
-            output: ToolOutput::error(NOT_RUN),
+            call_id: slot.call.id,
+            output: ToolOutput::not_run(),
         }));
     }
     closers.push(Event::StepEnd {
@@ -459,7 +553,7 @@ mod tests {
     use agnes_core::content::Content;
     use agnes_core::header::{Environment, Header};
     use agnes_core::llm::{LlmResponse, StopReason};
-    use agnes_core::message::{TokenUsage, ToolArguments};
+    use agnes_core::message::{TokenUsage, ToolArguments, ToolCallId};
     use agnes_core::tool::ToolName;
     use agnes_core::turn::{
         Action, AgentConfig, AwaitingMessage, MessageReplied, ToolsAdvanced, Turn,
@@ -521,7 +615,7 @@ mod tests {
             panic!("expected a tool phase")
         };
         prefix.extend(pump(&mut turn));
-        turn.tool_started(&ToolCallId::new("c1"));
+        turn.tool_started();
         let ToolsAdvanced::Ongoing { mut turn } =
             turn.tool_finished(ToolCallId::new("c1"), ToolOutput::success("noted"))
         else {
@@ -698,7 +792,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let raw = concat!(
-            "{\"kind\":\"meta\",\"format\":4}\n",
+            "{\"kind\":\"meta\",\"format\":5}\n",
             "{\"kind\":\"core\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
             "{\"kind\":\"core\",\"seq\":3,\"time\":\"2026-10-19T00:00:01Z\",\"event\":\"turn_start\"}\n",
         );
@@ -718,7 +812,7 @@ mod tests {
             // 空内容
             r#"{"kind":"core","seq":1,"time":"2026-10-19T00:00:00Z","event":{"message":{"user":{"content":""}}}}"#,
             // 空工具调用集合 —— NonEmpty 的构造器不可绕过
-            r#"{"kind":"core","seq":1,"time":"2026-10-19T00:00:00Z","event":{"message_end":{"step":1,"model":"m","stop":{"tool_use":{"content":null,"calls":[]}},"usage":{"input":0,"output":0}}}}"#,
+            r#"{"kind":"core","seq":1,"time":"2026-10-19T00:00:00Z","event":{"message":{"assistant":{"tool_calls":{"content":null,"calls":[]}}}}}"#,
             // step 编号不能为 0
             r#"{"kind":"core","seq":1,"time":"2026-10-19T00:00:00Z","event":{"step_start":{"step":0}}}"#,
             // 工具名不能带空白
@@ -733,7 +827,7 @@ mod tests {
             let path = dir.path().join("s.jsonl");
             std::fs::write(
                 &path,
-                format!("{{\"kind\":\"meta\",\"format\":4}}\n{case}\n"),
+                format!("{{\"kind\":\"meta\",\"format\":5}}\n{case}\n"),
             )
             .unwrap();
 
@@ -748,10 +842,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_reasons_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_json = dir.path().join("bad-json.jsonl");
+        std::fs::write(&bad_json, "{\"kind\":\"meta\",\"format\":5}\nnot json\n").unwrap();
+        let err = SessionFile::open_or_create(bad_json.as_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenError::Corrupt {
+                reason: CorruptReason::Json(_),
+                ..
+            }
+        ));
+
+        let bad_shape = dir.path().join("bad-shape.jsonl");
+        std::fs::write(
+            &bad_shape,
+            "{\"kind\":\"meta\",\"format\":5}\n\
+             {\"kind\":\"core\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\
+             \"event\":{\"message\":{\"assistant\":{\"tool_calls\":{\"content\":null,\"calls\":[]}}}}}\n",
+        )
+        .unwrap();
+        let err = SessionFile::open_or_create(bad_shape.as_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenError::Corrupt {
+                reason: CorruptReason::Shape(WireError::EmptyToolCalls),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_session_refuses_to_advance_the_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let Opened { mut session, .. } = SessionFile::open_or_create(&path).await.unwrap();
+        let before = session.next_seq;
+        session.poisoned = true;
+
+        let err = session
+            .append(Timestamp::now(), &Event::TurnStart)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Poisoned));
+        assert_eq!(session.next_seq, before);
+        assert!(matches!(
+            session.flush().await.unwrap_err(),
+            SessionError::Poisoned
+        ));
+    }
+
+    #[tokio::test]
     async fn a_future_format_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
-        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":5}\n").unwrap();
+        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":6}\n").unwrap();
 
         let err = SessionFile::open_or_create(path.as_path())
             .await
@@ -759,7 +909,25 @@ mod tests {
         assert!(matches!(
             err,
             OpenError::UnsupportedVersion {
-                found: 5,
+                found: 6,
+                supported: FORMAT
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_v4_session_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":4}\n").unwrap();
+
+        let err = SessionFile::open_or_create(path.as_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenError::UnsupportedVersion {
+                found: 4,
                 supported: FORMAT
             }
         ));
@@ -826,7 +994,7 @@ mod tests {
         drop(session);
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(raw, "{\"kind\":\"meta\",\"format\":4}\n");
+        assert_eq!(raw, "{\"kind\":\"meta\",\"format\":5}\n");
     }
 
     #[tokio::test]
@@ -834,7 +1002,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let raw = concat!(
-            "{\"kind\":\"meta\",\"format\":4}\n",
+            "{\"kind\":\"meta\",\"format\":5}\n",
             "{\"kind\":\"core\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
             "{\"kind\":\"core\",\"seq\":2",
         );

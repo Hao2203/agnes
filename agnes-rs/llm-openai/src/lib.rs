@@ -2,12 +2,12 @@
 //!
 //! Generic over [`HttpTransport`]: pair it with `agnes-transport-reqwest`
 //! (tokio) today or any other async transport tomorrow.
-pub mod wire;
+mod wire;
 
 use agnes_core::config::{ApiKey, BaseUrl, ModelName};
 use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_io::http::{HttpTransport, TransportError};
-use agnes_io::llm::{Llm, LlmError};
+use agnes_io::llm::{ApiBody, Llm, LlmError};
 use async_trait::async_trait;
 
 /// Client for any OpenAI-compatible chat-completions API.
@@ -29,34 +29,33 @@ impl<T: HttpTransport> OpenAiClient<T> {
     fn build_request(&self, request: &LlmRequest) -> Result<http::Request<String>, LlmError> {
         let body = serde_json::to_string(&wire::ChatCompletionRequest::from_core(request))
             .expect("request serialization cannot fail");
+        let endpoint = self.base_url.join("chat/completions")?;
         http::Request::builder()
             .method(http::Method::POST)
-            .uri(self.base_url.join("chat/completions").as_str())
+            .uri(endpoint.as_str())
             .header(
                 http::header::AUTHORIZATION,
                 format!("Bearer {}", self.api_key.expose()),
             )
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(body)
-            .map_err(|e| LlmError::Transport(TransportError::Request(anyhow::Error::new(e))))
+            .map_err(|e| LlmError::Transport(TransportError::Request(e)))
     }
 
     fn parse_response(
-        &self,
         model: ModelName,
         status: http::StatusCode,
         body: &str,
     ) -> Result<LlmResponse, LlmError> {
         if !status.is_success() {
+            let detail = wire::extract_error_body(body);
             return Err(LlmError::Api {
                 status,
-                detail: wire::extract_error_body(body),
+                body: ApiBody::new(body, detail),
             });
         }
         let parsed: wire::ChatCompletionResponse =
-            serde_json::from_str(body).map_err(|e| LlmError::Malformed {
-                detail: format!("invalid JSON: {e}"),
-            })?;
+            serde_json::from_str(body).map_err(|err| LlmError::Decode(Box::new(err)))?;
         parsed.into_core(model)
     }
 }
@@ -66,7 +65,7 @@ impl<T: HttpTransport> Llm for OpenAiClient<T> {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let http_request = self.build_request(request)?;
         let http_response = self.transport.send(http_request).await?;
-        self.parse_response(
+        Self::parse_response(
             request.model.clone(),
             http_response.status(),
             http_response.body(),
@@ -125,7 +124,7 @@ mod tests {
         OpenAiClient::new(
             transport,
             BaseUrl::from_str("https://api.example.com/v1").unwrap(),
-            ApiKey::new("sk-test").unwrap(),
+            ApiKey::try_from("sk-test").unwrap(),
         )
     }
 
@@ -169,7 +168,7 @@ mod tests {
         let openai = OpenAiClient::new(
             Capture(Arc::clone(&sink)),
             BaseUrl::from_str("https://api.example.com/v1/").unwrap(),
-            ApiKey::new("sk-test").unwrap(),
+            ApiKey::try_from("sk-test").unwrap(),
         );
         Llm::complete(&openai, &sample_request()).await.unwrap();
 
@@ -210,10 +209,12 @@ mod tests {
             r#"{"error":{"message":"invalid api key"}}"#,
         ));
         let err = Llm::complete(&openai, &sample_request()).await.unwrap_err();
-        let LlmError::Api { status, .. } = &err else {
+        let LlmError::Api { status, body } = &err else {
             panic!("expected Api error");
         };
         assert_eq!(*status, http::StatusCode::UNAUTHORIZED);
+        assert_eq!(body.raw(), r#"{"error":{"message":"invalid api key"}}"#);
+        assert!(body.detail().contains("invalid api key"));
         assert!(err.to_string().contains("invalid api key"));
     }
 
@@ -222,7 +223,7 @@ mod tests {
         let openai = client(FakeTransport::new(200, "not json at all"));
         assert!(matches!(
             Llm::complete(&openai, &sample_request()).await.unwrap_err(),
-            LlmError::Malformed { .. }
+            LlmError::Decode(_)
         ));
     }
 
@@ -271,7 +272,7 @@ mod tests {
                 turns: Mutex::new(turns.into_iter()),
             },
             BaseUrl::from_str("https://api.example.com/v1").unwrap(),
-            ApiKey::new("sk-test").unwrap(),
+            ApiKey::try_from("sk-test").unwrap(),
         );
 
         let config = agnes_core::turn::AgentConfig {
@@ -319,7 +320,7 @@ mod tests {
         );
 
         let call = call_slot.take().unwrap();
-        turn.tool_started(&call.id);
+        turn.tool_started();
         let agnes_core::turn::ToolsAdvanced::NextStep { mut turn } =
             turn.tool_finished(call.id, agnes_core::message::ToolOutput::success("ok"))
         else {
@@ -348,12 +349,12 @@ mod tests {
             &mut request_slot,
             &mut call_slot,
         );
-        assert_eq!(
-            turn.outcome(),
-            &agnes_core::turn::Outcome::Answered {
-                reply: Content::try_from("flipped it").unwrap()
-            }
-        );
+        assert_eq!(turn.outcome(), &agnes_core::turn::Outcome::Answered);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Message(Message::Assistant(agnes_core::message::AssistantMessage::Text(content)))
+                if content.as_str() == "flipped it"
+        )));
     }
 
     /// 像驱动一样消费动作：事件按序收集，`CallModel` 时用事件序列构造请求。

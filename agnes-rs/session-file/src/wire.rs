@@ -1,4 +1,4 @@
-//! 会话文件的线格式：v4 JSONL 的具体形状，以及与领域词汇的互转。
+//! 会话文件的线格式：v5 JSONL 的具体形状，以及与领域词汇的互转。
 //!
 //! 格式是本 crate 的私事 —— core 的类型不实现序列化，形状、校验与拒载
 //! 规则都定义在这里（与 `agnes-llm-openai` 的 wire 同一模式）。变体名是
@@ -6,22 +6,40 @@
 //! 日志不猜，直接拒载；形状非法（空内容、空工具调用集合、step 0、带空白
 //! 的工具名、非对象的参数模式）在换回领域类型时同样拒载。
 
-use agnes_core::config::{ModelName, SystemPrompt};
+use agnes_core::config::{ConfigError, ModelName, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::event::Event;
 use agnes_core::header::{Environment, Header};
-use agnes_core::llm::StopReason;
+use agnes_core::llm::StopKind;
 use agnes_core::message::{
     AssistantMessage, Message, TokenUsage, ToolArguments, ToolCall, ToolCallId, ToolOutput,
 };
-use agnes_core::tool::{JsonSchema, ToolName, ToolSpec};
-use agnes_core::turn::{Outcome, StepNumber, StepOutcome};
+use agnes_core::tool::{JsonSchema, SchemaError, ToolName, ToolSpec};
+use agnes_core::turn::{Outcome, StepOutcome};
 use agnes_io::session::{ApprovalOutcome, HostEvent};
 use agnes_util::NonEmpty;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use std::str::FromStr;
+
+/// Why a wire payload does not describe a legal domain value.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WireError {
+    #[error("content must not be empty")]
+    EmptyContent,
+    #[error("a tool-use message must carry at least one call")]
+    EmptyToolCalls,
+    #[error("tool call id must not be empty")]
+    EmptyCallId,
+    #[error("tool name is invalid")]
+    ToolName(#[source] ConfigError),
+    #[error("model name is invalid")]
+    ModelName(#[source] ConfigError),
+    #[error(transparent)]
+    Schema(#[from] SchemaError),
+}
 
 /// 一行日志：版本标记、core 记录或宿主审计记录。
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,7 +111,7 @@ pub(crate) enum WireEvent {
     MessageEnd {
         step: NonZeroU32,
         model: String,
-        stop: WireStopReason,
+        stop: WireStopKind,
         usage: WireTokenUsage,
     },
     ToolExecutionStart {
@@ -103,14 +121,13 @@ pub(crate) enum WireEvent {
     ToolExecutionEnd {
         step: NonZeroU32,
         call_id: String,
-        is_error: bool,
     },
     StepEnd {
         step: NonZeroU32,
         outcome: WireStepOutcome,
     },
     MessagesInjected {
-        messages: Vec<WireMessage>,
+        count: usize,
     },
     TurnEnd {
         outcome: WireOutcome,
@@ -182,33 +199,29 @@ pub(crate) struct WireTokenUsage {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum WireStopReason {
-    Completed {
-        content: String,
-    },
-    ToolUse {
-        content: Option<String>,
-        calls: Vec<WireToolCall>,
-    },
-    LengthExceeded {
-        content: Option<String>,
-    },
+pub(crate) enum WireStopKind {
+    Completed,
+    ToolUse,
+    LengthExceeded,
+    ContentFiltered,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WireStepOutcome {
-    Answered { reply: String },
+    Answered,
     ToolUse,
     LengthExceeded,
+    ContentFiltered,
     Interrupted,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WireOutcome {
-    Answered { reply: String },
+    Answered,
     LengthExceeded,
+    ContentFiltered,
     Interrupted,
     BudgetExhausted,
 }
@@ -221,10 +234,10 @@ impl From<&Event> for WireEvent {
             Event::Header(header) => Self::Header(header.into()),
             Event::TurnStart => Self::TurnStart,
             Event::StepStart { step } => Self::StepStart {
-                step: step_of(*step),
+                step: (*step).into(),
             },
             Event::MessageStart { step } => Self::MessageStart {
-                step: step_of(*step),
+                step: (*step).into(),
             },
             Event::Message(message) => Self::Message(message.into()),
             Event::MessageEnd {
@@ -233,31 +246,24 @@ impl From<&Event> for WireEvent {
                 stop,
                 usage,
             } => Self::MessageEnd {
-                step: step_of(*step),
+                step: (*step).into(),
                 model: model.as_str().to_owned(),
-                stop: stop.into(),
+                stop: (*stop).into(),
                 usage: usage.into(),
             },
             Event::ToolExecutionStart { step, call } => Self::ToolExecutionStart {
-                step: step_of(*step),
+                step: (*step).into(),
                 call: call.into(),
             },
-            Event::ToolExecutionEnd {
-                step,
-                call_id,
-                is_error,
-            } => Self::ToolExecutionEnd {
-                step: step_of(*step),
+            Event::ToolExecutionEnd { step, call_id } => Self::ToolExecutionEnd {
+                step: (*step).into(),
                 call_id: call_id.as_str().to_owned(),
-                is_error: *is_error,
             },
             Event::StepEnd { step, outcome } => Self::StepEnd {
-                step: step_of(*step),
+                step: (*step).into(),
                 outcome: outcome.into(),
             },
-            Event::MessagesInjected { messages } => Self::MessagesInjected {
-                messages: messages.iter().map(Into::into).collect(),
-            },
+            Event::MessagesInjected { count } => Self::MessagesInjected { count: *count },
             Event::TurnEnd { outcome } => Self::TurnEnd {
                 outcome: outcome.into(),
             },
@@ -265,19 +271,11 @@ impl From<&Event> for WireEvent {
     }
 }
 
-fn step_of(step: StepNumber) -> NonZeroU32 {
-    NonZeroU32::new(step.get()).expect("a step number is never zero")
-}
-
-fn step_from(raw: NonZeroU32) -> StepNumber {
-    StepNumber::new(raw)
-}
-
 impl From<&Header> for WireHeader {
     fn from(header: &Header) -> Self {
         Self {
-            system: header.system.as_str().to_owned(),
-            environment: (&header.environment).into(),
+            system: header.system().as_str().to_owned(),
+            environment: header.environment().into(),
         }
     }
 }
@@ -293,9 +291,9 @@ impl From<&Environment> for WireEnvironment {
 impl From<&ToolSpec> for WireToolSpec {
     fn from(spec: &ToolSpec) -> Self {
         Self {
-            name: spec.name.as_str().to_owned(),
-            description: spec.description.to_string(),
-            parameters: spec.parameters.get().clone(),
+            name: spec.name().as_str().to_owned(),
+            description: spec.description().to_owned(),
+            parameters: spec.parameters().as_value().clone(),
         }
     }
 }
@@ -313,8 +311,8 @@ impl From<&Message> for WireMessage {
             Message::ToolResult { call_id, output } => Self::ToolResult {
                 call_id: call_id.as_str().to_owned(),
                 output: WireToolOutput {
-                    content: output.content.to_string(),
-                    is_error: output.is_error,
+                    content: output.content().to_owned(),
+                    is_error: output.is_error(),
                 },
             },
         }
@@ -343,19 +341,13 @@ impl From<&ToolCall> for WireToolCall {
     }
 }
 
-impl From<&StopReason> for WireStopReason {
-    fn from(stop: &StopReason) -> Self {
+impl From<StopKind> for WireStopKind {
+    fn from(stop: StopKind) -> Self {
         match stop {
-            StopReason::Completed { content } => Self::Completed {
-                content: content.as_str().to_owned(),
-            },
-            StopReason::ToolUse { content, calls } => Self::ToolUse {
-                content: content.as_ref().map(|content| content.as_str().to_owned()),
-                calls: calls.iter().map(Into::into).collect(),
-            },
-            StopReason::LengthExceeded { content } => Self::LengthExceeded {
-                content: content.as_ref().map(|content| content.as_str().to_owned()),
-            },
+            StopKind::Completed => Self::Completed,
+            StopKind::ToolUse => Self::ToolUse,
+            StopKind::LengthExceeded => Self::LengthExceeded,
+            StopKind::ContentFiltered => Self::ContentFiltered,
         }
     }
 }
@@ -372,11 +364,10 @@ impl From<&TokenUsage> for WireTokenUsage {
 impl From<&StepOutcome> for WireStepOutcome {
     fn from(outcome: &StepOutcome) -> Self {
         match outcome {
-            StepOutcome::Answered { reply } => Self::Answered {
-                reply: reply.as_str().to_owned(),
-            },
+            StepOutcome::Answered => Self::Answered,
             StepOutcome::ToolUse => Self::ToolUse,
             StepOutcome::LengthExceeded => Self::LengthExceeded,
+            StepOutcome::ContentFiltered => Self::ContentFiltered,
             StepOutcome::Interrupted => Self::Interrupted,
         }
     }
@@ -385,10 +376,9 @@ impl From<&StepOutcome> for WireStepOutcome {
 impl From<&Outcome> for WireOutcome {
     fn from(outcome: &Outcome) -> Self {
         match outcome {
-            Outcome::Answered { reply } => Self::Answered {
-                reply: reply.as_str().to_owned(),
-            },
+            Outcome::Answered => Self::Answered,
             Outcome::LengthExceeded => Self::LengthExceeded,
+            Outcome::ContentFiltered => Self::ContentFiltered,
             Outcome::Interrupted => Self::Interrupted,
             Outcome::BudgetExhausted => Self::BudgetExhausted,
         }
@@ -427,18 +417,14 @@ impl From<ApprovalOutcome> for WireApprovalOutcome {
 // —— 线 → 领域：fail closed ——
 
 impl TryFrom<WireEvent> for Event {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(event: WireEvent) -> Result<Self, Self::Error> {
         Ok(match event {
             WireEvent::Header(header) => Self::Header(header.try_into()?),
             WireEvent::TurnStart => Self::TurnStart,
-            WireEvent::StepStart { step } => Self::StepStart {
-                step: step_from(step),
-            },
-            WireEvent::MessageStart { step } => Self::MessageStart {
-                step: step_from(step),
-            },
+            WireEvent::StepStart { step } => Self::StepStart { step: step.into() },
+            WireEvent::MessageStart { step } => Self::MessageStart { step: step.into() },
             WireEvent::Message(message) => Self::Message(message.try_into()?),
             WireEvent::MessageEnd {
                 step,
@@ -446,34 +432,24 @@ impl TryFrom<WireEvent> for Event {
                 stop,
                 usage,
             } => Self::MessageEnd {
-                step: step_from(step),
-                model: ModelName::from_str(&model).map_err(|err| err.to_string())?,
-                stop: stop.try_into()?,
+                step: step.into(),
+                model: ModelName::from_str(&model).map_err(WireError::ModelName)?,
+                stop: stop.into(),
                 usage: usage.into(),
             },
             WireEvent::ToolExecutionStart { step, call } => Self::ToolExecutionStart {
-                step: step_from(step),
+                step: step.into(),
                 call: call.try_into()?,
             },
-            WireEvent::ToolExecutionEnd {
-                step,
-                call_id,
-                is_error,
-            } => Self::ToolExecutionEnd {
-                step: step_from(step),
+            WireEvent::ToolExecutionEnd { step, call_id } => Self::ToolExecutionEnd {
+                step: step.into(),
                 call_id: ToolCallId::new(call_id),
-                is_error,
             },
             WireEvent::StepEnd { step, outcome } => Self::StepEnd {
-                step: step_from(step),
+                step: step.into(),
                 outcome: outcome.try_into()?,
             },
-            WireEvent::MessagesInjected { messages } => Self::MessagesInjected {
-                messages: messages
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<Vec<_>, _>>()?,
-            },
+            WireEvent::MessagesInjected { count } => Self::MessagesInjected { count },
             WireEvent::TurnEnd { outcome } => Self::TurnEnd {
                 outcome: outcome.try_into()?,
             },
@@ -482,12 +458,12 @@ impl TryFrom<WireEvent> for Event {
 }
 
 impl TryFrom<WireHeader> for Header {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(header: WireHeader) -> Result<Self, Self::Error> {
-        Ok(Self {
-            system: SystemPrompt::new(header.system),
-            environment: Environment::new(
+        Ok(Header::new(
+            SystemPrompt::new(header.system),
+            Environment::new(
                 header
                     .environment
                     .tools
@@ -495,24 +471,24 @@ impl TryFrom<WireHeader> for Header {
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-        })
+        ))
     }
 }
 
 impl TryFrom<WireToolSpec> for ToolSpec {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(spec: WireToolSpec) -> Result<Self, Self::Error> {
-        Ok(Self {
-            name: tool_name(spec.name)?,
-            description: spec.description.into(),
-            parameters: JsonSchema::try_from(spec.parameters).map_err(|err| err.to_string())?,
-        })
+        Ok(ToolSpec::new(
+            tool_name(spec.name)?,
+            spec.description,
+            JsonSchema::try_from(spec.parameters)?,
+        ))
     }
 }
 
 impl TryFrom<WireMessage> for Message {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(message: WireMessage) -> Result<Self, Self::Error> {
         Ok(match message {
@@ -525,9 +501,10 @@ impl TryFrom<WireMessage> for Message {
             WireMessage::Assistant(assistant) => Self::Assistant(assistant.try_into()?),
             WireMessage::ToolResult { call_id, output } => Self::ToolResult {
                 call_id: ToolCallId::new(call_id),
-                output: ToolOutput {
-                    content: output.content.into(),
-                    is_error: output.is_error,
+                output: if output.is_error {
+                    ToolOutput::error(output.content)
+                } else {
+                    ToolOutput::success(output.content)
                 },
             },
         })
@@ -535,7 +512,7 @@ impl TryFrom<WireMessage> for Message {
 }
 
 impl TryFrom<WireAssistantMessage> for AssistantMessage {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(message: WireAssistantMessage) -> Result<Self, Self::Error> {
         Ok(match message {
@@ -552,9 +529,12 @@ impl TryFrom<WireAssistantMessage> for AssistantMessage {
 }
 
 impl TryFrom<WireToolCall> for ToolCall {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(call: WireToolCall) -> Result<Self, Self::Error> {
+        if call.id.is_empty() {
+            return Err(WireError::EmptyCallId);
+        }
         Ok(Self {
             id: ToolCallId::new(call.id),
             name: tool_name(call.name)?,
@@ -563,25 +543,14 @@ impl TryFrom<WireToolCall> for ToolCall {
     }
 }
 
-impl TryFrom<WireStopReason> for StopReason {
-    type Error = String;
-
-    fn try_from(stop: WireStopReason) -> Result<Self, Self::Error> {
-        Ok(match stop {
-            WireStopReason::Completed { content: raw } => Self::Completed {
-                content: content_from(raw)?,
-            },
-            WireStopReason::ToolUse {
-                content: raw,
-                calls,
-            } => Self::ToolUse {
-                content: raw.map(content_from).transpose()?,
-                calls: tool_calls(calls)?,
-            },
-            WireStopReason::LengthExceeded { content: raw } => Self::LengthExceeded {
-                content: raw.map(content_from).transpose()?,
-            },
-        })
+impl From<WireStopKind> for StopKind {
+    fn from(stop: WireStopKind) -> Self {
+        match stop {
+            WireStopKind::Completed => Self::Completed,
+            WireStopKind::ToolUse => Self::ToolUse,
+            WireStopKind::LengthExceeded => Self::LengthExceeded,
+            WireStopKind::ContentFiltered => Self::ContentFiltered,
+        }
     }
 }
 
@@ -595,29 +564,27 @@ impl From<WireTokenUsage> for TokenUsage {
 }
 
 impl TryFrom<WireStepOutcome> for StepOutcome {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(outcome: WireStepOutcome) -> Result<Self, Self::Error> {
         Ok(match outcome {
-            WireStepOutcome::Answered { reply } => Self::Answered {
-                reply: content_from(reply)?,
-            },
+            WireStepOutcome::Answered => Self::Answered,
             WireStepOutcome::ToolUse => Self::ToolUse,
             WireStepOutcome::LengthExceeded => Self::LengthExceeded,
+            WireStepOutcome::ContentFiltered => Self::ContentFiltered,
             WireStepOutcome::Interrupted => Self::Interrupted,
         })
     }
 }
 
 impl TryFrom<WireOutcome> for Outcome {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(outcome: WireOutcome) -> Result<Self, Self::Error> {
         Ok(match outcome {
-            WireOutcome::Answered { reply } => Self::Answered {
-                reply: content_from(reply)?,
-            },
+            WireOutcome::Answered => Self::Answered,
             WireOutcome::LengthExceeded => Self::LengthExceeded,
+            WireOutcome::ContentFiltered => Self::ContentFiltered,
             WireOutcome::Interrupted => Self::Interrupted,
             WireOutcome::BudgetExhausted => Self::BudgetExhausted,
         })
@@ -625,7 +592,7 @@ impl TryFrom<WireOutcome> for Outcome {
 }
 
 impl TryFrom<WireHostEvent> for HostEvent {
-    type Error = String;
+    type Error = WireError;
 
     fn try_from(event: WireHostEvent) -> Result<Self, Self::Error> {
         Ok(match event {
@@ -653,20 +620,20 @@ impl From<WireApprovalOutcome> for ApprovalOutcome {
     }
 }
 
-fn content_from(raw: String) -> Result<Content, String> {
-    Content::try_from(raw).map_err(|err| err.to_string())
+fn content_from(raw: String) -> Result<Content, WireError> {
+    Content::try_from(raw).map_err(|_| WireError::EmptyContent)
 }
 
-fn tool_name(raw: String) -> Result<ToolName, String> {
-    ToolName::from_str(&raw).map_err(|err| err.to_string())
+fn tool_name(raw: String) -> Result<ToolName, WireError> {
+    ToolName::from_str(&raw).map_err(WireError::ToolName)
 }
 
-fn tool_calls(calls: Vec<WireToolCall>) -> Result<NonEmpty<ToolCall>, String> {
-    let calls = calls
-        .into_iter()
-        .map(TryInto::try_into)
-        .collect::<Result<Vec<_>, _>>()?;
-    NonEmpty::from_vec(calls).map_err(|err| err.to_string())
+fn tool_calls(calls: Vec<WireToolCall>) -> Result<NonEmpty<ToolCall>, WireError> {
+    let mut converted = Vec::with_capacity(calls.len());
+    for call in calls {
+        converted.push(call.try_into()?);
+    }
+    NonEmpty::from_vec(converted).map_err(|_| WireError::EmptyToolCalls)
 }
 
 #[cfg(test)]
@@ -675,6 +642,7 @@ mod tests {
     use agnes_core::content::Content;
     use agnes_core::message::AssistantMessage;
     use agnes_core::tool::ToolName;
+    use agnes_core::turn::StepNumber;
     use agnes_util::NonEmpty;
 
     fn content(text: &str) -> Content {
@@ -696,12 +664,11 @@ mod tests {
         vec![
             Event::Header(Header::new(
                 SystemPrompt::new("sys"),
-                Environment::new(vec![ToolSpec {
-                    name: ToolName::from_str("read_file").unwrap(),
-                    description: "reads".into(),
-                    parameters: JsonSchema::try_from(serde_json::json!({"type": "object"}))
-                        .unwrap(),
-                }]),
+                Environment::new(vec![ToolSpec::new(
+                    ToolName::from_str("read_file").unwrap(),
+                    "reads",
+                    JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
+                )]),
             )),
             Event::TurnStart,
             Event::StepStart { step },
@@ -724,10 +691,7 @@ mod tests {
             Event::MessageEnd {
                 step,
                 model: ModelName::from_str("test-model").unwrap(),
-                stop: StopReason::ToolUse {
-                    content: None,
-                    calls: NonEmpty::new(first_call),
-                },
+                stop: StopKind::ToolUse,
                 usage: TokenUsage {
                     input: 3,
                     output: 4,
@@ -740,26 +704,14 @@ mod tests {
             Event::ToolExecutionEnd {
                 step,
                 call_id: ToolCallId::new("c2"),
-                is_error: true,
             },
             Event::StepEnd {
                 step,
                 outcome: StepOutcome::ToolUse,
             },
-            Event::MessagesInjected {
-                messages: vec![
-                    Message::User {
-                        content: content("also"),
-                    },
-                    Message::System {
-                        content: SystemPrompt::new("injected note"),
-                    },
-                ],
-            },
+            Event::MessagesInjected { count: 2 },
             Event::TurnEnd {
-                outcome: Outcome::Answered {
-                    reply: content("done"),
-                },
+                outcome: Outcome::Answered,
             },
         ]
     }

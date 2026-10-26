@@ -7,7 +7,7 @@ use agnes_core::message::{
     AssistantMessage, Message, TokenUsage, ToolArguments, ToolCall, ToolCallId,
 };
 use agnes_core::tool::{ToolName, ToolSpec};
-use agnes_io::llm::LlmError;
+use agnes_io::llm::{LlmError, ProtocolError};
 use agnes_util::NonEmpty;
 use serde::Deserialize;
 use serde_json::Value;
@@ -88,7 +88,7 @@ impl WireMessage {
             },
             Message::ToolResult { call_id, output } => Self::ToolResult {
                 tool_call_id: call_id.as_str().to_owned(),
-                content: output.content.as_ref().to_owned(),
+                content: output.content().to_owned(),
             },
         }
     }
@@ -133,9 +133,9 @@ impl WireTool {
         Self {
             kind: "function",
             function: WireFunctionSpec {
-                name: spec.name.as_str().to_owned(),
-                description: spec.description.as_ref().to_owned(),
-                parameters: spec.parameters.get().clone(),
+                name: spec.name().as_str().to_owned(),
+                description: spec.description().to_owned(),
+                parameters: spec.parameters().as_value().clone(),
             },
         }
     }
@@ -161,7 +161,20 @@ pub struct ChatCompletionResponse {
 #[derive(Debug, Deserialize)]
 pub struct WireChoice {
     message: WireAssistantMessage,
-    finish_reason: String,
+    #[serde(default)]
+    finish_reason: Option<WireFinishReason>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireFinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    FunctionCall,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,9 +211,7 @@ impl ChatCompletionResponse {
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| LlmError::Malformed {
-                detail: "response contains no choices".to_owned(),
-            })?;
+            .ok_or(ProtocolError::NoChoices)?;
         let WireChoice {
             message,
             finish_reason,
@@ -209,39 +220,40 @@ impl ChatCompletionResponse {
             content: raw_content,
             tool_calls: raw_calls,
         } = message;
-        let content = raw_content.and_then(|text| Content::try_from(text).ok());
+        let finish = finish_reason.ok_or(ProtocolError::MissingFinishReason)?;
 
-        let stop_reason = match finish_reason.as_str() {
-            "stop" => StopReason::Completed {
-                content: content.ok_or_else(|| LlmError::Malformed {
-                    detail: "finish_reason `stop` without any content".to_owned(),
-                })?,
+        let stop_reason = match finish {
+            WireFinishReason::Stop => StopReason::Completed {
+                content: required_content(raw_content)?,
             },
-            "tool_calls" => {
-                let calls = raw_calls
-                    .into_iter()
-                    .map(|call| {
-                        Ok(ToolCall {
-                            id: ToolCallId::new(call.id),
-                            name: ToolName::from_str(&call.function.name).map_err(|e| {
-                                LlmError::Malformed {
-                                    detail: e.to_string(),
-                                }
-                            })?,
-                            arguments: ToolArguments::new(call.function.arguments),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, LlmError>>()?;
-                let calls = NonEmpty::from_vec(calls).map_err(|_| LlmError::Malformed {
-                    detail: "finish_reason `tool_calls` without any tool calls".to_owned(),
-                })?;
-                StopReason::ToolUse { content, calls }
+            WireFinishReason::ToolCalls => {
+                let mut calls = Vec::with_capacity(raw_calls.len());
+                for call in raw_calls {
+                    if call.id.is_empty() {
+                        return Err(ProtocolError::EmptyToolCallId.into());
+                    }
+                    let name = ToolName::from_str(&call.function.name)
+                        .map_err(ProtocolError::InvalidToolName)?;
+                    calls.push(ToolCall {
+                        id: ToolCallId::new(call.id),
+                        name,
+                        arguments: ToolArguments::new(call.function.arguments),
+                    });
+                }
+                let calls = NonEmpty::from_vec(calls).map_err(|_| ProtocolError::EmptyToolCalls)?;
+                StopReason::ToolUse {
+                    content: optional_content(raw_content)?,
+                    calls,
+                }
             }
-            "length" => StopReason::LengthExceeded { content },
-            other => {
-                return Err(LlmError::Malformed {
-                    detail: format!("unknown finish_reason `{other}`"),
-                });
+            WireFinishReason::Length => StopReason::LengthExceeded {
+                content: optional_content(raw_content)?,
+            },
+            WireFinishReason::ContentFilter => StopReason::ContentFiltered {
+                content: optional_content(raw_content)?,
+            },
+            WireFinishReason::FunctionCall | WireFinishReason::Unknown => {
+                return Err(ProtocolError::UnknownFinishReason.into());
             }
         };
         Ok(LlmResponse {
@@ -258,28 +270,56 @@ impl ChatCompletionResponse {
     }
 }
 
+fn required_content(raw: Option<String>) -> Result<Content, LlmError> {
+    let text = raw.ok_or(ProtocolError::MissingContent)?;
+    Content::try_from(text).map_err(|_| ProtocolError::MissingContent.into())
+}
+
+/// Optional content may be null or whitespace-only; both mean "no text".
+fn optional_content(raw: Option<String>) -> Result<Option<Content>, LlmError> {
+    match raw {
+        None => Ok(None),
+        Some(text) => Ok(Content::try_from(text).ok()),
+    }
+}
+
 /// Extracts a human-readable detail from an error body, tolerating arbitrary
 /// shapes across OpenAI-compatible servers.
 pub fn extract_error_body(body: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 512;
+
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return "empty error body".to_owned();
     }
     let parsed: Result<Value, _> = serde_json::from_str(trimmed);
-    match parsed {
+    let detail = match parsed {
         Ok(Value::Object(map)) => {
             let error = map.get("error");
             if let Some(Value::Object(inner)) = error
                 && let Some(Value::String(message)) = inner.get("message")
             {
-                return message.clone();
+                message.clone()
+            } else if let Some(Value::String(message)) = map.get("message") {
+                message.clone()
+            } else {
+                trimmed.to_owned()
             }
-            if let Some(Value::String(message)) = map.get("message") {
-                return message.clone();
-            }
-            trimmed.to_owned()
         }
         _ => trimmed.to_owned(),
+    };
+
+    if detail.len() <= MAX_DETAIL_CHARS {
+        return detail;
+    }
+    match detail.char_indices().nth(MAX_DETAIL_CHARS) {
+        Some((index, _)) => {
+            let mut truncated = detail;
+            truncated.truncate(index);
+            truncated.push('…');
+            truncated
+        }
+        None => detail,
     }
 }
 
@@ -428,7 +468,7 @@ mod tests {
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
             parsed.into_core(model()),
-            Err(LlmError::Malformed { .. })
+            Err(LlmError::Protocol(ProtocolError::MissingContent))
         ));
 
         let body =
@@ -436,7 +476,7 @@ mod tests {
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
             parsed.into_core(model()),
-            Err(LlmError::Malformed { .. })
+            Err(LlmError::Protocol(ProtocolError::MissingContent))
         ));
     }
 
@@ -447,7 +487,7 @@ mod tests {
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
             parsed.into_core(model()),
-            Err(LlmError::Malformed { .. })
+            Err(LlmError::Protocol(ProtocolError::EmptyToolCalls))
         ));
     }
 
@@ -468,19 +508,47 @@ mod tests {
         let parsed: ChatCompletionResponse = serde_json::from_str(r#"{"choices": []}"#).unwrap();
         assert!(matches!(
             parsed.into_core(model()),
-            Err(LlmError::Malformed { .. })
+            Err(LlmError::Protocol(ProtocolError::NoChoices))
         ));
     }
 
     #[test]
-    fn unknown_finish_reason_is_malformed() {
+    fn unknown_finish_reason_is_rejected() {
         let body =
             r#"{ "choices": [{ "message": { "content": "x" }, "finish_reason": "wednesday" }] }"#;
         let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
         assert!(matches!(
             parsed.into_core(model()),
-            Err(LlmError::Malformed { .. })
+            Err(LlmError::Protocol(ProtocolError::UnknownFinishReason))
         ));
+    }
+
+    #[test]
+    fn a_missing_finish_reason_is_typed() {
+        let body = r#"{ "choices": [{ "message": { "content": "x" }, "finish_reason": null }] }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        assert!(matches!(
+            parsed.into_core(model()),
+            Err(LlmError::Protocol(ProtocolError::MissingFinishReason))
+        ));
+    }
+
+    #[test]
+    fn content_filter_is_a_normal_outcome() {
+        let body = r#"{
+            "choices": [{
+                "message": { "content": "partial" },
+                "finish_reason": "content_filter"
+            }]
+        }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body).unwrap();
+        let response = parsed.into_core(model()).unwrap();
+        assert_eq!(
+            response.stop_reason,
+            StopReason::ContentFiltered {
+                content: Some(Content::try_from("partial").unwrap())
+            }
+        );
     }
 
     #[test]

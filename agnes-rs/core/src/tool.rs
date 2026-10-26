@@ -93,7 +93,7 @@ impl TryFrom<serde_json::Value> for JsonSchema {
 }
 
 impl JsonSchema {
-    pub fn get(&self) -> &serde_json::Value {
+    pub fn as_value(&self) -> &serde_json::Value {
         &self.0
     }
 }
@@ -104,17 +104,54 @@ impl JsonSchema {
 /// name carries its own internal representation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
-    pub name: ToolName,
-    pub description: Arc<str>,
-    pub parameters: JsonSchema,
+    name: ToolName,
+    description: Arc<str>,
+    parameters: JsonSchema,
+}
+
+impl ToolSpec {
+    pub fn new(name: ToolName, description: impl Into<Arc<str>>, parameters: JsonSchema) -> Self {
+        Self {
+            name,
+            description: description.into(),
+            parameters,
+        }
+    }
+
+    pub fn name(&self) -> &ToolName {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn parameters(&self) -> &JsonSchema {
+        &self.parameters
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ToolError {
-    #[error("invalid arguments: {detail}")]
-    BadArguments { detail: String },
-    #[error("{detail}")]
-    Failed { detail: String },
+    #[error("invalid tool arguments: {source}")]
+    BadArguments {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("path must be relative to the working directory: {path}")]
+    AbsolutePath { path: String },
+    #[error("path escapes the working directory: {path}")]
+    PathEscape { path: String },
+    #[error("{action} `{path}`: {source}")]
+    Io {
+        action: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("command timed out after {seconds}s")]
+    Timeout { seconds: u64 },
 }
 
 #[cfg(test)]

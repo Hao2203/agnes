@@ -42,3 +42,12 @@ tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+too_many_arguments = "warn"
+wildcard_imports = "warn"
+dbg_macro = "deny"
+todo = "warn"
+unimplemented = "deny"

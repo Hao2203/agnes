@@ -3,13 +3,18 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agnes_core::content::Content;
 use agnes_io::input::Input;
 use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Notify, watch};
+use tokio::task::JoinHandle;
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// One classified line the user typed.
 pub enum Line {
@@ -49,19 +54,24 @@ impl UserInput {
     }
 
     pub fn push(&self, line: Line) {
-        self.queue.lock().unwrap().push_back(line);
+        lock(&self.queue).push_back(line);
         self.wake.notify_one();
     }
 
-    /// 等待审批的一行答覆：进入答覆模式，读到的行不分类、原样交回。
-    pub async fn ask(&self) -> Option<String> {
-        self.answering.store(true, Ordering::SeqCst);
+    /// Enters answer mode **before** the question is printed, closing the
+    /// window where a fast answer would be classified as a task.
+    pub fn begin_answer(&self) -> AnswerMode<'_> {
+        self.answering.store(true, Ordering::Release);
+        AnswerMode { input: self }
+    }
+
+    /// Waits for the next raw line supplied by the stdin reader.
+    pub async fn answer(&self) -> String {
         loop {
             {
-                let mut answers = self.answers.lock().unwrap();
+                let mut answers = lock(&self.answers);
                 if let Some(line) = answers.pop_front() {
-                    self.answering.store(false, Ordering::SeqCst);
-                    return Some(line);
+                    return line;
                 }
             }
             self.answer_wake.notified().await;
@@ -69,11 +79,11 @@ impl UserInput {
     }
 
     fn is_answering(&self) -> bool {
-        self.answering.load(Ordering::SeqCst)
+        self.answering.load(Ordering::Acquire)
     }
 
     fn push_answer(&self, line: String) {
-        self.answers.lock().unwrap().push_back(line);
+        lock(&self.answers).push_back(line);
         self.answer_wake.notify_one();
     }
 
@@ -81,7 +91,7 @@ impl UserInput {
     pub async fn next(&self) -> Line {
         loop {
             {
-                let mut queue = self.queue.lock().unwrap();
+                let mut queue = lock(&self.queue);
                 if let Some(line) = queue.pop_front() {
                     return line;
                 }
@@ -94,11 +104,11 @@ impl UserInput {
     /// run, so one Ctrl-C never leaks into the next task.
     pub fn begin_run(&self) {
         self.stop.send_replace(false);
-        self.running.store(true, Ordering::SeqCst);
+        self.running.store(true, Ordering::Release);
     }
 
     pub fn end_run(&self) {
-        self.running.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::Release);
     }
 
     fn request_stop(&self) {
@@ -106,7 +116,19 @@ impl UserInput {
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running.load(Ordering::Acquire)
+    }
+}
+
+/// Answer mode guard: dropping it (including on cancellation) restores normal
+/// line classification.
+pub struct AnswerMode<'a> {
+    input: &'a UserInput,
+}
+
+impl Drop for AnswerMode<'_> {
+    fn drop(&mut self) {
+        self.input.answering.store(false, Ordering::Release);
     }
 }
 
@@ -116,7 +138,7 @@ impl Input for UserInput {
         // Only messages ahead of any command line are injected; a command is
         // a barrier, so `/new` and whatever follows it stay queued for the
         // loop to handle in order.
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = lock(&self.queue);
         let mut messages = Vec::new();
         while matches!(queue.front(), Some(Line::Task(_))) {
             if let Some(Line::Task(content)) = queue.pop_front() {
@@ -138,7 +160,7 @@ impl Input for UserInput {
 
 /// Reads stdin line by line in the background, classifying every line, until
 /// EOF — which queues `Line::Exit` like `exit`/`quit` do.
-pub fn spawn_stdin_reader(input: &Arc<UserInput>) {
+pub fn spawn_stdin_reader(input: &Arc<UserInput>) -> JoinHandle<()> {
     let input = Arc::clone(input);
     tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
@@ -161,11 +183,11 @@ pub fn spawn_stdin_reader(input: &Arc<UserInput>) {
                 }
             }
         }
-    });
+    })
 }
 
 /// Ctrl-C: interrupts a run in flight; at the prompt it leaves the session.
-pub fn spawn_ctrl_c(input: &Arc<UserInput>) {
+pub fn spawn_ctrl_c(input: &Arc<UserInput>) -> JoinHandle<()> {
     let input = Arc::clone(input);
     tokio::spawn(async move {
         loop {
@@ -179,7 +201,7 @@ pub fn spawn_ctrl_c(input: &Arc<UserInput>) {
                 return;
             }
         }
-    });
+    })
 }
 
 /// Maps one raw line to a [`Line`], or `None` for blank lines.
@@ -201,7 +223,7 @@ pub(crate) async fn read_line_lossy<R>(reader: &mut R) -> anyhow::Result<Option<
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(128);
     let n = reader.read_until(b'\n', &mut bytes).await?;
     if n == 0 {
         return Ok(None); // EOF
@@ -241,15 +263,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answering_mode_takes_raw_lines() {
+    async fn answering_mode_takes_raw_lines_and_restores_on_drop() {
         let input = UserInput::new();
-        let asker = {
-            let input = Arc::clone(&input);
-            tokio::spawn(async move { input.ask().await })
-        };
-        tokio::task::yield_now().await;
+        let mode = input.begin_answer();
+        assert!(input.is_answering());
         input.push_answer("y".into());
-        assert_eq!(asker.await.unwrap().as_deref(), Some("y"));
+        assert_eq!(input.answer().await, "y");
+        drop(mode);
+        assert!(!input.is_answering());
         // 答覆模式已退出：后续行照常分类
         input.push(Line::Reset);
         assert!(matches!(input.next().await, Line::Reset));

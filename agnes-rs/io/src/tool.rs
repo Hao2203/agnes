@@ -27,31 +27,34 @@ pub struct ToolRegistry {
 
 impl fmt::Debug for ToolRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = self.tools.keys().map(|n| n.as_str()).collect();
-        f.debug_struct("ToolRegistry")
-            .field("tools", &names)
-            .finish()
+        f.debug_list().entries(self.tools.keys()).finish()
     }
 }
 
 impl ToolRegistry {
+    /// # Errors
+    ///
+    /// Returns [`DuplicateTool`] when two tools share a name.
     pub fn build(tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Result<Self, DuplicateTool> {
-        let mut map = BTreeMap::new();
+        let mut registry = Self::default();
         for tool in tools {
-            let name = tool.spec().name.clone();
-            if map.insert(name.clone(), tool).is_some() {
-                return Err(DuplicateTool(name));
-            }
+            registry.register(tool)?;
         }
-        Ok(Self { tools: map })
+        Ok(registry)
     }
 
     /// Adds a tool; a live registry lets hosts grow the tool set between runs.
+    /// A duplicate name leaves the existing tool untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DuplicateTool`] when the name is already registered.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), DuplicateTool> {
-        let name = tool.spec().name.clone();
-        if self.tools.insert(name.clone(), tool).is_some() {
+        let name = tool.spec().name().clone();
+        if self.tools.contains_key(&name) {
             return Err(DuplicateTool(name));
         }
+        self.tools.insert(name, tool);
         Ok(())
     }
 
@@ -109,11 +112,11 @@ mod tests {
     impl Echo {
         fn new(name: &str) -> Self {
             Self {
-                spec: ToolSpec {
-                    name: ToolName::from_str(name).unwrap(),
-                    description: "echoes its arguments".into(),
-                    parameters: serde_json::json!({"type": "object"}).try_into().unwrap(),
-                },
+                spec: ToolSpec::new(
+                    ToolName::from_str(name).unwrap(),
+                    "echoes its arguments",
+                    serde_json::json!({"type": "object"}).try_into().unwrap(),
+                ),
             }
         }
     }
@@ -150,8 +153,20 @@ mod tests {
         ])
         .unwrap();
         let specs = registry.specs();
-        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = specs.iter().map(|s| s.name().as_str()).collect();
         assert_eq!(names, ["read_file", "write_file"]);
+    }
+
+    #[test]
+    fn a_duplicate_registration_keeps_the_existing_tool() {
+        let mut registry = ToolRegistry::default();
+        let name = ToolName::from_str("echo").unwrap();
+        let first = Arc::new(Echo::new("echo")) as Arc<dyn Tool>;
+        registry.register(Arc::clone(&first)).unwrap();
+
+        let second = Arc::new(Echo::new("echo")) as Arc<dyn Tool>;
+        assert!(registry.register(second).is_err());
+        assert!(Arc::ptr_eq(registry.get(&name).unwrap(), &first));
     }
 
     #[test]
@@ -181,11 +196,11 @@ mod tests {
             ToolRegistry::build(vec![Arc::new(Echo::new("echo")) as Arc<dyn Tool>]).unwrap();
 
         let ok = registry.execute(&call("echo", r#"{"x":1}"#)).await;
-        assert!(!ok.is_error);
-        assert_eq!(&*ok.content, r#"{"x":1}"#);
+        assert!(!ok.is_error());
+        assert_eq!(ok.content(), r#"{"x":1}"#);
 
         let missing = registry.execute(&call("nope", "{}")).await;
-        assert!(missing.is_error);
-        assert!(missing.content.contains("unknown tool"));
+        assert!(missing.is_error());
+        assert!(missing.content().contains("unknown tool"));
     }
 }

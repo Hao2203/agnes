@@ -12,8 +12,8 @@ use crate::tool::ToolSpec;
 /// The model-side configuration in force for a turn.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
-    pub system: SystemPrompt,
-    pub environment: Environment,
+    system: SystemPrompt,
+    environment: Environment,
 }
 
 impl Header {
@@ -22,6 +22,14 @@ impl Header {
             system,
             environment,
         }
+    }
+
+    pub fn system(&self) -> &SystemPrompt {
+        &self.system
+    }
+
+    pub fn environment(&self) -> &Environment {
+        &self.environment
     }
 }
 

@@ -9,7 +9,6 @@ license.workspace = true
 agnes-core.workspace = true
 agnes-io.workspace = true
 agnes-util.workspace = true
-anyhow.workspace = true
 async-trait.workspace = true
 http.workspace = true
 serde.workspace = true

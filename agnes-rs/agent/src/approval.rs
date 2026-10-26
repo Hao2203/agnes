@@ -25,28 +25,36 @@ pub struct ApprovalRequest {
     pub reply: oneshot::Sender<bool>,
 }
 
-/// 问询通道：驱动按它发问询；审批界面持有配对的
-/// [`mpsc::UnboundedReceiver`]。`Clone` 后可全班共享。
+/// 问询通道：驱动按它发问询；审批界面持有配对的 [`mpsc::Receiver`]。
+/// `Clone` 后可全班共享。
+///
+/// 容量为 1：驱动同一时刻只允许一个 in-flight 问询；队列满或接收端消失
+/// 都按 fail-closed 处理，避免无界缓冲掩盖这一契约。
 #[derive(Debug, Clone)]
 pub struct ApprovalChannel {
-    tx: mpsc::UnboundedSender<ApprovalRequest>,
+    tx: mpsc::Sender<ApprovalRequest>,
     /// 问询等待答覆的上限；超时按拒绝处理。不设则一直等（或打断）。
     timeout: Option<Duration>,
 }
 
 impl ApprovalChannel {
     /// 建一对（驱动发送端，界面接收端）；`timeout` 作用于每次问询。
-    pub fn channel(timeout: Option<Duration>) -> (Self, mpsc::UnboundedReceiver<ApprovalRequest>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn channel(timeout: Option<Duration>) -> (Self, mpsc::Receiver<ApprovalRequest>) {
+        let (tx, rx) = mpsc::channel(1);
         (Self { tx, timeout }, rx)
     }
 
-    /// 递送一次问询；接口端已消失则失败（驱动按 fail-closed 落定）。
+    /// 递送一次问询；接口端已消失或已有在飞问询则失败（驱动按
+    /// fail-closed 落定）。
+    ///
+    /// # Errors
+    ///
+    /// 接收端已关闭，或已有一个问询在飞。
     pub fn send(
         &self,
         request: ApprovalRequest,
-    ) -> Result<(), mpsc::error::SendError<ApprovalRequest>> {
-        self.tx.send(request)
+    ) -> Result<(), mpsc::error::TrySendError<ApprovalRequest>> {
+        self.tx.try_send(request)
     }
 
     /// 一次问询的等待上限。

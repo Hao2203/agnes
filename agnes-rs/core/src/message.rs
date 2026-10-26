@@ -79,6 +79,9 @@ impl ToolArguments {
         self.0.as_str()
     }
 
+    /// # Errors
+    ///
+    /// Returns the JSON error when the arguments do not match `T`.
     pub fn parse<T: DeserializeOwned>(&self) -> serde_json::Result<T> {
         serde_json::from_str(self.0.as_str())
     }
@@ -105,8 +108,8 @@ pub struct ToolCall {
 /// stays on the standard `Arc<str>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
-    pub content: Arc<str>,
-    pub is_error: bool,
+    content: Arc<str>,
+    is_error: bool,
 }
 
 impl ToolOutput {
@@ -122,6 +125,20 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
         }
+    }
+
+    /// The synthetic result for a call that never ran because the turn was
+    /// interrupted. Shared by the machine and session recovery.
+    pub fn not_run() -> Self {
+        Self::error("not run: the user interrupted the agent")
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.is_error
     }
 }
 

@@ -6,25 +6,30 @@ use std::time::Duration;
 use agnes_io::http::{HttpTransport, TransportError};
 use async_trait::async_trait;
 
+/// Hard cap on one response body; a runaway or hostile peer must not be able
+/// to exhaust memory before the provider sees the payload.
+const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Async transport with per-request total and connect timeouts.
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
 
 impl ReqwestTransport {
-    pub fn new(timeout: Duration) -> Self {
+    /// Builds a client with the given total timeout and a fixed 15-second
+    /// connect timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client build error when the TLS backend, root
+    /// certificates, or resolver configuration cannot be initialized.
+    pub fn new(timeout: Duration) -> Result<Self, TransportError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(15))
             .build()
-            .expect("reqwest client configuration is static and valid");
-        Self { client }
-    }
-}
-
-impl Default for ReqwestTransport {
-    fn default() -> Self {
-        Self::new(Duration::from_secs(300))
+            .map_err(transport_error)?;
+        Ok(Self { client })
     }
 }
 
@@ -42,31 +47,51 @@ impl HttpTransport for ReqwestTransport {
         if !body.is_empty() {
             builder = builder.body(body);
         }
-        let response = builder.send().await.map_err(transport_error)?;
-
-        let mut builder = http::Response::builder().status(response.status());
-        if let Some(headers) = builder.headers_mut() {
-            *headers = response.headers().clone();
+        let mut response = builder.send().await.map_err(transport_error)?;
+        if let Some(length) = response.content_length()
+            && length > MAX_BODY_BYTES
+        {
+            return Err(body_too_large());
         }
-        let body = response.text().await.map_err(transport_error)?;
-        builder.body(body).map_err(transport_error_from_http)
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+            let next_len = bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(body_too_large)?;
+            if u64::try_from(next_len).unwrap_or(u64::MAX) > MAX_BODY_BYTES {
+                return Err(body_too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let mut builder = http::Response::builder().status(status);
+        if let Some(out) = builder.headers_mut() {
+            *out = headers;
+        }
+        let body = std::str::from_utf8(&bytes)?.to_owned();
+        builder.body(body).map_err(TransportError::Request)
     }
 }
 
-/// Classifies a reqwest failure: connection- and body-level problems map to
-/// [`TransportError::Io`], the rest keep their full error chain in
-/// [`TransportError::Request`].
+fn body_too_large() -> TransportError {
+    TransportError::BodyTooLarge {
+        limit: usize::try_from(MAX_BODY_BYTES).unwrap_or(usize::MAX),
+    }
+}
+
+/// Classifies a reqwest failure without flattening it into a string.
 fn transport_error(error: reqwest::Error) -> TransportError {
-    let io_like = error.is_connect() || error.is_timeout() || error.is_body() || error.is_decode();
-    if io_like {
+    if error.is_timeout() {
+        TransportError::Timeout
+    } else if error.is_connect() || error.is_body() || error.is_decode() {
         TransportError::Io(std::io::Error::other(error))
     } else {
-        TransportError::Request(anyhow::Error::new(error))
+        TransportError::Other(Box::new(error))
     }
-}
-
-fn transport_error_from_http(error: http::Error) -> TransportError {
-    TransportError::Request(anyhow::Error::new(error))
 }
 
 #[cfg(test)]
@@ -76,7 +101,7 @@ mod tests {
     /// Serves exactly one response and returns the request that arrived.
     fn serve_once(
         listener: std::net::TcpListener,
-        response: &'static str,
+        response: Vec<u8>,
     ) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -107,9 +132,7 @@ mod tests {
                     let body =
                         String::from_utf8_lossy(&buf[headers_end..headers_end + content_length])
                             .into_owned();
-                    stream
-                        .write_all(response.as_bytes())
-                        .expect("write response");
+                    stream.write_all(&response).expect("write response");
                     return body;
                 }
             }
@@ -148,7 +171,8 @@ mod tests {
         );
         let server = serve_once(
             listener,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\nok",
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\nok"
+                .to_vec(),
         );
 
         let response = test_transport()
@@ -172,7 +196,8 @@ mod tests {
         );
         let server = serve_once(
             listener,
-            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 19\r\n\r\n{\"error\":\"bad key\"}",
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 19\r\n\r\n{\"error\":\"bad key\"}"
+                .to_vec(),
         );
 
         let response = test_transport().send(post(url, "{}")).await.unwrap();
@@ -193,5 +218,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TransportError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_rejected() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = serve_once(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\xff\xfe".to_vec(),
+        );
+
+        let err = test_transport().send(post(url, "{}")).await.unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(err, TransportError::InvalidUtf8(_)));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_content_length_is_refused_before_reading() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        )
+        .into_bytes();
+        let server = serve_once(listener, response);
+
+        let err = test_transport().send(post(url, "{}")).await.unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(err, TransportError::BodyTooLarge { .. }));
     }
 }

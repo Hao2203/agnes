@@ -7,9 +7,11 @@
 //! 门禁折叠是拒绝单调的：本插件即使只是不表态，也不会削弱其他插件的
 //! 拒绝。
 
+use agnes_core::config::ConfigError;
 use agnes_core::message::ToolCall;
 use agnes_core::tool::ToolName;
 use std::fmt;
+use std::str::FromStr;
 
 use crate::ext::{Bundle, Plugin, Verdict};
 use crate::host::{Host, LoadError};
@@ -41,18 +43,47 @@ impl fmt::Display for Rule {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RuleError {
+    #[error("empty prefix in `{spec}`")]
+    EmptyPrefix { spec: String },
+    #[error(transparent)]
+    InvalidName(#[from] ConfigError),
+}
+
+impl FromStr for Rule {
+    type Err = RuleError;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        match spec.strip_suffix('*') {
+            Some(prefix) if !prefix.is_empty() => Ok(Rule::Prefix(prefix.to_owned())),
+            Some(_) => Err(RuleError::EmptyPrefix {
+                spec: spec.to_owned(),
+            }),
+            None => Ok(Rule::Name(ToolName::from_str(spec)?)),
+        }
+    }
+}
+
+/// 权限规则表：把两个同类型列表收进一个结构，避免位置参数写反。
+#[must_use = "pass the rules to PermissionPlugin or PolicyBundle"]
+#[derive(Debug, Clone, Default)]
+pub struct PermissionRules {
+    pub deny: Vec<Rule>,
+    pub ask: Vec<Rule>,
+}
+
 /// 基于规则表的权限插件。
-#[derive(Debug, Default)]
-#[must_use]
+#[derive(Debug)]
 pub struct PermissionPlugin {
-    deny: Vec<Rule>,
-    ask: Vec<Rule>,
+    rules: PermissionRules,
 }
 
 impl PermissionPlugin {
     /// 新插件：`deny` 一律拒绝（附理由）；`ask` 命中走审批；其余不表态。
-    pub fn new(deny: Vec<Rule>, ask: Vec<Rule>) -> Self {
-        Self { deny, ask }
+    pub fn new(rules: PermissionRules) -> Self {
+        Self { rules }
     }
 }
 
@@ -62,12 +93,12 @@ impl Plugin for PermissionPlugin {
     }
 
     fn gate(&mut self, call: &ToolCall) -> Option<Verdict> {
-        if self.deny.iter().any(|rule| rule.matches(&call.name)) {
+        if self.rules.deny.iter().any(|rule| rule.matches(&call.name)) {
             return Some(Verdict::Deny {
                 reason: format!("tool `{}` is denied by policy", call.name),
             });
         }
-        if self.ask.iter().any(|rule| rule.matches(&call.name)) {
+        if self.rules.ask.iter().any(|rule| rule.matches(&call.name)) {
             return Some(Verdict::Ask);
         }
         None
@@ -79,14 +110,14 @@ impl Plugin for PermissionPlugin {
 /// 校验发生在装载期而不是第一次调用时：规则必须能命中至少一个已注册
 /// 的工具（否则它永远不会生效）；配了 ask 就必须接通审批口（否则每次
 /// 命中都只会 fail-closed 拒绝）。
+#[must_use = "install the policy bundle into a host"]
 pub struct PolicyBundle {
-    deny: Vec<Rule>,
-    ask: Vec<Rule>,
+    rules: PermissionRules,
 }
 
 impl PolicyBundle {
-    pub fn new(deny: Vec<Rule>, ask: Vec<Rule>) -> Self {
-        Self { deny, ask }
+    pub fn new(rules: PermissionRules) -> Self {
+        Self { rules }
     }
 }
 
@@ -96,7 +127,7 @@ impl Bundle for PolicyBundle {
     }
 
     fn install(&self, host: &mut Host<'_>) -> Result<(), LoadError> {
-        for rule in self.deny.iter().chain(&self.ask) {
+        for rule in self.rules.deny.iter().chain(&self.rules.ask) {
             if !host.tools().names().any(|name| rule.matches(name)) {
                 return Err(LoadError::UnknownTool {
                     bundle: self.name(),
@@ -104,13 +135,13 @@ impl Bundle for PolicyBundle {
                 });
             }
         }
-        if !self.ask.is_empty() && !host.has_approvals() {
+        if !self.rules.ask.is_empty() && !host.has_approvals() {
             return Err(LoadError::AskWithoutApprovals {
                 bundle: self.name(),
             });
         }
         host.extensions_mut()
-            .register(PermissionPlugin::new(self.deny.clone(), self.ask.clone()));
+            .register(PermissionPlugin::new(self.rules.clone()));
         Ok(())
     }
 }
@@ -131,10 +162,10 @@ mod tests {
 
     #[test]
     fn rules_map_to_verdicts_in_priority_order() {
-        let mut plugin = PermissionPlugin::new(
-            vec![Rule::Prefix("shell".into())],
-            vec![Rule::Name(ToolName::from_str("edit").unwrap())],
-        );
+        let mut plugin = PermissionPlugin::new(PermissionRules {
+            deny: vec![Rule::Prefix("shell".into())],
+            ask: vec![Rule::Name(ToolName::from_str("edit").unwrap())],
+        });
 
         // deny 前缀命中 → 拒绝
         assert_eq!(
@@ -153,10 +184,10 @@ mod tests {
 
     #[test]
     fn deny_wins_over_ask_when_both_match() {
-        let mut plugin = PermissionPlugin::new(
-            vec![Rule::Name(ToolName::from_str("run_shell").unwrap())],
-            vec![Rule::Prefix("run_".into())],
-        );
+        let mut plugin = PermissionPlugin::new(PermissionRules {
+            deny: vec![Rule::Name(ToolName::from_str("run_shell").unwrap())],
+            ask: vec![Rule::Prefix("run_".into())],
+        });
 
         // 名字同时命中 deny（精确）与 ask（前缀）：deny 先定案
         assert!(matches!(

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("{field} must not be empty")]
     Empty { field: &'static str },
@@ -26,8 +27,20 @@ pub enum ConfigError {
         #[source]
         source: url::ParseError,
     },
+    #[error("invalid endpoint path `{path}`: {reason}")]
+    InvalidEndpoint { path: String, reason: &'static str },
+    #[error("invalid endpoint path `{path}`")]
+    BadEndpoint {
+        path: String,
+        #[source]
+        source: url::ParseError,
+    },
     #[error("step budget must be a positive integer: {value}")]
-    BadStepBudget { value: String },
+    BadStepBudget {
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
     #[error("tool name must not contain whitespace: {value}")]
     ToolNameWhitespace { value: String },
 }
@@ -91,20 +104,32 @@ impl fmt::Debug for SystemPrompt {
 /// Secret credential. The key material lives in a `secrecy::SecretString`:
 /// wiped from memory on drop, reachable only through [`ApiKey::expose`], and
 /// never printed by `Debug` — keys cannot leak through logs.
+#[derive(Clone)]
 pub struct ApiKey(SecretString);
 
 impl ApiKey {
-    pub fn new(value: impl Into<String>) -> Result<Self, ConfigError> {
-        let value = value.into();
+    /// Borrows the key material — the only way out, never implicit.
+    pub fn expose(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl TryFrom<&str> for ApiKey {
+    type Error = ConfigError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_owned())
+    }
+}
+
+impl TryFrom<String> for ApiKey {
+    type Error = ConfigError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
         if value.trim().is_empty() {
             return Err(ConfigError::Empty { field: "api key" });
         }
         Ok(Self(value.into()))
-    }
-
-    /// Borrows the key material — the only way out, never implicit.
-    pub fn expose(&self) -> &str {
-        self.0.expose_secret()
     }
 }
 
@@ -118,7 +143,7 @@ impl FromStr for ApiKey {
     type Err = ConfigError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(s)
+        Self::try_from(s)
     }
 }
 
@@ -138,14 +163,32 @@ impl BaseUrl {
     /// Resolves a path relative to the base: `join("chat/completions")`
     /// against `https://api.openai.com/v1/` gives
     /// `https://api.openai.com/v1/chat/completions`.
-    pub fn join(&self, path: &str) -> Url {
-        debug_assert!(
-            !path.starts_with('/'),
-            "path must be relative to the base URL"
-        );
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty paths, absolute paths, protocol-relative paths, and
+    /// references that parse as a full URL, so an endpoint can never silently
+    /// replace the configured host. Malformed relative references are
+    /// reported with the underlying [`url::ParseError`].
+    pub fn join(&self, path: &str) -> Result<Url, ConfigError> {
+        if path.is_empty() {
+            return Err(ConfigError::InvalidEndpoint {
+                path: path.to_owned(),
+                reason: "the endpoint path must not be empty",
+            });
+        }
+        if path.starts_with('/') || Url::parse(path).is_ok() {
+            return Err(ConfigError::InvalidEndpoint {
+                path: path.to_owned(),
+                reason: "the endpoint path must be relative to the base URL",
+            });
+        }
         self.0
             .join(path)
-            .expect("a relative path resolves against an absolute base URL")
+            .map_err(|source| ConfigError::BadEndpoint {
+                path: path.to_owned(),
+                source,
+            })
     }
 }
 
@@ -192,6 +235,12 @@ impl StepBudget {
     }
 }
 
+impl fmt::Display for StepBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl FromStr for StepBudget {
     type Err = ConfigError;
 
@@ -199,8 +248,9 @@ impl FromStr for StepBudget {
         s.trim()
             .parse::<NonZeroU32>()
             .map(Self)
-            .map_err(|_| ConfigError::BadStepBudget {
+            .map_err(|source| ConfigError::BadStepBudget {
                 value: s.to_owned(),
+                source,
             })
     }
 }
@@ -232,7 +282,7 @@ mod tests {
 
     #[test]
     fn api_key_moves_an_owned_string_into_the_secret() {
-        let key = ApiKey::new(String::from("  sk-owned  ")).unwrap();
+        let key = ApiKey::try_from(String::from("  sk-owned  ")).unwrap();
         assert_eq!(key.expose(), "  sk-owned  ");
         assert!(!format!("{key:?}").contains("sk-owned"));
     }
@@ -242,7 +292,7 @@ mod tests {
         let url = " https://api.openai.com/v1/// ".parse::<BaseUrl>().unwrap();
         assert_eq!(url.as_str(), "https://api.openai.com/v1/");
         assert_eq!(
-            url.join("chat/completions").as_str(),
+            url.join("chat/completions").unwrap().as_str(),
             "https://api.openai.com/v1/chat/completions"
         );
 
@@ -254,11 +304,20 @@ mod tests {
     }
 
     #[test]
+    fn base_url_join_refuses_to_replace_the_host() {
+        let url = "https://api.openai.com/v1".parse::<BaseUrl>().unwrap();
+        assert!(url.join("").is_err());
+        assert!(url.join("/chat/completions").is_err());
+        assert!(url.join("//evil.example/v1").is_err());
+        assert!(url.join("https://evil.example/v1").is_err());
+    }
+
+    #[test]
     fn base_url_without_a_path_still_appends() {
         let url = "https://api.openai.com".parse::<BaseUrl>().unwrap();
         assert_eq!(url.as_str(), "https://api.openai.com/");
         assert_eq!(
-            url.join("v1/chat/completions").as_str(),
+            url.join("v1/chat/completions").unwrap().as_str(),
             "https://api.openai.com/v1/chat/completions"
         );
     }

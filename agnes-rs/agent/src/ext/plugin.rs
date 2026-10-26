@@ -39,7 +39,7 @@ pub enum Notice<'a> {
 }
 
 /// 参与 agent 循环的策略层。
-pub trait Plugin: Send + Sync {
+pub trait Plugin: Send {
     /// 插件名；也是拒绝与挡回的溯源标签。
     fn name(&self) -> &'static str;
 

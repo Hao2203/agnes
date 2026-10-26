@@ -9,6 +9,7 @@
 use agnes_util::EmptyError;
 use cold_string::ArcColdString;
 use std::fmt;
+use std::str::FromStr;
 
 /// Text guaranteed to hold at least one non-whitespace character. Cheap to
 /// clone: short text is stored inline, longer text is refcounted, and a
@@ -18,17 +19,24 @@ use std::fmt;
 pub struct Content(ArcColdString);
 
 impl Content {
-    pub fn new<T: AsRef<str>>(value: T) -> Option<Self> {
-        let s = value.as_ref().trim();
-        if s.is_empty() {
+    fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
             return None;
         }
-
-        Some(Self(ArcColdString::new(s)))
+        Some(Self(ArcColdString::new(trimmed)))
     }
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+}
+
+impl FromStr for Content {
+    type Err = EmptyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value).ok_or(EmptyError)
     }
 }
 
@@ -54,7 +62,7 @@ impl TryFrom<&str> for Content {
     type Error = EmptyError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::new(value).ok_or(EmptyError)
+        Self::parse(value).ok_or(EmptyError)
     }
 }
 
@@ -62,7 +70,16 @@ impl TryFrom<String> for Content {
     type Error = EmptyError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value).ok_or(EmptyError)
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(EmptyError);
+        }
+        if trimmed.len() == value.len() {
+            // No outer whitespace: move the owned buffer instead of copying.
+            Ok(Self(ArcColdString::from(value)))
+        } else {
+            Ok(Self(ArcColdString::new(trimmed)))
+        }
     }
 }
 

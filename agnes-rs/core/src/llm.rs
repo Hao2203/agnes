@@ -43,7 +43,7 @@ impl Prompt {
         let mut input = Vec::with_capacity(messages + 1);
         if let Some(header) = header {
             input.push(Message::System {
-                content: header.system.clone(),
+                content: header.system().clone(),
             });
         }
         input.extend(events.iter().filter_map(|event| match event {
@@ -53,7 +53,7 @@ impl Prompt {
         Self {
             input,
             tools: header
-                .map(|header| header.environment.tools().to_vec())
+                .map(|header| header.environment().tools().to_vec())
                 .unwrap_or_default(),
         }
     }
@@ -82,6 +82,30 @@ pub enum StopReason {
     },
     /// Output hit the token limit; the truncated text is optional.
     LengthExceeded { content: Option<Content> },
+    /// The provider's content filter stopped the response; any partial text
+    /// is optional.
+    ContentFiltered { content: Option<Content> },
+}
+
+/// Why a model message ended, without duplicating its payload. The payload
+/// itself lives in the recorded [`Message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopKind {
+    Completed,
+    ToolUse,
+    LengthExceeded,
+    ContentFiltered,
+}
+
+impl From<&StopReason> for StopKind {
+    fn from(stop: &StopReason) -> Self {
+        match stop {
+            StopReason::Completed { .. } => Self::Completed,
+            StopReason::ToolUse { .. } => Self::ToolUse,
+            StopReason::LengthExceeded { .. } => Self::LengthExceeded,
+            StopReason::ContentFiltered { .. } => Self::ContentFiltered,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,11 +125,11 @@ mod tests {
     use std::str::FromStr;
 
     fn spec(name: &str) -> ToolSpec {
-        ToolSpec {
-            name: ToolName::from_str(name).unwrap(),
-            description: "".into(),
-            parameters: JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
-        }
+        ToolSpec::new(
+            ToolName::from_str(name).unwrap(),
+            "",
+            JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
+        )
     }
 
     #[test]
@@ -133,7 +157,7 @@ mod tests {
         );
         assert!(matches!(&prompt.input[2], Message::Assistant(_)));
         assert_eq!(prompt.tools.len(), 1);
-        assert_eq!(prompt.tools[0].name.as_str(), "read_file");
+        assert_eq!(prompt.tools[0].name().as_str(), "read_file");
     }
 
     #[test]

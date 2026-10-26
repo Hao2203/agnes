@@ -23,6 +23,7 @@ use crate::{AgentError, Event, Log, RequestBuilder, RunSummary, Sink, StandardRe
 
 /// 装载期的失败：自包含的配置错误在这里暴露。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoadError {
     #[error("no model configured: set `model` or supply a request builder")]
     MissingModel,
@@ -34,6 +35,31 @@ pub enum LoadError {
     AskWithoutApprovals { bundle: &'static str },
     #[error(transparent)]
     DuplicateTool(#[from] DuplicateTool),
+}
+
+/// 一次 run 的全部输入：配置、已有日志、上报出口与可选会话。
+#[non_exhaustive]
+pub struct RunRequest<'s, 'q> {
+    pub config: AgentConfig,
+    pub log: Log,
+    pub sink: &'s mut dyn Sink,
+    pub session: Option<&'q mut dyn SessionLog>,
+}
+
+impl<'s, 'q> RunRequest<'s, 'q> {
+    pub fn new(config: AgentConfig, log: Log, sink: &'s mut dyn Sink) -> Self {
+        Self {
+            config,
+            log,
+            sink,
+            session: None,
+        }
+    }
+
+    pub fn with_session(mut self, session: &'q mut dyn SessionLog) -> Self {
+        self.session = Some(session);
+        self
+    }
 }
 
 /// 一次装配好的运行器。
@@ -100,21 +126,26 @@ impl<'a> Host<'a> {
     /// `Ask` 则走审批口问询挂起（未接线即拒绝）；结果入账前再过一次
     /// 结果折叠。工具失败不中止 run —— 它是给模型的错误输出；只有传输/
     /// 模型错误终止。
-    pub async fn run(
-        &mut self,
-        config: AgentConfig,
-        log: Log,
-        sink: &mut dyn Sink,
-        session: Option<&mut dyn SessionLog>,
-    ) -> Result<RunSummary, AgentError> {
+    ///
+    /// # Errors
+    ///
+    /// 模型/传输失败会中止 run；会话写盘失败按 fail-closed 中止；内部状态
+    /// 不变式被破坏时返回 [`AgentError::Invariant`]。
+    pub async fn run(&mut self, request: RunRequest<'_, '_>) -> Result<RunSummary, AgentError> {
+        let RunRequest {
+            config,
+            log,
+            sink,
+            session,
+        } = request;
         let started_at = Timestamp::now();
         let goal = config.goal.clone();
         let tools = config
             .header
-            .environment
+            .environment()
             .tools()
             .iter()
-            .map(|spec| spec.name.clone())
+            .map(|spec| spec.name().clone())
             .collect();
         sink.event(&Event::Started {
             at: started_at,
@@ -138,12 +169,21 @@ impl<'a> Host<'a> {
         let mut log = log;
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
         // 由驱动记录，宿主保留所有权。
-        let closed = Driver::new(&mut log, ports, outlets).run(turn).await?;
+        let closed = match Driver::new(&mut log, ports, outlets).run(turn).await {
+            Ok(closed) => closed,
+            Err(err) => {
+                sink.event(&Event::Failed {
+                    at: Timestamp::now(),
+                    error: err.to_string(),
+                });
+                return Err(err);
+            }
+        };
 
         let finished_at = Timestamp::now();
         let result = closed.into_result();
         let summary = RunSummary {
-            outcome: result.outcome.clone(),
+            outcome: result.outcome,
             steps_used: result.steps_used,
             usage: result.usage,
             log,
@@ -225,6 +265,10 @@ impl<'a> HostBuilder<'a> {
         self
     }
 
+    /// # Errors
+    ///
+    /// Returns [`LoadError`] when the model is missing, a tool name is
+    /// duplicated, or a bundle/config check fails.
     pub fn build(self) -> Result<Host<'a>, LoadError> {
         let requests = match (self.requests, self.model) {
             (Some(requests), _) => requests,
@@ -255,7 +299,7 @@ impl<'a> HostBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission::{PolicyBundle, Rule};
+    use crate::permission::{PermissionRules, PolicyBundle, Rule};
     use crate::tools::{FsBundle, ReadFile};
     use agnes_core::llm::{LlmRequest, LlmResponse};
     use agnes_core::tool::ToolName;
@@ -298,7 +342,10 @@ mod tests {
         // 精确规则指向不存在的工具
         let err = Host::builder(&llm, &input)
             .model(model())
-            .bundle(PolicyBundle::new(vec![Rule::Name(name("nope"))], vec![]))
+            .bundle(PolicyBundle::new(PermissionRules {
+                deny: vec![Rule::Name(name("nope"))],
+                ask: vec![],
+            }))
             .build()
             .unwrap_err();
         assert!(matches!(err, LoadError::UnknownTool { .. }));
@@ -307,7 +354,10 @@ mod tests {
         let err = Host::builder(&llm, &input)
             .model(model())
             .bundle(FsBundle::new(".", false))
-            .bundle(PolicyBundle::new(vec![Rule::Prefix("zzz".into())], vec![]))
+            .bundle(PolicyBundle::new(PermissionRules {
+                deny: vec![Rule::Prefix("zzz".into())],
+                ask: vec![],
+            }))
             .build()
             .unwrap_err();
         assert!(matches!(err, LoadError::UnknownTool { .. }));
@@ -320,10 +370,10 @@ mod tests {
         let err = Host::builder(&llm, &input)
             .model(model())
             .bundle(FsBundle::new(".", false))
-            .bundle(PolicyBundle::new(
-                vec![],
-                vec![Rule::Name(name("read_file"))],
-            ))
+            .bundle(PolicyBundle::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(name("read_file"))],
+            }))
             .build()
             .unwrap_err();
         assert!(matches!(err, LoadError::AskWithoutApprovals { .. }));
@@ -337,10 +387,10 @@ mod tests {
         let host = Host::builder(&llm, &input)
             .model(model())
             .bundle(FsBundle::new(".", false))
-            .bundle(PolicyBundle::new(
-                vec![],
-                vec![Rule::Name(name("read_file"))],
-            ))
+            .bundle(PolicyBundle::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(name("read_file"))],
+            }))
             .approvals(Some(&approval))
             .build()
             .unwrap();

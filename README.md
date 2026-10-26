@@ -102,14 +102,16 @@ agnes chat --session ./notes/session.jsonl
 | `--api-key <KEY>` | 见环境变量 | API 密钥 |
 | `--max-steps <N>` | `32` | 每个任务的最大模型轮次 |
 | `--allow-shell` | 关闭 | 向模型提供 `run_shell` 工具 |
-| `--session <PATH>` | 关闭 | chat 的会话文件：存在即恢复，不存在即新建 |
-| `--yes` | 关闭 | 不启用 ask 规则（需要审批的工具直接执行） |
+| `--session <PATH>` | 关闭 | chat/run 的会话文件：存在即恢复，不存在即新建 |
+| `--yes` | 关闭 | 自动批准 ask 规则（审批审计仍会落盘） |
 | `--deny <TOOL>` | 无 | 拒绝工具：`name` 精确匹配，`prefix*` 前缀匹配，可重复 |
 
 默认策略：`run_shell`（仅在启用 `--allow-shell` 时）每次执行前在终端询问
 `[y] once / [n] reject / [a] always this session`；拒绝会作为一次失败的
-工具结果反馈给模型。带 `--session` 时，`/new` 会轮转到下一个空闲的兄弟
-文件 —— 日志只追加，从不重写。
+工具结果反馈给模型。`run` 模式下需要审批时必须能读终端；管道输入任务或
+无 TTY 的环境请加 `--yes`（自动批准）或 `--deny run_shell`，否则启动即报错，
+不会挂起等待。带 `--session` 时，`/new` 会轮转到下一个空闲的兄弟文件 ——
+日志只追加，从不重写。
 
 ### 环境变量
 
@@ -128,7 +130,7 @@ agnes chat --session ./notes/session.jsonl
 | `run_shell` | `command` | 以 `sh -c` 执行命令，需 `--allow-shell` |
 
 所有路径都相对于启动时的工作目录，绝对路径与 `..` 逃逸会被拒绝；
-单次工具输出超过 100 000 字符时截断。
+`read_file` 有字节上限，单次工具输出超过 100 000 字符时按 UTF-8 字符边界截断。
 
 ## 架构
 
@@ -154,7 +156,7 @@ util ← core ← io ← agent ← cli
 | `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器 |
 | `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写；线格式（wire）定义在此 |
 | `agnes-agent` | 宿主装配（`Host`）、驱动状态机、会话日志 `Log`、扩展内核与内置工具 |
-| `agnes-cli` | 二进制 `agnes`：参数解析、REPL、审批与终端渲染 |
+| `agnes-cli` | 二进制 `agnes`：参数解析、REPL、审批与独立写线程的终端渲染 |
 
 ### 关键设计
 
@@ -184,10 +186,12 @@ util ← core ← io ← agent ← cli
   因此一次请求完全可以从日志复原；`RunSummary.log` 可直接传回下一次运行。
   工具集变化只需新 turn 记一条新 header，不需要额外校验。
 - **日志耐久**：每个上报事件先追加到会话文件、再上报宿主；每个模型请求
-  前与收场时 `flush`（fsync）。格式 v4：首行版本标记，之后是 `core` 事件行
+  前与收场时 `flush`（fsync）。格式 v5：首行版本标记，之后是 `core` 事件行
   与 `host` 审计行（审批问询/决定、中止原因），共享一个连续 `seq`；恢复时
   校验连续性并**补写**未收尾的 step/turn（与 `Turn::interrupted` 同形），
-  从不重写已有记录；旧格式（含 v3）拒载。
+  从不重写已有记录；旧格式（含 v4）拒载。`seq` 只在实际写成功后提交，
+  写失败会 poison 会话句柄，避免半行之后继续追加。v5 里 `MessageEnd` 只记
+  无载荷的 `StopKind`，`StepOutcome`/`Outcome` 不再复制答复文本。
 - **审计与可追溯**：`MessageEnd` 记录产生该消息的模型（适配器从请求回带），
   切换模型后日志仍能归因；审批落定与 run 中止原因不扩 core 词汇，作为
   `HostEvent` 与事件一起落盘。
@@ -199,6 +203,8 @@ util ← core ← io ← agent ← cli
   保持格式无关。
 - **两阶段可中断**：等待模型消息与等待工具执行都能被打断，且都会以
   `turn_end` 收尾——工具阶段必须补齐每个调用的结果。
+- **内容过滤是一等结果**：模型返回 `content_filter` 时，本轮以
+  `Outcome::ContentFiltered` 收场；已产生的文本仍作为普通 assistant 消息入账。
 
 ## 开发
 

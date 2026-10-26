@@ -58,8 +58,11 @@ impl Log {
 
     /// 追加一条事件。驱动记录机器以动作形式产生的事件；机器本身不持有
     /// 历史。
-    pub(crate) fn record(&mut self, event: Event) {
+    pub(crate) fn record(&mut self, event: Event) -> &Event {
         self.events.push(event);
+        self.events
+            .last()
+            .expect("record just pushed an event onto the log")
     }
 }
 
@@ -145,6 +148,6 @@ mod tests {
             )),
         ]);
 
-        assert_eq!(log.header().unwrap().system.as_str(), "new");
+        assert_eq!(log.header().unwrap().system().as_str(), "new");
     }
 }

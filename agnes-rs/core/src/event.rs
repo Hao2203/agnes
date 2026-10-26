@@ -12,7 +12,7 @@
 //! [`crate::turn::Turn::tool_finished`] 喂回机器）。
 
 use crate::header::Header;
-use crate::llm::StopReason;
+use crate::llm::StopKind;
 use crate::message::{Message, TokenUsage, ToolCall, ToolCallId};
 use crate::turn::{Outcome, StepNumber, StepOutcome};
 
@@ -35,7 +35,7 @@ pub enum Event {
         step: StepNumber,
         /// 产生这条消息的模型（适配器从请求回带）。
         model: crate::config::ModelName,
-        stop: StopReason,
+        stop: StopKind,
         usage: TokenUsage,
     },
     /// 一个工具调用开始执行。
@@ -44,16 +44,15 @@ pub enum Event {
     ToolExecutionEnd {
         step: StepNumber,
         call_id: ToolCallId,
-        is_error: bool,
     },
     /// 一个 step 收尾。
     StepEnd {
         step: StepNumber,
         outcome: StepOutcome,
     },
-    /// 运行中被注入、在 step 边界生效的消息（不一定是用户发出 —— 角色
-    /// 由 [`Message`] 保留；随后逐条作为 [`Event::Message`] 入账）。
-    MessagesInjected { messages: Vec<Message> },
+    /// 运行中被注入、在 step 边界生效的消息数量（消息本身紧随其后逐条
+    /// 作为 [`Event::Message`] 入账，不在这里重复携带）。
+    MessagesInjected { count: usize },
     /// turn 收场 —— 结果就是整个 run 的结果。
     TurnEnd { outcome: Outcome },
 }

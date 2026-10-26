@@ -6,9 +6,17 @@ use std::sync::Arc;
 
 /// A non-empty, immutable collection. Cloning is cheap — it only bumps a
 /// reference count — and read access is available through `AsRef<[T]>`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct NonEmpty<T> {
     inner: Arc<[T]>,
+}
+
+impl<T> Clone for NonEmpty<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<T> NonEmpty<T> {
@@ -25,6 +33,10 @@ impl<T> NonEmpty<T> {
     /// Collected straight into `Arc<[T]>`, which uses std's exact-size fast
     /// path: iterators with a known length land in a single allocation.
     /// When a `Vec` already exists, prefer [`NonEmpty::from_vec`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyError`] when the iterator yields no elements.
     #[allow(clippy::should_implement_trait)]
     pub fn from_iter<I>(iter: I) -> Result<Self, EmptyError>
     where
@@ -39,6 +51,10 @@ impl<T> NonEmpty<T> {
 
     /// Wraps an existing vector, rejecting the empty one. No re-collection:
     /// the elements are moved into the shared allocation as-is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyError`] when `items` is empty.
     pub fn from_vec(items: Vec<T>) -> Result<Self, EmptyError> {
         if items.is_empty() {
             return Err(EmptyError);
@@ -65,6 +81,23 @@ impl<T> NonEmpty<T> {
         self.inner.iter()
     }
 
+    /// Returns the elements mutably. The length cannot change, so the
+    /// non-empty invariant is preserved. Clones the backing allocation only
+    /// when another handle still shares it.
+    pub fn make_mut(&mut self) -> &mut [T]
+    where
+        T: Clone,
+    {
+        Arc::make_mut(&mut self.inner)
+    }
+
+    /// Maps every element, preserving the non-empty invariant.
+    pub fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> NonEmpty<U> {
+        NonEmpty {
+            inner: self.inner.iter().map(&mut f).collect(),
+        }
+    }
+
     /// Deep-copies the contents into a vector.
     pub fn to_vec(&self) -> Vec<T>
     where
@@ -83,12 +116,6 @@ impl<T> AsRef<[T]> for NonEmpty<T> {
 impl<T: fmt::Debug> fmt::Debug for NonEmpty<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.inner.iter()).finish()
-    }
-}
-
-impl<T> From<T> for NonEmpty<T> {
-    fn from(first: T) -> Self {
-        Self::new(first)
     }
 }
 

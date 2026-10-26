@@ -25,14 +25,14 @@ pub mod ext;
 pub mod permission;
 pub mod tools;
 
-pub use host::{Host, HostBuilder, LoadError};
+pub use host::{Host, HostBuilder, LoadError, RunRequest};
 pub use log::Log;
 
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
 use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::{LlmRequest, Prompt};
-use agnes_core::message::{Message, TokenUsage, ToolCall, ToolCallId};
+use agnes_core::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolCallId};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::Outcome;
 use agnes_io::llm::LlmError;
@@ -42,12 +42,23 @@ use approval::ApprovalOutcome;
 use ext::Denied;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AgentError {
     #[error(transparent)]
     Llm(#[from] LlmError),
     /// 会话日志写失败：宁可中止，也不在没有审计轨迹的情况下继续跑。
     #[error(transparent)]
     Session(#[from] agnes_io::session::SessionError),
+    /// 驱动内部不变量被破坏（不是用户输入或 IO 错误）。
+    #[error("driver invariant violated: {reason}")]
+    Invariant { reason: &'static str },
+    /// 原始错误保留为 source；审计写盘失败单独可见，不再被吞掉。
+    #[error("run aborted; the audit trail could not be written: {audit}")]
+    Audit {
+        #[source]
+        cause: Box<AgentError>,
+        audit: agnes_io::session::SessionError,
+    },
 }
 
 /// 把会话日志转换成具体请求。宿主提供一个，驱动在每次模型调用前询问它 ——
@@ -81,6 +92,7 @@ impl RequestBuilder for StandardRequestBuilder {
 /// 运行期间的上报：run 级生命周期事件、日志的镜像事件，以及
 /// 插件语义的宿主事件 —— 插件的面貌只长在这里，core 不见。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     Started {
         at: Timestamp,
@@ -116,6 +128,12 @@ pub enum Event {
         at: Timestamp,
         outcome: Outcome,
     },
+    /// The run aborted with an error; emitted before the error is returned so
+    /// observers always see a terminal event.
+    Failed {
+        at: Timestamp,
+        error: String,
+    },
 }
 
 /// 接收 [`Event`]s。任何 `FnMut(&Event)` 都是个 `Sink`。
@@ -148,18 +166,20 @@ pub struct RunSummary {
 
 impl RunSummary {
     pub fn duration(&self) -> jiff::SignedDuration {
-        jiff::SignedDuration::from_secs(self.finished_at.as_second() - self.started_at.as_second())
+        self.finished_at.duration_since(self.started_at)
     }
-}
 
-/// 宿主可用的默认 step 预算。
-pub const DEFAULT_STEP_BUDGET: u32 = 32;
-
-/// 便捷构造：把最大 step 数变成预算 newtype；0 返回 None。
-pub fn step_budget(max_steps: u32) -> Option<agnes_core::config::StepBudget> {
-    Some(agnes_core::config::StepBudget::new(
-        std::num::NonZeroU32::new(max_steps)?,
-    ))
+    /// The last assistant text in the log — the final answer when the
+    /// outcome is [`Outcome::Answered`].
+    pub fn reply(&self) -> Option<&Content> {
+        self.log
+            .messages()
+            .filter_map(|message| match message {
+                Message::Assistant(AssistantMessage::Text(content)) => Some(content),
+                _ => None,
+            })
+            .last()
+    }
 }
 
 #[cfg(test)]
@@ -167,14 +187,14 @@ mod tests {
     use super::*;
     use crate::approval::ApprovalChannel;
     use crate::ext::{ApprovalOutcome, Notice, Plugin, Settlement};
-    use crate::permission::{PermissionPlugin, Rule};
+    use crate::permission::{PermissionPlugin, PermissionRules, Rule};
     use agnes_core::config::{StepBudget, SystemPrompt};
     use agnes_core::header::{Environment, Header};
     use agnes_core::llm::{LlmResponse, StopReason};
     use agnes_core::message::{Message, ToolArguments, ToolOutput};
     use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
     use agnes_io::input::{Input as InputPort, NoInput};
-    use agnes_io::llm::Llm;
+    use agnes_io::llm::{ApiBody, Llm};
     use agnes_io::session::HostEvent;
     use agnes_io::tool::Tool;
     use agnes_util::NonEmpty;
@@ -226,16 +246,16 @@ mod tests {
     impl Recorder {
         fn new() -> Self {
             Self {
-                spec: ToolSpec {
-                    name: ToolName::from_str("note").unwrap(),
-                    description: "records a note".into(),
-                    parameters: JsonSchema::try_from(serde_json::json!({
+                spec: ToolSpec::new(
+                    ToolName::from_str("note").unwrap(),
+                    "records a note",
+                    JsonSchema::try_from(serde_json::json!({
                         "type": "object",
                         "properties": { "text": { "type": "string" } },
                         "required": ["text"]
                     }))
                     .unwrap(),
-                },
+                ),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -362,16 +382,12 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
 
-        assert_eq!(
-            summary.outcome,
-            Outcome::Answered {
-                reply: Content::try_from("all done").unwrap()
-            }
-        );
+        assert_eq!(summary.outcome, Outcome::Answered);
+        assert_eq!(summary.reply().map(Content::as_str), Some("all done"));
         assert_eq!(summary.steps_used, 2);
         assert_eq!(
             summary.usage,
@@ -390,7 +406,7 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert!(matches!(messages[0], Message::User { .. }));
         assert!(matches!(messages[3], Message::Assistant(_)));
-        assert_eq!(summary.log.header().unwrap().system.as_str(), "sys");
+        assert_eq!(summary.log.header().unwrap().system().as_str(), "sys");
 
         // 驱动按顺序上报了整个生命周期
         let events = &sink.0;
@@ -420,7 +436,7 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(Event::Finished { outcome, .. })
-                if matches!(outcome, Outcome::Answered { .. })
+                if matches!(outcome, Outcome::Answered)
         ));
         // 上报的核心事件就是日志里的那些
         assert_eq!(recorded(events).len(), summary.log.events().len());
@@ -484,7 +500,7 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, Some(&mut session))
+            .run(RunRequest::new(config(8), Log::default(), &mut sink).with_session(&mut session))
             .await
             .unwrap();
 
@@ -505,10 +521,10 @@ mod tests {
         ]);
         let mut host = Host::builder(&llm, &NoInput)
             .model(model())
-            .plugin(PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ))
+            .plugin(PermissionPlugin::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            }))
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .approvals(Some(&approval))
             .build()
@@ -526,7 +542,7 @@ mod tests {
         });
 
         let mut sink = Collector(Vec::new());
-        host.run(config(8), Log::default(), &mut sink, Some(&mut session))
+        host.run(RunRequest::new(config(8), Log::default(), &mut sink).with_session(&mut session))
             .await
             .unwrap();
         reviewer.await.unwrap();
@@ -554,7 +570,7 @@ mod tests {
             async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
                 Err(LlmError::Api {
                     status: http::StatusCode::SERVICE_UNAVAILABLE,
-                    detail: "down".to_owned(),
+                    body: ApiBody::new("down", "down"),
                 })
             }
         }
@@ -573,10 +589,8 @@ mod tests {
 
         let err = host
             .run(
-                config(4),
-                Log::default(),
-                &mut Collector(Vec::new()),
-                Some(&mut session),
+                RunRequest::new(config(4), Log::default(), &mut Collector(Vec::new()))
+                    .with_session(&mut session),
             )
             .await
             .unwrap_err();
@@ -598,18 +612,20 @@ mod tests {
                 &self.spec
             }
             async fn run(&self, _arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-                Err(ToolError::Failed {
-                    detail: "disk on fire".to_owned(),
+                Err(ToolError::Io {
+                    action: "cannot read the disk",
+                    path: "disk".to_owned(),
+                    source: std::io::Error::other("disk on fire"),
                 })
             }
         }
 
         let tool = Arc::new(AlwaysFails {
-            spec: ToolSpec {
-                name: ToolName::from_str("boom").unwrap(),
-                description: "".into(),
-                parameters: JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
-            },
+            spec: ToolSpec::new(
+                ToolName::from_str("boom").unwrap(),
+                "",
+                JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
+            ),
         }) as Arc<dyn Tool>;
         let llm = ScriptedLlm::new(vec![
             response(tool_use(vec![call("c1", "boom", "{}")])),
@@ -623,15 +639,14 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
-        assert!(
-            recorded(&sink.0)
-                .iter()
-                .any(|event| matches!(event, CoreEvent::ToolExecutionEnd { is_error: true, .. }))
-        );
+        assert!(matches!(summary.outcome, Outcome::Answered));
+        assert!(recorded(&sink.0).iter().any(|event| matches!(
+            event,
+            CoreEvent::Message(Message::ToolResult { output, .. }) if output.is_error()
+        )));
     }
 
     #[tokio::test]
@@ -642,7 +657,7 @@ mod tests {
             async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
                 Err(LlmError::Api {
                     status: http::StatusCode::SERVICE_UNAVAILABLE,
-                    detail: "down".to_owned(),
+                    body: ApiBody::new("down", "down"),
                 })
             }
         }
@@ -652,7 +667,11 @@ mod tests {
             .build()
             .unwrap();
         let err = host
-            .run(config(4), Log::default(), &mut Collector(Vec::new()), None)
+            .run(RunRequest::new(
+                config(4),
+                Log::default(),
+                &mut Collector(Vec::new()),
+            ))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -697,10 +716,10 @@ mod tests {
         let config = config_with(host.tools().specs(), 4);
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config, Log::default(), &mut sink, None)
+            .run(RunRequest::new(config, Log::default(), &mut sink))
             .await
             .unwrap();
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(matches!(summary.outcome, Outcome::Answered));
 
         let requests = llm.requests();
         assert_eq!(requests.len(), 1);
@@ -711,7 +730,7 @@ mod tests {
             Message::User { content } if content.as_str() == "<system> be extra brief"
         ));
         // 环境仍在会话里，未被破坏
-        assert_eq!(summary.log.header().unwrap().environment.tools().len(), 1);
+        assert_eq!(summary.log.header().unwrap().environment().tools().len(), 1);
     }
 
     /// 测试直接驱动的输入：消息队列 + 停止通道。
@@ -798,16 +817,12 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
 
-        assert_eq!(
-            summary.outcome,
-            Outcome::Answered {
-                reply: Content::try_from("all done").unwrap()
-            }
-        );
+        assert_eq!(summary.outcome, Outcome::Answered);
+        assert_eq!(summary.reply().map(Content::as_str), Some("all done"));
         let requests = llm.requests();
         assert_eq!(requests.len(), 2);
         let second = &requests[1].prompt.input;
@@ -821,7 +836,7 @@ mod tests {
         // 注入事件随日志上报
         assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
-            CoreEvent::MessagesInjected { messages } if messages.len() == 1
+            CoreEvent::MessagesInjected { count } if *count == 1
         )));
         // 注入的消息属于继续的会话上下文
         let messages = messages_of(&summary.log);
@@ -845,7 +860,7 @@ mod tests {
             input.interrupt();
         };
         let (result, ()) = tokio::join!(
-            host.run(config(4), Log::default(), &mut sink, None),
+            host.run(RunRequest::new(config(4), Log::default(), &mut sink)),
             interrupter
         );
         let summary = result.unwrap();
@@ -890,12 +905,11 @@ mod tests {
             .model(model())
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .tool(Arc::new(HangingTool {
-                spec: ToolSpec {
-                    name: ToolName::from_str("hang").unwrap(),
-                    description: "never returns".into(),
-                    parameters: JsonSchema::try_from(serde_json::json!({"type": "object"}))
-                        .unwrap(),
-                },
+                spec: ToolSpec::new(
+                    ToolName::from_str("hang").unwrap(),
+                    "never returns",
+                    JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
+                ),
             }))
             .build()
             .unwrap();
@@ -906,7 +920,7 @@ mod tests {
             input.interrupt();
         };
         let (result, ()) = tokio::join!(
-            host.run(config(8), Log::default(), &mut sink, None),
+            host.run(RunRequest::new(config(8), Log::default(), &mut sink)),
             interrupter
         );
         let summary = result.unwrap();
@@ -920,12 +934,12 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert!(matches!(
             messages[2],
-            Message::ToolResult { output, .. } if !output.is_error
+            Message::ToolResult { output, .. } if !output.is_error()
         ));
         assert!(matches!(
             messages[3],
             Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("interrupted")
+                if output.is_error() && output.content().contains("interrupted")
         ));
     }
 
@@ -942,7 +956,7 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(4), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(4), Log::default(), &mut sink))
             .await
             .unwrap();
 
@@ -952,17 +966,13 @@ mod tests {
         assert!(requests[1].prompt.input.iter().any(
             |message| matches!(message, Message::User { content } if content.as_str() == "also update the readme")
         ));
-        assert_eq!(
-            summary.outcome,
-            Outcome::Answered {
-                reply: Content::try_from("second answer").unwrap()
-            }
-        );
+        assert_eq!(summary.outcome, Outcome::Answered);
+        assert_eq!(summary.reply().map(Content::as_str), Some("second answer"));
         assert_eq!(summary.steps_used, 2);
         assert!(summary.pending_messages.is_empty());
         assert!(recorded(&sink.0).iter().any(|event| matches!(
             event,
-            CoreEvent::MessagesInjected { messages } if messages.len() == 1
+            CoreEvent::MessagesInjected { count } if *count == 1
         )));
     }
 
@@ -976,16 +986,12 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(1), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(1), Log::default(), &mut sink))
             .await
             .unwrap();
 
-        assert_eq!(
-            summary.outcome,
-            Outcome::Answered {
-                reply: Content::try_from("all done").unwrap()
-            }
-        );
+        assert_eq!(summary.outcome, Outcome::Answered);
+        assert_eq!(summary.reply().map(Content::as_str), Some("all done"));
         // 注入没有进会话；会话里只有 goal 和答复
         assert_eq!(
             summary.pending_messages,
@@ -994,6 +1000,100 @@ mod tests {
             }]
         );
         assert_eq!(messages_of(&summary.log).len(), 2);
+    }
+
+    struct QueueingModel<'a> {
+        input: &'a FakeInput,
+    }
+
+    #[async_trait]
+    impl Llm for QueueingModel<'_> {
+        async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            self.input.queue("typed during the final answer");
+            Ok(response(completed("done")))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_during_the_final_call_is_not_dropped() {
+        let input = FakeInput::new();
+        let llm = QueueingModel { input: &input };
+        let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
+
+        let mut sink = Collector(Vec::new());
+        let summary = host
+            .run(RunRequest::new(config(4), Log::default(), &mut sink))
+            .await
+            .unwrap();
+
+        assert_eq!(summary.outcome, Outcome::Answered);
+        assert_eq!(summary.reply().map(Content::as_str), Some("done"));
+        // 收场后不再 drain：消息留在 Input 队列，下一次 run 会取到。
+        assert!(summary.pending_messages.is_empty());
+        assert_eq!(
+            input.drain(),
+            vec![Content::try_from("typed during the final answer").unwrap()]
+        );
+    }
+
+    struct FailingAudit;
+
+    #[async_trait]
+    impl agnes_io::session::SessionLog for FailingAudit {
+        async fn append(
+            &mut self,
+            _at: jiff::Timestamp,
+            _event: &agnes_core::event::Event,
+        ) -> Result<(), agnes_io::session::SessionError> {
+            Ok(())
+        }
+
+        async fn append_host(
+            &mut self,
+            _at: jiff::Timestamp,
+            _event: &HostEvent,
+        ) -> Result<(), agnes_io::session::SessionError> {
+            Err(agnes_io::session::SessionError::Io(std::io::Error::other(
+                "audit down",
+            )))
+        }
+
+        async fn flush(&mut self) -> Result<(), agnes_io::session::SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_audit_write_failure_is_reported_with_the_original_cause() {
+        struct Broken;
+        #[async_trait]
+        impl Llm for Broken {
+            async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+                Err(LlmError::Api {
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    body: ApiBody::new("down", "down"),
+                })
+            }
+        }
+
+        let llm = Broken;
+        let mut host = Host::builder(&llm, &NoInput)
+            .model(model())
+            .build()
+            .unwrap();
+        let mut sink = Collector(Vec::new());
+        let mut session = FailingAudit;
+        let err = host
+            .run(RunRequest::new(config(4), Log::default(), &mut sink).with_session(&mut session))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AgentError::Audit { .. }));
+        assert!(
+            sink.0
+                .iter()
+                .any(|event| matches!(event, Event::Failed { .. }))
+        );
     }
 
     // —— 插件：权限链驱动宿主 FSM ——
@@ -1052,12 +1152,12 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
 
         assert!(
-            matches!(&messages_of(&summary.log)[2], Message::ToolResult { output, .. } if !output.is_error)
+            matches!(&messages_of(&summary.log)[2], Message::ToolResult { output, .. } if !output.is_error())
         );
         assert_eq!(*seen.lock().unwrap(), vec!["ran"]);
     }
@@ -1084,7 +1184,7 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
 
@@ -1092,15 +1192,14 @@ mod tests {
         assert_eq!(recorder.calls.lock().unwrap().len(), 1);
         assert!(
             matches!(&messages_of(&summary.log)[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("the note was rejected"))
+                if output.is_error() && output.content().contains("the note was rejected"))
         );
-        assert!(
-            recorded(&sink.0)
-                .iter()
-                .any(|event| matches!(event, CoreEvent::ToolExecutionEnd { is_error: true, .. }))
-        );
+        assert!(recorded(&sink.0).iter().any(|event| matches!(
+            event,
+            CoreEvent::Message(Message::ToolResult { output, .. }) if output.is_error()
+        )));
         assert_eq!(*seen.lock().unwrap(), vec!["blocked"]);
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(matches!(summary.outcome, Outcome::Answered));
     }
 
     #[tokio::test]
@@ -1112,17 +1211,17 @@ mod tests {
         ]);
         let mut host = Host::builder(&llm, &NoInput)
             .model(model())
-            .plugin(PermissionPlugin::new(
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-                vec![],
-            ))
+            .plugin(PermissionPlugin::new(PermissionRules {
+                deny: vec![Rule::Name(ToolName::from_str("note").unwrap())],
+                ask: vec![],
+            }))
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .build()
             .unwrap();
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
 
@@ -1132,7 +1231,7 @@ mod tests {
         let messages = messages_of(&summary.log);
         assert_eq!(messages.len(), 4);
         assert!(matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("denied by policy")));
+                if output.is_error() && output.content().contains("denied by policy")));
         // 宿主上报了 gating
         assert!(
             sink.0
@@ -1140,7 +1239,7 @@ mod tests {
                 .any(|event| matches!(event, Event::ToolGated { denied, .. }
                 if denied.by == "permission" && denied.reason.contains("denied by policy")))
         );
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(matches!(summary.outcome, Outcome::Answered));
         // 事件序列与一次真实工具往返一致（core 视角无法区分拒绝）
         assert_eq!(
             shape(&recorded(&sink.0)),
@@ -1176,10 +1275,10 @@ mod tests {
         ]);
         let mut host = Host::builder(&llm, &NoInput)
             .model(model())
-            .plugin(PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ))
+            .plugin(PermissionPlugin::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            }))
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .approvals(Some(&approval))
             .build()
@@ -1194,7 +1293,7 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
         reviewer.await.unwrap();
@@ -1211,7 +1310,7 @@ mod tests {
             matches!(event, Event::ApprovalResolved { call_id, outcome: ApprovalOutcome::AllowedOnce, .. }
                 if call_id.as_str() == "c1")
         ));
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(matches!(summary.outcome, Outcome::Answered));
     }
 
     #[tokio::test]
@@ -1224,10 +1323,10 @@ mod tests {
         ]);
         let mut host = Host::builder(&llm, &NoInput)
             .model(model())
-            .plugin(PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ))
+            .plugin(PermissionPlugin::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            }))
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .approvals(Some(&approval))
             .build()
@@ -1239,7 +1338,7 @@ mod tests {
 
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
         reviewer.await.unwrap();
@@ -1247,7 +1346,7 @@ mod tests {
         assert!(recorder.calls.lock().unwrap().is_empty());
         let messages = messages_of(&summary.log);
         assert!(matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("denied by approval: the approval was refused")));
+                if output.is_error() && output.content().contains("denied by approval: the approval was refused")));
         assert!(sink.0.iter().any(|event| matches!(
             event,
             Event::ApprovalResolved {
@@ -1258,7 +1357,7 @@ mod tests {
         assert!(sink.0.iter().any(|event|
             matches!(event, Event::ToolGated { denied, .. } if denied.reason.contains("the approval was refused"))
         ));
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(matches!(summary.outcome, Outcome::Answered));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1274,10 +1373,10 @@ mod tests {
         let input = FakeInput::new();
         let mut host = Host::builder(&llm, &input)
             .model(model())
-            .plugin(PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ))
+            .plugin(PermissionPlugin::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            }))
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .approvals(Some(&approval))
             .build()
@@ -1289,7 +1388,7 @@ mod tests {
             input.interrupt();
         };
         let (result, ()) = tokio::join!(
-            host.run(config(8), Log::default(), &mut sink, None),
+            host.run(RunRequest::new(config(8), Log::default(), &mut sink)),
             interrupter
         );
         let summary = result.unwrap();
@@ -1315,7 +1414,7 @@ mod tests {
         let messages = messages_of(&summary.log);
         assert_eq!(messages.len(), 3);
         assert!(matches!(&messages[2], Message::ToolResult { output, .. }
-                if output.is_error && output.content.contains("interrupted")));
+                if output.is_error() && output.content().contains("interrupted")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1328,22 +1427,22 @@ mod tests {
         ]);
         let mut host = Host::builder(&llm, &NoInput)
             .model(model())
-            .plugin(PermissionPlugin::new(
-                vec![],
-                vec![Rule::Name(ToolName::from_str("note").unwrap())],
-            ))
+            .plugin(PermissionPlugin::new(PermissionRules {
+                deny: vec![],
+                ask: vec![Rule::Name(ToolName::from_str("note").unwrap())],
+            }))
             .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
             .approvals(Some(&approval))
             .build()
             .unwrap();
         let mut sink = Collector(Vec::new());
         let summary = host
-            .run(config(8), Log::default(), &mut sink, None)
+            .run(RunRequest::new(config(8), Log::default(), &mut sink))
             .await
             .unwrap();
         drop(kept_questions);
 
-        assert!(matches!(summary.outcome, Outcome::Answered { .. }));
+        assert!(matches!(summary.outcome, Outcome::Answered));
         assert!(recorder.calls.lock().unwrap().is_empty());
         assert!(sink.0.iter().any(|event|
             matches!(event, Event::ToolGated { denied, .. } if denied.reason.contains("timed out"))

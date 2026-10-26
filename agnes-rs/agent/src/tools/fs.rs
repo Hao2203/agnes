@@ -8,9 +8,9 @@ use agnes_core::message::{ToolArguments, ToolOutput};
 use agnes_core::tool::{ToolError, ToolName, ToolSpec};
 use agnes_io::tool::Tool;
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt as _;
 
-/// Largest tool output handed back to the model, in characters.
-const MAX_OUTPUT_CHARS: usize = 100_000;
+use super::text::{MAX_OUTPUT_BYTES, MAX_OUTPUT_CHARS, MAX_READ_BYTES, truncate};
 
 /// Resolves `relative` under `root`, rejecting absolute paths and any `..`
 /// that would climb out of the root. Symlink escapes are not followed up on
@@ -18,25 +18,25 @@ const MAX_OUTPUT_CHARS: usize = 100_000;
 fn resolve_under(root: &Path, relative: &str) -> Result<PathBuf, ToolError> {
     let rel = Path::new(relative);
     if rel.is_absolute() {
-        return Err(ToolError::BadArguments {
-            detail: format!("path must be relative to the working directory: {relative}"),
+        return Err(ToolError::AbsolutePath {
+            path: relative.to_owned(),
         });
     }
-    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let mut parts: Vec<std::ffi::OsString> = Vec::with_capacity(rel.components().count());
     for component in rel.components() {
         match component {
             Component::CurDir => {}
             Component::Normal(part) => parts.push(part.to_owned()),
             Component::ParentDir => {
                 if parts.pop().is_none() {
-                    return Err(ToolError::BadArguments {
-                        detail: format!("path escapes the working directory: {relative}"),
+                    return Err(ToolError::PathEscape {
+                        path: relative.to_owned(),
                     });
                 }
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(ToolError::BadArguments {
-                    detail: format!("path must be relative to the working directory: {relative}"),
+                return Err(ToolError::AbsolutePath {
+                    path: relative.to_owned(),
                 });
             }
         }
@@ -48,32 +48,23 @@ fn resolve_under(root: &Path, relative: &str) -> Result<PathBuf, ToolError> {
     Ok(resolved)
 }
 
-fn truncate(content: String) -> String {
-    if content.chars().count() <= MAX_OUTPUT_CHARS {
-        return content;
-    }
-    let mut out: String = content.chars().take(MAX_OUTPUT_CHARS).collect();
-    out.push_str("\n... (output truncated)");
-    out
-}
-
 fn spec(
     name: &str,
     description: &str,
     properties: serde_json::Value,
     required: &[&str],
 ) -> ToolSpec {
-    ToolSpec {
-        name: ToolName::from_str(name).expect("built-in tool names are valid"),
-        description: description.into(),
-        parameters: serde_json::json!({
+    ToolSpec::new(
+        ToolName::from_str(name).expect("built-in tool names are valid"),
+        description,
+        serde_json::json!({
             "type": "object",
             "properties": properties,
             "required": required,
         })
         .try_into()
         .expect("built-in schemas are objects"),
-    }
+    )
 }
 
 /// Reads a text file under the root directory.
@@ -83,6 +74,10 @@ pub struct ReadFile {
 }
 
 impl ReadFile {
+    /// # Panics
+    ///
+    /// Panics only if the built-in tool name or schema is invalid (a
+    /// programming error in this crate).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -110,15 +105,40 @@ impl Tool for ReadFile {
     }
 
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-        let args: PathArgs = arguments.parse().map_err(|e| ToolError::BadArguments {
-            detail: e.to_string(),
-        })?;
+        let args: PathArgs = arguments
+            .parse()
+            .map_err(|source| ToolError::BadArguments { source })?;
         let path = resolve_under(&self.root, &args.path)?;
-        let content = tokio::fs::read_to_string(&path)
+        let file = tokio::fs::File::open(&path)
             .await
-            .map_err(|e| ToolError::Failed {
-                detail: format!("cannot read `{}`: {e}", args.path),
+            .map_err(|source| ToolError::Io {
+                action: "cannot open file",
+                path: args.path.clone(),
+                source,
             })?;
+        let metadata = file.metadata().await.map_err(|source| ToolError::Io {
+            action: "cannot stat file",
+            path: args.path.clone(),
+            source,
+        })?;
+        // UTF-8 needs at most four bytes per character; reading this prefix is
+        // enough to fill the character budget without slurping a huge file.
+        let limit = metadata.len().min(MAX_READ_BYTES);
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(limit).expect("the read cap fits into usize"));
+        let mut reader = file.take(limit);
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|source| ToolError::Io {
+                action: "cannot read file",
+                path: args.path.clone(),
+                source,
+            })?;
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        };
         Ok(ToolOutput::success(truncate(content)))
     }
 }
@@ -131,6 +151,10 @@ pub struct WriteFile {
 }
 
 impl WriteFile {
+    /// # Panics
+    ///
+    /// Panics only if the built-in tool name or schema is invalid (a
+    /// programming error in this crate).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -160,21 +184,25 @@ impl Tool for WriteFile {
     }
 
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-        let args: WriteArgs = arguments.parse().map_err(|e| ToolError::BadArguments {
-            detail: e.to_string(),
-        })?;
+        let args: WriteArgs = arguments
+            .parse()
+            .map_err(|source| ToolError::BadArguments { source })?;
         let path = resolve_under(&self.root, &args.path)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| ToolError::Failed {
-                    detail: format!("cannot create directory for `{}`: {e}", args.path),
+                .map_err(|source| ToolError::Io {
+                    action: "cannot create directory for",
+                    path: args.path.clone(),
+                    source,
                 })?;
         }
         tokio::fs::write(&path, &args.content)
             .await
-            .map_err(|e| ToolError::Failed {
-                detail: format!("cannot write `{}`: {e}", args.path),
+            .map_err(|source| ToolError::Io {
+                action: "cannot write",
+                path: args.path.clone(),
+                source,
             })?;
         Ok(ToolOutput::success(format!(
             "wrote {} bytes to `{}`",
@@ -191,6 +219,10 @@ pub struct ListDir {
 }
 
 impl ListDir {
+    /// # Panics
+    ///
+    /// Panics only if the built-in tool name or schema is invalid (a
+    /// programming error in this crate).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -218,22 +250,40 @@ impl Tool for ListDir {
     }
 
     async fn run(&self, arguments: &ToolArguments) -> Result<ToolOutput, ToolError> {
-        let args: ListArgs = arguments.parse().map_err(|e| ToolError::BadArguments {
-            detail: e.to_string(),
-        })?;
+        const MAX_ENTRIES: usize = 10_000;
+
+        let args: ListArgs = arguments
+            .parse()
+            .map_err(|source| ToolError::BadArguments { source })?;
         let display = args.path.as_deref().unwrap_or(".");
         let path = resolve_under(&self.root, display)?;
         let mut reader = tokio::fs::read_dir(&path)
             .await
-            .map_err(|e| ToolError::Failed {
-                detail: format!("cannot list `{display}`: {e}"),
+            .map_err(|source| ToolError::Io {
+                action: "cannot list",
+                path: display.to_owned(),
+                source,
             })?;
-        let mut entries: Vec<String> = Vec::new();
-        while let Some(entry) = reader.next_entry().await.map_err(|e| ToolError::Failed {
-            detail: format!("cannot list `{display}`: {e}"),
+        let mut entries: Vec<String> = Vec::with_capacity(16);
+        let mut capped = false;
+        while let Some(entry) = reader.next_entry().await.map_err(|source| ToolError::Io {
+            action: "cannot list",
+            path: display.to_owned(),
+            source,
         })? {
+            if entries.len() >= MAX_ENTRIES {
+                capped = true;
+                break;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            // A failed stat degrades to "not a directory"; the entry is still
+            // listed. Only read_dir failures abort the listing.
+            if entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
                 entries.push(format!("{name}/"));
             } else {
                 entries.push(name);
@@ -243,7 +293,23 @@ impl Tool for ListDir {
         if entries.is_empty() {
             Ok(ToolOutput::success("(empty directory)"))
         } else {
-            Ok(ToolOutput::success(truncate(entries.join("\n"))))
+            let mut output =
+                String::with_capacity(MAX_OUTPUT_CHARS.min(entries.len().saturating_mul(32)));
+            for entry in entries {
+                let needed = output.len().saturating_add(entry.len()).saturating_add(1);
+                if needed > MAX_OUTPUT_BYTES {
+                    capped = true;
+                    break;
+                }
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&entry);
+            }
+            if capped {
+                output.push_str("\n... (output truncated)");
+            }
+            Ok(ToolOutput::success(truncate(output)))
         }
     }
 }
@@ -278,18 +344,34 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(!out.is_error);
+        assert!(!out.is_error());
 
         let read = ReadFile::new(dir.path());
         let out = read
             .run(&ToolArguments::new(r#"{"path": "sub/a.txt"}"#))
             .await
             .unwrap();
-        assert_eq!(&*out.content, "hello");
+        assert_eq!(out.content(), "hello");
 
         let list = ListDir::new(dir.path());
         let out = list.run(&ToolArguments::new("{}")).await.unwrap();
-        assert_eq!(&*out.content, "sub/");
+        assert_eq!(out.content(), "sub/");
+    }
+
+    #[tokio::test]
+    async fn read_file_truncates_large_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("large.txt"), "a".repeat(150_000)).unwrap();
+        let read = ReadFile::new(dir.path());
+        let out = read
+            .run(&ToolArguments::new(r#"{"path": "large.txt"}"#))
+            .await
+            .unwrap();
+        assert!(out.content().ends_with("\n... (output truncated)"));
+        assert_eq!(
+            out.content().chars().count(),
+            100_000 + "\n... (output truncated)".chars().count()
+        );
     }
 
     #[tokio::test]
@@ -300,6 +382,6 @@ mod tests {
             .run(&ToolArguments::new(r#"{"path": "nope.txt"}"#))
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Failed { .. }));
+        assert!(matches!(err, ToolError::Io { .. }));
     }
 }

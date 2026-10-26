@@ -15,6 +15,10 @@ pub trait Bundle {
     fn name(&self) -> &'static str;
 
     /// 把注册装进宿主；校验失败即中止装配。
+    ///
+    /// # Errors
+    ///
+    /// 装载单元的配置非法（规则指向不存在的工具、缺少审批口、重名等）。
     fn install(&self, host: &mut Host<'_>) -> Result<(), LoadError>;
 }
 

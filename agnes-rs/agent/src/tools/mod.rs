@@ -2,6 +2,7 @@
 
 mod fs;
 mod shell;
+mod text;
 
 pub use fs::{ListDir, ReadFile, WriteFile};
 pub use shell::Shell;

@@ -55,7 +55,6 @@ name = "agnes-io"
 version = "0.1.0"
 dependencies = [
  "agnes-core",
- "anyhow",
  "async-trait",
  "http",
  "jiff",
@@ -71,7 +70,6 @@ dependencies = [
  "agnes-core",
  "agnes-io",
  "agnes-util",
- "anyhow",
  "async-trait",
  "http",
  "serde",
@@ -100,7 +98,6 @@ name = "agnes-transport-reqwest"
 version = "0.1.0"
 dependencies = [
  "agnes-io",
- "anyhow",
  "async-trait",
  "http",
  "reqwest",

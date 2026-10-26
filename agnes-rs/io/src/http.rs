@@ -10,13 +10,27 @@ use async_trait::async_trait;
 /// Failure while performing an HTTP request. Payloads carry the underlying
 /// error — never a formatted string.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TransportError {
     /// The connection or stream failed at the I/O level.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    /// The request could not be completed for another reason.
-    #[error(transparent)]
-    Request(#[from] anyhow::Error),
+    /// The request exceeded its configured deadline.
+    #[error("request timed out")]
+    Timeout,
+    /// The response body was not valid UTF-8. The transport never replaces
+    /// invalid sequences silently.
+    #[error("response body is not valid UTF-8")]
+    InvalidUtf8(#[from] std::str::Utf8Error),
+    /// The response body exceeded the transport's safety limit.
+    #[error("response body exceeds {limit} bytes")]
+    BodyTooLarge { limit: usize },
+    /// The request could not be built by the `http` crate.
+    #[error("http request could not be built")]
+    Request(#[source] http::Error),
+    /// The client reported another failure (TLS, resolver, redirect, …).
+    #[error("{0}")]
+    Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Sends a request and returns the raw response with *any* status code;
@@ -29,8 +43,9 @@ pub trait HttpTransport: Send + Sync {
     ) -> Result<http::Response<String>, TransportError>;
 }
 
-/// Wrapper for logging a request without leaking credentials: header values
-/// of `Authorization` are masked, the body is reduced to its length.
+/// Wrapper for logging a request without leaking credentials: only
+/// `Content-Type`, `Accept`, and `User-Agent` stay visible; every other header
+/// value is masked and the body is reduced to its length.
 pub struct RedactedRequest<'a>(pub &'a http::Request<String>);
 
 impl fmt::Debug for RedactedRequest<'_> {
@@ -46,17 +61,22 @@ impl fmt::Debug for RedactedRequest<'_> {
 }
 
 fn redacted_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let value = if name == http::header::AUTHORIZATION {
-                "***".to_owned()
-            } else {
-                value.to_str().unwrap_or("<non-utf8>").to_owned()
-            };
-            (name.to_string(), value)
-        })
-        .collect()
+    const VISIBLE: [http::header::HeaderName; 3] = [
+        http::header::CONTENT_TYPE,
+        http::header::ACCEPT,
+        http::header::USER_AGENT,
+    ];
+
+    let mut rendered = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let value = if VISIBLE.contains(name) {
+            value.to_str().unwrap_or("<non-utf8>").to_owned()
+        } else {
+            "***".to_owned()
+        };
+        rendered.push((name.to_string(), value));
+    }
+    rendered
 }
 
 #[cfg(test)]
@@ -70,12 +90,16 @@ mod tests {
             .uri("https://example.com/v1/chat/completions")
             .header(http::header::AUTHORIZATION, "Bearer sk-secret")
             .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::COOKIE, "session=secret")
+            .header("x-api-key", "secret-key")
             .body("{}".to_owned())
             .unwrap();
 
         let rendered = format!("{:?}", RedactedRequest(&request));
         assert!(rendered.contains("***"));
         assert!(!rendered.contains("sk-secret"));
+        assert!(!rendered.contains("session=secret"));
+        assert!(!rendered.contains("secret-key"));
         assert!(rendered.contains("application/json"));
         assert!(rendered.contains("body_len: 2"));
     }
