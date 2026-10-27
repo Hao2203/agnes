@@ -1,23 +1,24 @@
 //! 会话日志的文件实现：JSONL、单写者、崩溃后补写恢复。
 //!
-//! 格式 v5（每行一个 JSON 对象；首行是版本标记，之后是两种记录）：
+//! 格式 v6（每行一个 JSON 对象；首行是版本标记，之后是两种记录）：
 //!
 //! ```text
-//! {"kind":"meta","format":5}
+//! {"kind":"meta","format":6}
 //! {"kind":"core","seq":1,"time":"2026-10-19T…","event":{"header":{…}}}
 //! {"kind":"host","seq":2,"time":"…","event":{"approval_requested":{…}}}
 //! ```
 //!
 //! `core` 行是运行的真源（`Event`），`host` 行是 core 不该知道的审计记录
-//! （审批问询/决定、错误中止的原因）。两者共享一个 `seq` 顺序。
+//! （审批问询/决定、插件中止的原因、错误中止的原因）。两者共享一个 `seq` 顺序。
 //!
 //! 系统提示与工具环境不是单独的一行：它们是事件（`Event::Header`），
-//! 每个 turn 记一条 —— 所以日志是唯一状态，恢复不需要比对任何旁路配置。
+//! 每个 turn 开局与工具集变化时各记一条 —— 所以日志是唯一状态，恢复不需要
+//! 比对任何旁路配置。
 //!
 //! 规则：
 //!
 //! - `seq` 从 1 起严格连续（跨两种行）；不连续 = 损坏，拒绝加载（fail closed）。
-//! - 读不懂的 `format` 拒绝加载，不猜；旧格式（v1–v4）同样拒载。
+//! - 读不懂的 `format` 拒绝加载，不猜；旧格式（v1–v5）同样拒载。
 //! - `event` 载荷的具体形状由 [`wire`] 定义（core 的类型不实现序列化）：
 //!   未知变体与非法载荷一律拒载，不猜。
 //! - 只有**最后一行**允许是撕裂的半行（崩溃时没写完）：丢弃并截断到物理
@@ -45,7 +46,7 @@ use jiff::Timestamp;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
 /// 本实现写出的格式版本。
-pub const FORMAT: u32 = 5;
+pub const FORMAT: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -684,6 +685,16 @@ mod tests {
             )
             .await
             .unwrap();
+        session
+            .append_host(
+                Timestamp::now(),
+                &HostEvent::Aborted {
+                    by: "policy".into(),
+                    reason: "stop here".into(),
+                },
+            )
+            .await
+            .unwrap();
         // turn 没写完 —— 恢复时要补写收尾，但审计记录必须原样保留
         session.flush().await.unwrap();
         drop(session);
@@ -696,7 +707,7 @@ mod tests {
         } = SessionFile::open_or_create(path.as_path()).await.unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(events.len(), 2);
-        assert_eq!(notes.len(), 2);
+        assert_eq!(notes.len(), 3);
         assert!(matches!(
             notes[0].event,
             HostEvent::ApprovalRequested { .. }
@@ -707,6 +718,10 @@ mod tests {
                 outcome: agnes_io::session::ApprovalOutcome::Rejected,
                 ..
             }
+        ));
+        assert!(matches!(
+            &notes[2].event,
+            HostEvent::Aborted { by, reason } if by == "policy" && reason == "stop here"
         ));
     }
 
@@ -792,7 +807,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let raw = concat!(
-            "{\"kind\":\"meta\",\"format\":5}\n",
+            "{\"kind\":\"meta\",\"format\":6}\n",
             "{\"kind\":\"core\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
             "{\"kind\":\"core\",\"seq\":3,\"time\":\"2026-10-19T00:00:01Z\",\"event\":\"turn_start\"}\n",
         );
@@ -827,7 +842,7 @@ mod tests {
             let path = dir.path().join("s.jsonl");
             std::fs::write(
                 &path,
-                format!("{{\"kind\":\"meta\",\"format\":5}}\n{case}\n"),
+                format!("{{\"kind\":\"meta\",\"format\":6}}\n{case}\n"),
             )
             .unwrap();
 
@@ -845,7 +860,7 @@ mod tests {
     async fn corrupt_reasons_are_typed() {
         let dir = tempfile::tempdir().unwrap();
         let bad_json = dir.path().join("bad-json.jsonl");
-        std::fs::write(&bad_json, "{\"kind\":\"meta\",\"format\":5}\nnot json\n").unwrap();
+        std::fs::write(&bad_json, "{\"kind\":\"meta\",\"format\":6}\nnot json\n").unwrap();
         let err = SessionFile::open_or_create(bad_json.as_path())
             .await
             .unwrap_err();
@@ -860,7 +875,7 @@ mod tests {
         let bad_shape = dir.path().join("bad-shape.jsonl");
         std::fs::write(
             &bad_shape,
-            "{\"kind\":\"meta\",\"format\":5}\n\
+            "{\"kind\":\"meta\",\"format\":6}\n\
              {\"kind\":\"core\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\
              \"event\":{\"message\":{\"assistant\":{\"tool_calls\":{\"content\":null,\"calls\":[]}}}}}\n",
         )
@@ -901,7 +916,7 @@ mod tests {
     async fn a_future_format_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
-        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":6}\n").unwrap();
+        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":7}\n").unwrap();
 
         let err = SessionFile::open_or_create(path.as_path())
             .await
@@ -909,7 +924,25 @@ mod tests {
         assert!(matches!(
             err,
             OpenError::UnsupportedVersion {
-                found: 6,
+                found: 7,
+                supported: FORMAT
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_v5_session_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{\"kind\":\"meta\",\"format\":5}\n").unwrap();
+
+        let err = SessionFile::open_or_create(path.as_path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenError::UnsupportedVersion {
+                found: 5,
                 supported: FORMAT
             }
         ));
@@ -994,7 +1027,7 @@ mod tests {
         drop(session);
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(raw, "{\"kind\":\"meta\",\"format\":5}\n");
+        assert_eq!(raw, "{\"kind\":\"meta\",\"format\":6}\n");
     }
 
     #[tokio::test]
@@ -1002,7 +1035,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let raw = concat!(
-            "{\"kind\":\"meta\",\"format\":5}\n",
+            "{\"kind\":\"meta\",\"format\":6}\n",
             "{\"kind\":\"core\",\"seq\":1,\"time\":\"2026-10-19T00:00:00Z\",\"event\":\"turn_start\"}\n",
             "{\"kind\":\"core\",\"seq\":2",
         );

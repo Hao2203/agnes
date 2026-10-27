@@ -1,4 +1,4 @@
-//! 会话文件的线格式：v5 JSONL 的具体形状，以及与领域词汇的互转。
+//! 会话文件的线格式：v6 JSONL 的具体形状，以及与领域词汇的互转。
 //!
 //! 格式是本 crate 的私事 —— core 的类型不实现序列化，形状、校验与拒载
 //! 规则都定义在这里（与 `agnes-llm-openai` 的 wire 同一模式）。变体名是
@@ -80,6 +80,10 @@ pub(crate) enum WireHostEvent {
     ApprovalResolved {
         call_id: String,
         outcome: WireApprovalOutcome,
+    },
+    Aborted {
+        by: String,
+        reason: String,
     },
     Failed {
         cause: String,
@@ -396,6 +400,10 @@ impl From<&HostEvent> for WireHostEvent {
                 call_id: call_id.as_str().to_owned(),
                 outcome: (*outcome).into(),
             },
+            HostEvent::Aborted { by, reason } => Self::Aborted {
+                by: by.clone(),
+                reason: reason.clone(),
+            },
             HostEvent::Failed { cause } => Self::Failed {
                 cause: cause.clone(),
             },
@@ -604,6 +612,7 @@ impl TryFrom<WireHostEvent> for HostEvent {
                 call_id: ToolCallId::new(call_id),
                 outcome: outcome.into(),
             },
+            WireHostEvent::Aborted { by, reason } => Self::Aborted { by, reason },
             WireHostEvent::Failed { cause } => Self::Failed { cause },
         })
     }
@@ -722,6 +731,33 @@ mod tests {
             let json = serde_json::to_string(&WireEvent::from(&event)).unwrap();
             let wire: WireEvent = serde_json::from_str(&json).unwrap();
             let back = Event::try_from(wire).unwrap();
+            assert_eq!(back, event, "round trip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn every_host_event_variant_round_trips() {
+        let events = vec![
+            HostEvent::ApprovalRequested {
+                call_id: ToolCallId::new("c1"),
+                tool: ToolName::from_str("run_shell").unwrap(),
+            },
+            HostEvent::ApprovalResolved {
+                call_id: ToolCallId::new("c1"),
+                outcome: ApprovalOutcome::Rejected,
+            },
+            HostEvent::Aborted {
+                by: "policy".into(),
+                reason: "stop here".into(),
+            },
+            HostEvent::Failed {
+                cause: "down".into(),
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&WireHostEvent::from(&event)).unwrap();
+            let wire: WireHostEvent = serde_json::from_str(&json).unwrap();
+            let back = HostEvent::try_from(wire).unwrap();
             assert_eq!(back, event, "round trip failed for {json}");
         }
     }

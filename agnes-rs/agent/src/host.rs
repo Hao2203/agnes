@@ -9,6 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use agnes_core::config::ModelName;
+use agnes_core::message::Message;
 use agnes_core::turn::{AgentConfig, Turn};
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
@@ -122,10 +123,11 @@ impl<'a> Host<'a> {
     /// 运行中的注入（[`InputPort::drain`] 的用户消息）由机器缓存、在下一个
     /// step 边界生效，没生效的随 [`RunSummary::pending_messages`] 还给宿主。
     ///
-    /// 工具调用先过扩展内核的门禁折叠 —— 拒绝以合成失败结果推进机器、
-    /// `Ask` 则走审批口问询挂起（未接线即拒绝）；结果入账前再过一次
-    /// 结果折叠。工具失败不中止 run —— 它是给模型的错误输出；只有传输/
-    /// 模型错误终止。
+    /// 工具调用先发布 `ToolCallRequested`，再取用插件指令 —— 拒绝以合成
+    /// 失败结果推进机器、`RequireApproval` 走审批口问询挂起（未接线即
+    /// 拒绝）；结果入账前发布 `ToolCallFinished` 并取用替换。注入进队列、
+    /// 工具变更在下一个模型调用前落地、`Abort` 在下一个工作前收场。
+    /// 工具失败不中止 run —— 它是给模型的错误输出；只有传输/模型错误终止。
     ///
     /// # Errors
     ///
@@ -153,8 +155,12 @@ impl<'a> Host<'a> {
             tools,
         });
 
+        // 上一次失败 run 遗留的指令/注入不能污染这一次。
+        self.extensions.clear_pending_commands();
+        self.extensions.clear_pending_injections();
+
         let ports = Ports {
-            registry: &self.tools,
+            registry: &mut self.tools,
             llm: self.llm,
             input: self.input,
             requests: self.requests.as_ref(),
@@ -169,9 +175,16 @@ impl<'a> Host<'a> {
         let mut log = log;
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
         // 由驱动记录，宿主保留所有权。
-        let closed = match Driver::new(&mut log, ports, outlets).run(turn).await {
-            Ok(closed) => closed,
+        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(turn).await {
+            Ok(done) => done,
             Err(err) => {
+                // 失败 run 里已经产生的工具变更对下一 turn 仍然有效；
+                // 无法执行的定向指令与注入直接丢弃。
+                for change in self.extensions.take_tool_changes() {
+                    change.apply(&mut self.tools);
+                }
+                self.extensions.clear_pending_commands();
+                self.extensions.clear_pending_injections();
                 sink.event(&Event::Failed {
                     at: Timestamp::now(),
                     error: err.to_string(),
@@ -182,12 +195,21 @@ impl<'a> Host<'a> {
 
         let finished_at = Timestamp::now();
         let result = closed.into_result();
+        // 收场时仍在注入队列里的消息交给宿主，和 core 的未生效注入一样
+        // 进 pending_messages。
+        let mut pending_messages = result.unapplied;
+        pending_messages.extend(self.extensions.take_pending_injections().into_iter().map(
+            |queued| Message::User {
+                content: queued.into_content(),
+            },
+        ));
         let summary = RunSummary {
             outcome: result.outcome,
             steps_used: result.steps_used,
             usage: result.usage,
             log,
-            pending_messages: result.unapplied,
+            pending_messages,
+            aborted,
             started_at,
             finished_at,
         };
@@ -361,6 +383,28 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, LoadError::UnknownTool { .. }));
+    }
+
+    #[test]
+    fn unresolved_rules_can_be_allowed_for_dynamic_tools() {
+        let llm = Never;
+        let input = NoInput;
+        let host = Host::builder(&llm, &input)
+            .model(model())
+            .bundle(
+                PolicyBundle::new(PermissionRules {
+                    deny: vec![Rule::Name(name("later"))],
+                    ask: vec![],
+                })
+                .allow_unresolved(),
+            )
+            .build()
+            .unwrap();
+        assert!(
+            host.extensions()
+                .names()
+                .any(|plugin| plugin == "permission")
+        );
     }
 
     #[test]

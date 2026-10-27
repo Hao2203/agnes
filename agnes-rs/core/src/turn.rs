@@ -144,6 +144,13 @@ impl Core {
     fn emit(&mut self, event: Event) {
         self.note([event]);
     }
+
+    /// 丢弃尚未执行的工作动作（模型调用 / 工具派发），保留已排队的事件。
+    /// 收场时使用：之后不应再启动新的工作。
+    fn discard_pending_work(&mut self) {
+        self.actions
+            .retain(|action| matches!(action, Action::Record(_)));
+    }
 }
 
 /// 阶段：等模型消息 —— 只接受完整响应、打断和注入。
@@ -225,6 +232,11 @@ impl<Phase> Turn<Phase> {
     pub fn poll_actions(&mut self) -> Option<Action> {
         self.core.actions.pop_front()
     }
+
+    /// 只看下一个待执行动作，不消费；队列空了返回 None。
+    pub fn next_action(&self) -> Option<&Action> {
+        self.core.actions.front()
+    }
 }
 
 impl Turn<AwaitingMessage> {
@@ -255,6 +267,27 @@ impl Turn<AwaitingMessage> {
     /// 消息不限于用户发出 —— 角色由 [`Message`] 本身保留。
     pub fn inject(&mut self, message: Message) {
         self.core.buffered_messages.push(message);
+    }
+
+    /// 下一个动作是否就是待发的模型调用（只看不消费）。
+    pub fn is_about_to_call_model(&self) -> bool {
+        matches!(self.core.actions.front(), Some(Action::CallModel))
+    }
+
+    /// 运行中替换模型侧环境：在下一次模型调用前插入一条 `Header` 事件，
+    /// 让紧随其后的请求使用新的系统提示与工具表。
+    ///
+    /// 只有队首就是待发模型调用时才生效；否则返回 `false`，不记录任何
+    /// 事件 —— 调用已经发出后，请求是不可变的，环境变更只能等下一轮。
+    #[must_use]
+    pub fn set_environment(&mut self, header: Header) -> bool {
+        if !self.is_about_to_call_model() {
+            return false;
+        }
+        self.core
+            .actions
+            .push_front(Action::Record(Event::Header(header)));
+        true
     }
 
     /// 一次模型往返的响应到达：用量落账，随后要么转入工具执行，要么
@@ -412,6 +445,8 @@ impl Turn<AwaitingMessage> {
     #[must_use]
     pub fn interrupted(self) -> Turn<Closed> {
         let Turn { mut core, phase } = self;
+        // 收场后队列里若还躺着 CallModel，驱动会误以为还要再问一次模型。
+        core.discard_pending_work();
         core.note([Event::StepEnd {
             step: phase.step,
             outcome: StepOutcome::Interrupted,
@@ -526,6 +561,8 @@ impl Turn<AwaitingTools> {
     #[must_use]
     pub fn interrupted(self) -> Turn<Closed> {
         let Turn { mut core, phase } = self;
+        // 还在排队的下一个 RunTool 不能在收场后被执行。
+        core.discard_pending_work();
         let mut events = Vec::with_capacity(phase.slots.len().saturating_mul(2).saturating_add(1));
         for slot in phase.slots.iter() {
             if slot.finished {
@@ -622,7 +659,7 @@ mod tests {
     use crate::header::{Environment, Header};
     use crate::llm::Prompt;
     use crate::message::{ToolArguments, ToolOutput};
-    use crate::tool::ToolName;
+    use crate::tool::{JsonSchema, ToolName, ToolSpec};
     use agnes_util::NonEmpty;
     use std::num::NonZeroU32 as TestNonZeroU32;
     use std::str::FromStr;
@@ -777,6 +814,111 @@ mod tests {
         assert!(
             matches!(&prompt.input[1], Message::User { content } if content.as_str() == "flip the flag")
         );
+    }
+
+    #[test]
+    fn set_environment_records_a_header_before_the_pending_model_call() {
+        let mut turn = Turn::start(config(4));
+        let mut events = Vec::new();
+        // 保留 CallModel 在队首：先把前面的记录动作取走
+        while !turn.is_about_to_call_model() {
+            match turn
+                .poll_actions()
+                .expect("a pending call follows the records")
+            {
+                Action::Record(event) => events.push(event),
+                other => panic!("unexpected action before the call: {other:?}"),
+            }
+        }
+        assert!(turn.next_action().is_some());
+
+        let spec = ToolSpec::new(
+            ToolName::from_str("injected").unwrap(),
+            "an injected tool",
+            JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
+        );
+        assert!(turn.set_environment(Header::new(
+            SystemPrompt::new("be brief"),
+            Environment::new(vec![spec]),
+        )));
+
+        let mut after = Vec::new();
+        let (shapes, calls, tools) = drain(&mut turn, &mut after);
+        // header 恰好落在唯一一次模型调用之前
+        assert_eq!(shapes, vec!["header"]);
+        assert_eq!(calls, 1);
+        assert!(tools.is_empty());
+        events.extend(after);
+
+        let prompt = Prompt::from_events(&events);
+        assert_eq!(prompt.tools.len(), 1);
+        assert_eq!(prompt.tools[0].name().as_str(), "injected");
+        assert!(
+            matches!(&prompt.input[0], Message::System { content } if content.as_str() == "be brief")
+        );
+    }
+
+    #[test]
+    fn set_environment_without_a_pending_call_records_nothing() {
+        let mut turn = Turn::start(config(4));
+        // 把包括 CallModel 在内的动作全部取走：驱动正在等模型
+        while turn.poll_actions().is_some() {}
+        assert!(!turn.is_about_to_call_model());
+        assert!(!turn.set_environment(Header::new(
+            SystemPrompt::new("be brief"),
+            Environment::default(),
+        )));
+    }
+
+    #[test]
+    fn set_environment_requires_the_pending_call_at_the_front() {
+        let mut turn = Turn::start(config(4));
+        // 队首还是 Header 记录：还不是应用环境变更的检查点
+        assert!(!turn.is_about_to_call_model());
+        assert!(!turn.set_environment(Header::new(
+            SystemPrompt::new("be brief"),
+            Environment::default(),
+        )));
+
+        // 取走记录，直到 CallModel 成为队首
+        while !turn.is_about_to_call_model() {
+            assert!(matches!(turn.poll_actions(), Some(Action::Record(_))));
+        }
+        assert!(turn.set_environment(Header::new(
+            SystemPrompt::new("be brief"),
+            Environment::default(),
+        )));
+
+        let mut events = Vec::new();
+        let (shapes, calls, tools) = drain(&mut turn, &mut events);
+        assert_eq!(shapes, vec!["header"]);
+        assert_eq!(calls, 1);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn interrupting_discards_queued_work_but_keeps_pending_records() {
+        // 还没取走 CallModel 就打断：收场不能留下会被误执行的模型调用。
+        let turn = Turn::start(config(4));
+        let mut closed = turn.interrupted();
+        let mut events = Vec::new();
+        let (shapes, calls, tools) = drain(&mut closed, &mut events);
+
+        assert_eq!(calls, 0);
+        assert!(tools.is_empty());
+        assert_eq!(
+            shapes,
+            vec![
+                "header",
+                "message",
+                "turn_start",
+                "step_start",
+                "message_start",
+                "step_end",
+                "turn_end"
+            ]
+        );
+        assert!(closed.next_action().is_none());
     }
 
     #[test]

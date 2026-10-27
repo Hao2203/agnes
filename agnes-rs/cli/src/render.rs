@@ -144,6 +144,7 @@ fn event_text(model: &ModelName, event: &Event) -> Option<String> {
         Event::ApprovalResolved { outcome, .. } => {
             (!outcome.allows()).then(|| format!("  ✗ not approved ({outcome:?})"))
         }
+        Event::Aborted { by, reason, .. } => Some(format!("  ⛔ aborted by {by}: {reason}")),
         Event::Recorded { event, .. } => recorded_text(event),
         Event::Finished { .. } => None,
         // The app reports the run error once; observers still see this.
@@ -170,7 +171,13 @@ pub fn print_summary(summary: &RunSummary, renderer: &Renderer) {
         }
         Outcome::Interrupted => {
             renderer.line("");
-            renderer.line("(stopped: interrupted by the user — session kept)");
+            match &summary.aborted {
+                Some(aborted) => renderer.line(format!(
+                    "(stopped by {}: {} — session kept)",
+                    aborted.by, aborted.reason
+                )),
+                None => renderer.line("(stopped: interrupted by the user — session kept)"),
+            }
         }
         Outcome::BudgetExhausted => {
             renderer.line("");

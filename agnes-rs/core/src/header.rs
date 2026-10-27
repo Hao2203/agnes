@@ -2,9 +2,10 @@
 //! and the tool environment.
 //!
 //! The header is not a field anywhere: it enters the log as
-//! [`crate::event::Event::Header`], once at the start of every turn. That
-//! makes a request a pure function of the log, and a changed tool set is
-//! simply recorded by the next turn instead of being validated out of band.
+//! [`crate::event::Event::Header`], once at the start of every turn and again
+//! whenever the host changes the tool environment mid-turn. The last header in
+//! the log is the one the next request is built from, so a changed tool set is
+//! recorded instead of being validated out of band.
 
 use crate::config::SystemPrompt;
 use crate::tool::ToolSpec;

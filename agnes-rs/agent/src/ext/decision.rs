@@ -1,16 +1,17 @@
-//! 扩展点的决议词汇：插件只表达「拒绝 / 要审批 / 挡回」，系统再折叠成
-//! 可执行决议。
+//! 系统侧的决议词汇：插件只表达意图，系统折叠成可执行结果。
 
-/// 门禁的插件侧结果。
+/// 门禁检查点的系统决议。
 ///
-/// 没有 `Allow` —— 放行不可表达，因此任何注册顺序都无法把已经发生的
-/// [`Verdict::Deny`] 变回放行；链上无人表态时由系统按放行处理。
+/// 插件侧没有 `Allow`：放行是「无人拒绝且无人要求审批」的系统默认，
+/// 因此任何注册顺序都无法把已经发生的 [`Gate::Deny`] 变回放行。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    /// 拒绝执行。理由会作为合成错误结果喂回模型；拒绝者的名字由内核盖章。
-    Deny { reason: String },
-    /// 要求一次人工审批；是否真有审批通道由系统在派发时决定。
+pub enum Gate {
+    /// 放行执行。
+    Allow,
+    /// 走审批流。
     Ask,
+    /// 拒绝执行。
+    Deny(Denied),
 }
 
 /// 一次拒绝：谁拒的、为什么。
@@ -22,29 +23,6 @@ pub struct Denied {
     pub reason: String,
 }
 
-/// 门禁折叠后的系统决议。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Gate {
-    /// 放行执行。
-    Allow,
-    /// 走审批流。
-    Ask,
-    /// 拒绝执行。
-    Deny(Denied),
-}
-
-/// 结果折叠的插件侧结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Settlement {
-    /// 接受原结果。
-    Accept,
-    /// 挡回：原结果被替换成反馈（仍是一条错误结果入账）。
-    Block {
-        /// 反馈内容，模型可见。
-        feedback: String,
-    },
-}
-
 /// 挡回后的系统决议。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
@@ -52,6 +30,15 @@ pub struct Blocked {
     pub by: &'static str,
     /// 入账的反馈。
     pub feedback: String,
+}
+
+/// 一次插件中止：谁中止的、为什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aborted {
+    /// 中止者（插件名），由内核盖章。
+    pub by: &'static str,
+    /// 中止原因（随宿主事件一起落盘/上报）。
+    pub reason: String,
 }
 
 /// 审批结果。词汇定义在 `agnes_io::session`（它同时是耐久记录的格式），

@@ -79,12 +79,13 @@ pub async fn run(cli: Cli) -> Result<()> {
 async fn run_staged(
     wiring: &Wiring,
     host: &mut Host<'_>,
-    header: &Header,
     session: Option<&mut ChatSession>,
     goal: Content,
 ) -> Result<RunSummary> {
+    // 每轮从当前注册表重建 header：插件上一轮动态加入/移除的工具
+    // 从这一轮开始对模型可见。
     let config = AgentConfig {
-        header: header.clone(),
+        header: session_header(host.tools()),
         goal,
         budget: wiring.max_steps,
     };
@@ -121,7 +122,6 @@ async fn run_once(wiring: &Wiring, task: Option<String>) -> Result<()> {
 
     let (approvals, approver) = approvals(wiring);
     let mut host = build_host(wiring, approvals.as_ref())?;
-    let header = session_header(host.tools());
 
     let mut session = match &wiring.session_path {
         Some(path) => {
@@ -131,7 +131,7 @@ async fn run_once(wiring: &Wiring, task: Option<String>) -> Result<()> {
         }
         None => None,
     };
-    let result = run_staged(wiring, &mut host, &header, session.as_mut(), goal).await;
+    let result = run_staged(wiring, &mut host, session.as_mut(), goal).await;
 
     if let Some(task) = stdin_task {
         task.abort();
@@ -187,7 +187,6 @@ async fn chat(wiring: &Wiring) -> Result<()> {
 
     let (approvals, approver) = approvals(wiring);
     let mut host = build_host(wiring, approvals.as_ref())?;
-    let header = session_header(host.tools());
 
     let mut session = match &wiring.session_path {
         Some(path) => {
@@ -226,7 +225,7 @@ async fn chat(wiring: &Wiring) -> Result<()> {
                 }
             }
             Line::Task(goal) => {
-                let result = run_staged(wiring, &mut host, &header, session.as_mut(), goal).await;
+                let result = run_staged(wiring, &mut host, session.as_mut(), goal).await;
                 match result {
                     Ok(summary) => {
                         print_summary(&summary, &wiring.renderer);

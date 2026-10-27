@@ -19,8 +19,8 @@ use crate::turn::{Outcome, StepNumber, StepOutcome};
 /// 运行时日志里的一条，按发生顺序。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// 模型侧配置（系统提示与工具环境）生效：每个 turn 开局记一条，
-    /// 日志里最后一条就是这一轮请求的依据。
+    /// 模型侧配置（系统提示与工具环境）生效：每个 turn 开局记一条；
+    /// 工具环境运行中变化时再记一条。日志里最后一条就是下一次请求的依据。
     Header(Header),
     /// turn 开始：一条用户请求进入 agent 循环。
     TurnStart,

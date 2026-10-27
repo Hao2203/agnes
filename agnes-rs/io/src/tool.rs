@@ -19,8 +19,9 @@ pub trait Tool: Send + Sync {
 #[error("duplicate tool name `{0}`")]
 pub struct DuplicateTool(pub ToolName);
 
-/// Immutable, name-ordered set of tools.
-#[derive(Default)]
+/// Immutable, name-ordered set of tools. Cloneable so the host can build a
+/// candidate set, validate tool changes, and swap it in atomically.
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<ToolName, Arc<dyn Tool>>,
 }
