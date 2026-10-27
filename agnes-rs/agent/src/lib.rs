@@ -1,14 +1,14 @@
 //! 驱动器：宿主状态机（私有模块 `driver`）解释 [`agnes_core::turn`] 状态机
-//! 产生的动作 —— 就地处理动作、管理等待点与输入输出。
+//! 的转移 —— 机器只持有领域状态，动作由阶段提示（等模型 / 等工具）。
 //!
 //! 机器是类型状态的（阶段即类型）；这个 crate 做 IO —— 通过 `agnes-io`
-//! 的异步接缝 —— 把结果经对应阶段的方法喂回机器，一路用 [`Event`] 上报
-//! 发生的事。运行时（tokio、smol、…）由宿主的执行器与传输层选择，与本
-//! crate 无关。
+//! 的异步接缝 —— 把结果经对应阶段的方法喂回机器，并按自己的记录词汇
+//! （[`record`]）上报发生的事。运行时（tokio、smol、…）由宿主的执行器与
+//! 传输层选择，与本 crate 无关。
 //!
 //! 宿主用 [`Host`] 装配：模型、输入、工具、扩展内核、审批口与会话日志在
 //! 装载期一次性解析。驱动从不自己组装提示词：[`RequestBuilder`] 是宿主
-//! 的转换者，在每次模型调用前由它把日志变成请求。
+//! 的转换者，在每次模型调用前由它把 [`Context`] 变成请求。
 //!
 //! 工具执行前先过扩展内核（[`ext`]）：插件只处理事件、返回指令
 //! （[`ext::Command`]），执行权在系统 —— 放行执行、拒绝则以合成失败结果
@@ -24,15 +24,18 @@ mod log;
 pub mod approval;
 pub mod ext;
 pub mod permission;
+pub mod record;
+pub mod session;
 pub mod tools;
 
 pub use host::{Host, HostBuilder, LoadError, RunRequest};
 pub use log::Log;
+pub use session::{SessionError, SessionLog};
 
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
-use agnes_core::event::Event as CoreEvent;
-use agnes_core::llm::{LlmRequest, Prompt};
+use agnes_core::context::Context;
+use agnes_core::llm::LlmRequest;
 use agnes_core::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolCallId};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::Outcome;
@@ -49,7 +52,7 @@ pub enum AgentError {
     Llm(#[from] LlmError),
     /// 会话日志写失败：宁可中止，也不在没有审计轨迹的情况下继续跑。
     #[error(transparent)]
-    Session(#[from] agnes_io::session::SessionError),
+    Session(#[from] SessionError),
     /// 驱动内部不变量被破坏（不是用户输入或 IO 错误）。
     #[error("driver invariant violated: {reason}")]
     Invariant { reason: &'static str },
@@ -58,17 +61,17 @@ pub enum AgentError {
     Audit {
         #[source]
         cause: Box<AgentError>,
-        audit: agnes_io::session::SessionError,
+        audit: SessionError,
     },
 }
 
-/// 把会话日志转换成具体请求。宿主提供一个，驱动在每次模型调用前询问它 ——
-/// 提示词长什么样完全是宿主的事，[`Prompt::from_events`] 只是标准投影。
+/// 把 [`Context`] 转换成具体请求。宿主提供一个，驱动在每次模型调用前询问
+/// 它 —— 提示词长什么样完全是宿主的事，[`Context::prompt`] 只是标准投影。
 pub trait RequestBuilder {
-    fn build(&self, log: &Log) -> LlmRequest;
+    fn build(&self, context: &Context) -> LlmRequest;
 }
 
-/// 标准转换者：日志的标准投影（[`Prompt::from_events`]）加模型名。
+/// 标准转换者：上下文的标准投影（[`Context::prompt`]）加模型名。
 /// 对提示词有想法的宿主自己实现 [`RequestBuilder`]。
 #[derive(Debug, Clone)]
 pub struct StandardRequestBuilder {
@@ -82,10 +85,10 @@ impl StandardRequestBuilder {
 }
 
 impl RequestBuilder for StandardRequestBuilder {
-    fn build(&self, log: &Log) -> LlmRequest {
+    fn build(&self, context: &Context) -> LlmRequest {
         LlmRequest {
             model: self.model.clone(),
-            prompt: Prompt::from_events(log.events()),
+            prompt: context.prompt(),
         }
     }
 }
@@ -100,11 +103,11 @@ pub enum Event {
         goal: Content,
         tools: Vec<ToolName>,
     },
-    /// Agent 循环里发生的一条核心事件 —— turn/step 生命周期或消息；
+    /// Agent 循环里发生的一条记录事件 —— turn/step 生命周期或消息；
     /// 驱动已把它记入日志，再按发生顺序转发。
     Recorded {
         at: Timestamp,
-        event: CoreEvent,
+        event: record::Event,
     },
     /// 扩展内核拒绝了一次工具调用；机器将收到一条合成的失败结果。
     ToolGated {

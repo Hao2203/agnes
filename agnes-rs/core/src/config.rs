@@ -225,8 +225,8 @@ impl StepBudget {
         Self(value)
     }
 
-    pub fn max_steps(&self) -> u32 {
-        self.0.get()
+    pub fn max_steps(&self) -> NonZeroU32 {
+        self.0
     }
 
     /// 已经启动 `started` 个 step，还能启动下一个吗？
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn step_budget_rejects_zero_and_garbage() {
-        assert_eq!("8".parse::<StepBudget>().unwrap().max_steps(), 8);
+        assert_eq!("8".parse::<StepBudget>().unwrap().max_steps().get(), 8);
         assert!("0".parse::<StepBudget>().is_err());
         assert!("many".parse::<StepBudget>().is_err());
     }

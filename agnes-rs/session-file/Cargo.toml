@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+agnes-agent.workspace = true
 agnes-core.workspace = true
-agnes-io.workspace = true
 agnes-util.workspace = true
 async-trait.workspace = true
 jiff.workspace = true

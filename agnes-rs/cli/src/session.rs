@@ -2,9 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use agnes_agent::Log;
-use agnes_core::event::Event as CoreEvent;
-use agnes_io::session::SessionLog;
+use agnes_agent::record::Event as RecordEvent;
+use agnes_agent::{Log, SessionLog};
 use agnes_session_file::{Note, Opened, SessionFile};
 use anyhow::{Context, Result, bail};
 
@@ -17,7 +16,7 @@ pub struct ChatSession {
 pub struct LoadedSession {
     pub session: ChatSession,
     pub notes: Vec<Note>,
-    pub repairs: Vec<CoreEvent>,
+    pub repairs: Vec<RecordEvent>,
 }
 
 impl ChatSession {
@@ -76,10 +75,10 @@ impl ChatSession {
     }
 }
 
-fn restore_log(path: &Path, events: Vec<CoreEvent>) -> Result<Log> {
+fn restore_log(path: &Path, events: Vec<RecordEvent>) -> Result<Log> {
     if events
         .iter()
-        .any(|event| matches!(event, CoreEvent::Header(_)))
+        .any(|event| matches!(event, RecordEvent::Header(_)))
     {
         return Ok(Log::restore(events));
     }

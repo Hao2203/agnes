@@ -4,7 +4,7 @@
 //! (tokio) today or any other async transport tomorrow.
 mod wire;
 
-use agnes_core::config::{ApiKey, BaseUrl, ModelName};
+use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_io::http::{HttpTransport, TransportError};
 use agnes_io::llm::{ApiBody, Llm, LlmError};
@@ -42,11 +42,7 @@ impl<T: HttpTransport> OpenAiClient<T> {
             .map_err(|e| LlmError::Transport(TransportError::Request(e)))
     }
 
-    fn parse_response(
-        model: ModelName,
-        status: http::StatusCode,
-        body: &str,
-    ) -> Result<LlmResponse, LlmError> {
+    fn parse_response(status: http::StatusCode, body: &str) -> Result<LlmResponse, LlmError> {
         if !status.is_success() {
             let detail = wire::extract_error_body(body);
             return Err(LlmError::Api {
@@ -56,7 +52,7 @@ impl<T: HttpTransport> OpenAiClient<T> {
         }
         let parsed: wire::ChatCompletionResponse =
             serde_json::from_str(body).map_err(|err| LlmError::Decode(Box::new(err)))?;
-        parsed.into_core(model)
+        parsed.into_core()
     }
 }
 
@@ -65,11 +61,7 @@ impl<T: HttpTransport> Llm for OpenAiClient<T> {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let http_request = self.build_request(request)?;
         let http_response = self.transport.send(http_request).await?;
-        Self::parse_response(
-            request.model.clone(),
-            http_response.status(),
-            http_response.body(),
-        )
+        Self::parse_response(http_response.status(), http_response.body())
     }
 }
 
@@ -78,7 +70,6 @@ mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::content::Content;
-    use agnes_core::event::Event;
     use agnes_core::llm::Prompt;
     use agnes_core::message::Message;
     use std::num::NonZeroU32;
@@ -275,110 +266,49 @@ mod tests {
             ApiKey::try_from("sk-test").unwrap(),
         );
 
-        let config = agnes_core::turn::AgentConfig {
-            header: agnes_core::header::Header::new(
+        let context = agnes_core::context::Context::new(
+            agnes_core::header::Header::new(
                 SystemPrompt::new("sys"),
                 agnes_core::header::Environment::default(),
             ),
-            goal: Content::try_from("flip").unwrap(),
-            budget: agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
-        };
-        let model = ModelName::from_str("gpt-test").unwrap();
-        let mut turn = agnes_core::turn::Turn::start(config);
-        let mut events = Vec::new();
-        let mut request_slot = None;
-        let mut call_slot = None;
-        pump(
-            &mut turn,
-            &mut events,
-            &model,
-            &mut request_slot,
-            &mut call_slot,
+            agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
         );
-        let request = request_slot
-            .take()
-            .expect("the first model call is requested");
+        let model = ModelName::from_str("gpt-test").unwrap();
+        let turn = agnes_core::turn::Turn::start(context, Content::try_from("flip").unwrap());
 
+        let request = LlmRequest {
+            model: model.clone(),
+            prompt: turn.prompt(),
+        };
         let response = Llm::complete(&openai, &request).await.unwrap();
-        let agnes_core::turn::MessageReplied::Tools { mut turn } = turn.model_responded(response)
-        else {
+        let agnes_core::turn::Replied::Tools(turn) = turn.respond(response) else {
             panic!("expected Tools");
         };
-        pump(
-            &mut turn,
-            &mut events,
-            &model,
-            &mut request_slot,
-            &mut call_slot,
-        );
+        let calls: Vec<_> = turn.calls().cloned().collect();
         assert!(
-            matches!(
-                &call_slot,
-                Some(tool) if tool.id.as_str() == "call_1" && tool.name.as_str() == "flag"
-            ),
+            matches!(&calls[..], [tool] if tool.id.as_str() == "call_1" && tool.name.as_str() == "flag"),
             "第一个响应应该派发 flag 调用"
         );
 
-        let call = call_slot.take().unwrap();
-        turn.tool_started();
-        let agnes_core::turn::ToolsAdvanced::NextStep { mut turn } =
-            turn.tool_finished(call.id, agnes_core::message::ToolOutput::success("ok"))
+        let call = calls.into_iter().next().unwrap();
+        let agnes_core::turn::Advanced::Next(turn) =
+            turn.finish(call.id, agnes_core::message::ToolOutput::success("ok"))
         else {
-            panic!("expected NextStep");
+            panic!("expected Next");
         };
-        pump(
-            &mut turn,
-            &mut events,
-            &model,
-            &mut request_slot,
-            &mut call_slot,
-        );
-        let request = request_slot
-            .take()
-            .expect("the second model call is requested");
-
+        let request = LlmRequest {
+            model: model.clone(),
+            prompt: turn.prompt(),
+        };
         let response = Llm::complete(&openai, &request).await.unwrap();
-        let agnes_core::turn::MessageReplied::Closed { mut turn } = turn.model_responded(response)
-        else {
+        let agnes_core::turn::Replied::Closed(turn) = turn.respond(response) else {
             panic!("expected Closed");
         };
-        pump(
-            &mut turn,
-            &mut events,
-            &model,
-            &mut request_slot,
-            &mut call_slot,
-        );
-        assert_eq!(turn.outcome(), &agnes_core::turn::Outcome::Answered);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Message(Message::Assistant(agnes_core::message::AssistantMessage::Text(content)))
+        assert_eq!(turn.outcome(), agnes_core::turn::Outcome::Answered);
+        assert!(matches!(
+            turn.context().messages().last(),
+            Some(Message::Assistant(agnes_core::message::AssistantMessage::Text(content)))
                 if content.as_str() == "flipped it"
-        )));
-    }
-
-    /// 像驱动一样消费动作：事件按序收集，`CallModel` 时用事件序列构造请求。
-    fn pump<S>(
-        turn: &mut agnes_core::turn::Turn<S>,
-        events: &mut Vec<Event>,
-        model: &ModelName,
-        request: &mut Option<LlmRequest>,
-        call: &mut Option<agnes_core::message::ToolCall>,
-    ) {
-        while let Some(action) = turn.poll_actions() {
-            match action {
-                agnes_core::turn::Action::Record(event) => events.push(event),
-                agnes_core::turn::Action::CallModel => *request = Some(build(events, model)),
-                agnes_core::turn::Action::RunTool(run) => *call = Some(run),
-            }
-        }
-    }
-
-    /// 在见到 `Action::CallModel` 的当下，用已有事件构造具体请求。
-    fn build(events: &[Event], model: &ModelName) -> LlmRequest {
-        LlmRequest {
-            model: model.clone(),
-            prompt: Prompt::from_events(events),
-        }
+        ));
     }
 }

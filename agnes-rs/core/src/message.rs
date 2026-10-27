@@ -170,14 +170,13 @@ pub enum AssistantMessage {
     },
 }
 
-/// One message of the conversation. Messages are recorded as
-/// [`Event::Message`](crate::event::Event::Message) entries of the context
-/// log, so their order relative to everything else that happened is fixed.
+/// One message of the conversation. The host records messages in its own log,
+/// so their order relative to everything else that happened is fixed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// The system prompt as a model input element. The prompt itself is a
-    /// field of the context; this variant exists for the projection into a
-    /// model request.
+    /// field of the [`Context`](crate::context::Context); this variant exists
+    /// for the projection into a model request.
     System {
         content: SystemPrompt,
     },

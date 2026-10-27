@@ -14,7 +14,26 @@ use agnes_core::tool::ToolName;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-pub use crate::ext::ApprovalOutcome;
+/// 审批结果。词汇是 fail-closed 的：只有 [`ApprovalOutcome::AllowedOnce`]
+/// 放行；通道被关闭、`reply` 被丢弃、超时、运行被打断，都按拒绝落定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// Explicitly approved once.
+    AllowedOnce,
+    /// Explicitly refused.
+    Rejected,
+    /// The wait was cancelled (the run was interrupted).
+    Cancelled,
+    /// No answerer: not wired, channel closed, reply dropped, or timed out.
+    Unavailable,
+}
+
+impl ApprovalOutcome {
+    /// The one value that allows the call.
+    pub fn allows(self) -> bool {
+        matches!(self, Self::AllowedOnce)
+    }
+}
 
 /// 递给审批界面的一次问询：界面收到后，用 `reply` 送回 true（批准）或
 /// false（拒绝）。`reply` 被丢弃等价于拒绝。

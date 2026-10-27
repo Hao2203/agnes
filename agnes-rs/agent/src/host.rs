@@ -9,18 +9,20 @@ use std::fmt;
 use std::sync::Arc;
 
 use agnes_core::config::ModelName;
+use agnes_core::context::Context;
 use agnes_core::message::Message;
 use agnes_core::turn::{AgentConfig, Turn};
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
-use agnes_io::session::SessionLog;
 use agnes_io::tool::{DuplicateTool, Tool, ToolRegistry};
 use jiff::Timestamp;
 
 use crate::approval::ApprovalChannel;
 use crate::driver::{Driver, Outlets, Ports};
 use crate::ext::{Bundle, Extensions, Plugin};
-use crate::{AgentError, Event, Log, RequestBuilder, RunSummary, Sink, StandardRequestBuilder};
+use crate::{
+    AgentError, Event, Log, RequestBuilder, RunSummary, SessionLog, Sink, StandardRequestBuilder,
+};
 
 /// 装载期的失败：自包含的配置错误在这里暴露。
 #[derive(Debug, thiserror::Error)]
@@ -141,17 +143,19 @@ impl<'a> Host<'a> {
             session,
         } = request;
         let started_at = Timestamp::now();
-        let goal = config.goal.clone();
-        let tools = config
-            .header
+        let AgentConfig {
+            header,
+            goal,
+            budget,
+        } = config;
+        let tools = header
             .environment()
             .tools()
-            .iter()
             .map(|spec| spec.name().clone())
             .collect();
         sink.event(&Event::Started {
             at: started_at,
-            goal,
+            goal: goal.clone(),
             tools,
         });
 
@@ -171,11 +175,15 @@ impl<'a> Host<'a> {
             sink: &mut *sink,
             session,
         };
-        let turn = Turn::start(config);
+        // 上下文从持久化日志的历史消息重建；系统提示与工具环境以当前
+        // 配置为准。goal 由 Turn::start 追加。
+        let context =
+            Context::with_messages(header, budget, log.messages().cloned().collect::<Vec<_>>());
+        let started = Turn::start(context, goal);
         let mut log = log;
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
         // 由驱动记录，宿主保留所有权。
-        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(turn).await {
+        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(started).await {
             Ok(done) => done,
             Err(err) => {
                 // 失败 run 里已经产生的工具变更对下一 turn 仍然有效；

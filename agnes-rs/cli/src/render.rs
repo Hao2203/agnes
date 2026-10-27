@@ -5,10 +5,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
+use agnes_agent::record::Event as RecordEvent;
 use agnes_agent::{Event, RunSummary, Sink};
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
-use agnes_core::event::Event as CoreEvent;
 use agnes_core::llm::StopKind;
 use agnes_core::message::Message;
 use agnes_core::turn::Outcome;
@@ -106,26 +106,28 @@ impl EventPrinter {
     }
 }
 
-fn recorded_text(event: &CoreEvent) -> Option<String> {
+fn recorded_text(event: &RecordEvent) -> Option<String> {
     match event {
-        CoreEvent::Header(_) => None,
-        CoreEvent::TurnStart => Some("─ turn ─".to_owned()),
-        CoreEvent::MessageStart { .. } => Some("→ model call".to_owned()),
-        CoreEvent::MessageEnd { stop, .. } => {
+        RecordEvent::Header(_) => None,
+        RecordEvent::TurnStart => Some("─ turn ─".to_owned()),
+        RecordEvent::MessageStart { .. } => Some("→ model call".to_owned()),
+        RecordEvent::MessageEnd { stop, .. } => {
             matches!(stop, StopKind::ToolUse).then(|| "← tool calls requested".to_owned())
         }
-        CoreEvent::ToolExecutionStart { call, .. } => {
+        RecordEvent::ToolExecutionStart { call, .. } => {
             Some(format!("  ⚒ {} {}", call.name, call.arguments.as_str()))
         }
-        CoreEvent::ToolExecutionEnd { .. } => None,
-        CoreEvent::Message(Message::ToolResult { output, .. }) if output.is_error() => {
+        RecordEvent::ToolExecutionEnd { .. } => None,
+        RecordEvent::Message(Message::ToolResult { output, .. }) if output.is_error() => {
             Some("  ✗ failed".to_owned())
         }
-        CoreEvent::Message(_) => None,
-        CoreEvent::MessagesInjected { count } => Some(format!(
+        RecordEvent::Message(_) => None,
+        RecordEvent::MessagesInjected { count } => Some(format!(
             "  ↪ {count} queued message(s) will be injected next step"
         )),
-        CoreEvent::StepStart { .. } | CoreEvent::StepEnd { .. } | CoreEvent::TurnEnd { .. } => None,
+        RecordEvent::StepStart { .. }
+        | RecordEvent::StepEnd { .. }
+        | RecordEvent::TurnEnd { .. } => None,
     }
 }
 
@@ -225,36 +227,36 @@ mod tests {
     }
 
     #[test]
-    fn core_lifecycle_events_map_to_one_line() {
+    fn record_lifecycle_events_map_to_one_line() {
         assert_eq!(
-            recorded_text(&CoreEvent::TurnStart).as_deref(),
+            recorded_text(&RecordEvent::TurnStart).as_deref(),
             Some("─ turn ─")
         );
         assert_eq!(
-            recorded_text(&CoreEvent::MessageStart {
+            recorded_text(&RecordEvent::MessageStart {
                 step: StepNumber::FIRST,
             })
             .as_deref(),
             Some("→ model call")
         );
         assert_eq!(
-            recorded_text(&CoreEvent::MessagesInjected { count: 2 }).as_deref(),
+            recorded_text(&RecordEvent::MessagesInjected { count: 2 }).as_deref(),
             Some("  ↪ 2 queued message(s) will be injected next step")
         );
     }
 
     #[test]
-    fn recorded_wraps_core_text() {
+    fn recorded_wraps_event_text() {
         let event = Event::Recorded {
             at: Timestamp::now(),
-            event: CoreEvent::TurnStart,
+            event: RecordEvent::TurnStart,
         };
         assert_eq!(event_text(&model(), &event).as_deref(), Some("─ turn ─"));
     }
 
     #[test]
     fn failed_tool_results_are_rendered() {
-        let event = CoreEvent::Message(Message::ToolResult {
+        let event = RecordEvent::Message(Message::ToolResult {
             call_id: ToolCallId::new("c1"),
             output: ToolOutput::error("boom"),
         });

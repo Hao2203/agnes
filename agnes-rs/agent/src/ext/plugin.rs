@@ -5,18 +5,18 @@
 //! 驱动在明确的检查点取用并执行；core 只看到普通的工具往返，封闭枚举
 //! 不因插件扩展。
 
-use agnes_core::event::Event as CoreEvent;
 use agnes_core::message::{ToolCall, ToolOutput};
 
 use super::command::Command;
 use super::decision::{ApprovalOutcome, Denied};
+use crate::record::Event as RecordEvent;
 
 /// 插件看到的统一事件流，按发生顺序。
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum PluginEvent<'a> {
-    /// core 日志里的一条，按发生顺序流过。
-    Core(&'a CoreEvent),
+    /// 宿主记录流里的一条，按发生顺序流过。
+    Record(&'a RecordEvent),
     /// 一次工具调用即将派发（门禁检查点）。
     ToolCallRequested { call: &'a ToolCall },
     /// 工具已执行、结果尚未入账（结果折叠检查点）。

@@ -41,6 +41,6 @@ pub struct Aborted {
     pub reason: String,
 }
 
-/// 审批结果。词汇定义在 `agnes_io::session`（它同时是耐久记录的格式），
-/// 这里只做再导出，插件与驱动的 import 不变。
-pub use agnes_io::session::ApprovalOutcome;
+/// 审批结果。词汇定义在 [`crate::approval`]（宿主自有的审批服务），这里
+/// 只做再导出，插件与驱动的 import 不变。
+pub use crate::approval::ApprovalOutcome;

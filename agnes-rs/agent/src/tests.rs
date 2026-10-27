@@ -2,14 +2,15 @@ use super::*;
 use crate::approval::ApprovalChannel;
 use crate::ext::{Command, Plugin, PluginEvent};
 use crate::permission::{PermissionPlugin, PermissionRules, Rule};
+use crate::record::{Event as RecordEvent, HostEvent};
 use agnes_core::config::{StepBudget, SystemPrompt};
+use agnes_core::context::Context;
 use agnes_core::header::{Environment, Header};
 use agnes_core::llm::{LlmResponse, StopReason};
 use agnes_core::message::{Message, ToolArguments, ToolOutput};
 use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
 use agnes_io::input::{Input as InputPort, NoInput};
 use agnes_io::llm::{ApiBody, Llm};
-use agnes_io::session::HostEvent;
 use agnes_io::tool::Tool;
 use agnes_util::NonEmpty;
 use async_trait::async_trait;
@@ -134,7 +135,6 @@ fn model() -> ModelName {
 
 fn response(stop_reason: StopReason) -> LlmResponse {
     LlmResponse {
-        model: model(),
         stop_reason,
         usage: TokenUsage {
             input: 1,
@@ -165,7 +165,7 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
 }
 
 /// 驱动上报的核心事件，按序。
-fn recorded(events: &[Event]) -> Vec<CoreEvent> {
+fn recorded(events: &[Event]) -> Vec<RecordEvent> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -176,21 +176,21 @@ fn recorded(events: &[Event]) -> Vec<CoreEvent> {
 }
 
 /// 事件种类，按序。
-fn shape(events: &[CoreEvent]) -> Vec<&'static str> {
+fn shape(events: &[RecordEvent]) -> Vec<&'static str> {
     events
         .iter()
         .map(|event| match event {
-            CoreEvent::Header(_) => "header",
-            CoreEvent::TurnStart => "turn_start",
-            CoreEvent::StepStart { .. } => "step_start",
-            CoreEvent::MessageStart { .. } => "message_start",
-            CoreEvent::Message(_) => "message",
-            CoreEvent::MessageEnd { .. } => "message_end",
-            CoreEvent::ToolExecutionStart { .. } => "tool_start",
-            CoreEvent::ToolExecutionEnd { .. } => "tool_end",
-            CoreEvent::StepEnd { .. } => "step_end",
-            CoreEvent::MessagesInjected { .. } => "messages_injected",
-            CoreEvent::TurnEnd { .. } => "turn_end",
+            RecordEvent::Header(_) => "header",
+            RecordEvent::TurnStart => "turn_start",
+            RecordEvent::StepStart { .. } => "step_start",
+            RecordEvent::MessageStart { .. } => "message_start",
+            RecordEvent::Message(_) => "message",
+            RecordEvent::MessageEnd { .. } => "message_end",
+            RecordEvent::ToolExecutionStart { .. } => "tool_start",
+            RecordEvent::ToolExecutionEnd { .. } => "tool_end",
+            RecordEvent::StepEnd { .. } => "step_end",
+            RecordEvent::MessagesInjected { .. } => "messages_injected",
+            RecordEvent::TurnEnd { .. } => "turn_end",
         })
         .collect()
 }
@@ -277,18 +277,18 @@ async fn happy_path_runs_tools_and_finishes() {
 
 /// 记录落盘事件、审计记录与 flush 次数的会话日志。
 struct RecordingSession {
-    events: Arc<Mutex<Vec<CoreEvent>>>,
+    events: Arc<Mutex<Vec<RecordEvent>>>,
     notes: Arc<Mutex<Vec<HostEvent>>>,
     flushes: Arc<Mutex<usize>>,
 }
 
 #[async_trait]
-impl agnes_io::session::SessionLog for RecordingSession {
+impl crate::SessionLog for RecordingSession {
     async fn append(
         &mut self,
         _at: jiff::Timestamp,
-        event: &CoreEvent,
-    ) -> Result<(), agnes_io::session::SessionError> {
+        event: &RecordEvent,
+    ) -> Result<(), crate::SessionError> {
         self.events.lock().unwrap().push(event.clone());
         Ok(())
     }
@@ -297,12 +297,12 @@ impl agnes_io::session::SessionLog for RecordingSession {
         &mut self,
         _at: jiff::Timestamp,
         event: &HostEvent,
-    ) -> Result<(), agnes_io::session::SessionError> {
+    ) -> Result<(), crate::SessionError> {
         self.notes.lock().unwrap().push(event.clone());
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<(), agnes_io::session::SessionError> {
+    async fn flush(&mut self) -> Result<(), crate::SessionError> {
         *self.flushes.lock().unwrap() += 1;
         Ok(())
     }
@@ -477,7 +477,7 @@ async fn tool_failure_is_surfaced_not_fatal() {
     assert!(matches!(summary.outcome, Outcome::Answered));
     assert!(recorded(&sink.0).iter().any(|event| matches!(
         event,
-        CoreEvent::Message(Message::ToolResult { output, .. }) if output.is_error()
+        RecordEvent::Message(Message::ToolResult { output, .. }) if output.is_error()
     )));
 }
 
@@ -519,8 +519,8 @@ struct PrimingRequests {
 }
 
 impl RequestBuilder for PrimingRequests {
-    fn build(&self, log: &Log) -> LlmRequest {
-        let mut prompt = Prompt::from_events(log.events());
+    fn build(&self, context: &Context) -> LlmRequest {
+        let mut prompt = context.prompt();
         prompt.tools.clear();
         prompt.input.insert(
             0,
@@ -562,7 +562,10 @@ async fn the_request_builder_shapes_what_the_model_sees() {
         Message::User { content } if content.as_str() == "<system> be extra brief"
     ));
     // 环境仍在会话里，未被破坏
-    assert_eq!(summary.log.header().unwrap().environment().tools().len(), 1);
+    assert_eq!(
+        summary.log.header().unwrap().environment().tools().count(),
+        1
+    );
 }
 
 /// 测试直接驱动的输入：消息队列 + 停止通道。
@@ -668,7 +671,7 @@ async fn queued_user_message_is_injected_at_the_step_boundary() {
     // 注入事件随日志上报
     assert!(recorded(&sink.0).iter().any(|event| matches!(
         event,
-        CoreEvent::MessagesInjected { count } if *count == 1
+        RecordEvent::MessagesInjected { count } if *count == 1
     )));
     // 注入的消息属于继续的会话上下文
     let messages = messages_of(&summary.log);
@@ -718,7 +721,7 @@ async fn interrupt_during_a_model_call_stops_the_run() {
     );
     assert!(matches!(
         summary.log.events().last(),
-        Some(CoreEvent::TurnEnd {
+        Some(RecordEvent::TurnEnd {
             outcome: Outcome::Interrupted,
             ..
         })
@@ -804,7 +807,7 @@ async fn a_queued_message_continues_the_turn_after_an_answer() {
     assert!(summary.pending_messages.is_empty());
     assert!(recorded(&sink.0).iter().any(|event| matches!(
         event,
-        CoreEvent::MessagesInjected { count } if *count == 1
+        RecordEvent::MessagesInjected { count } if *count == 1
     )));
 }
 
@@ -832,6 +835,44 @@ async fn a_queued_message_comes_back_when_the_budget_blocks_another_step() {
         }]
     );
     assert_eq!(messages_of(&summary.log).len(), 2);
+}
+
+#[tokio::test]
+async fn a_queued_message_comes_back_when_the_budget_blocks_after_a_tool_round() {
+    let recorder = Arc::new(Recorder::new());
+    let input = FakeInput::new();
+    input.queue("too late after the tool");
+    let llm = ScriptedLlm::new(vec![response(tool_use(vec![call(
+        "c1",
+        "note",
+        r#"{"text":"hi"}"#,
+    )]))]);
+    let mut host = Host::builder(&llm, &input)
+        .model(model())
+        .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+        .build()
+        .unwrap();
+
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(config(1), Log::default(), &mut sink))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::BudgetExhausted);
+    assert_eq!(
+        summary.pending_messages,
+        vec![Message::User {
+            content: Content::try_from("too late after the tool").unwrap()
+        }]
+    );
+    // goal、工具调用、工具结果；注入没有进会话。
+    assert_eq!(messages_of(&summary.log).len(), 3);
+    assert!(
+        !recorded(&sink.0)
+            .iter()
+            .any(|event| matches!(event, RecordEvent::MessagesInjected { .. }))
+    );
 }
 
 struct QueueingModel<'a> {
@@ -871,12 +912,12 @@ async fn a_message_queued_during_the_final_call_is_not_dropped() {
 struct FailingAudit;
 
 #[async_trait]
-impl agnes_io::session::SessionLog for FailingAudit {
+impl crate::SessionLog for FailingAudit {
     async fn append(
         &mut self,
         _at: jiff::Timestamp,
-        _event: &agnes_core::event::Event,
-    ) -> Result<(), agnes_io::session::SessionError> {
+        _event: &RecordEvent,
+    ) -> Result<(), crate::SessionError> {
         Ok(())
     }
 
@@ -884,13 +925,11 @@ impl agnes_io::session::SessionLog for FailingAudit {
         &mut self,
         _at: jiff::Timestamp,
         _event: &HostEvent,
-    ) -> Result<(), agnes_io::session::SessionError> {
-        Err(agnes_io::session::SessionError::Io(std::io::Error::other(
-            "audit down",
-        )))
+    ) -> Result<(), crate::SessionError> {
+        Err(crate::SessionError::Io(std::io::Error::other("audit down")))
     }
 
-    async fn flush(&mut self) -> Result<(), agnes_io::session::SessionError> {
+    async fn flush(&mut self) -> Result<(), crate::SessionError> {
         Ok(())
     }
 }
@@ -952,7 +991,7 @@ impl Plugin for Witness {
 
     fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
         match event {
-            PluginEvent::Core(_) => {}
+            PluginEvent::Record(_) => {}
             PluginEvent::ToolCallRequested { .. } => {
                 self.seen.lock().unwrap().push("requested");
             }
@@ -982,6 +1021,7 @@ impl Plugin for Witness {
 
 #[derive(Clone, Copy)]
 enum Trigger {
+    StepStart,
     Requested,
     Finished,
     ApprovalRequested,
@@ -992,13 +1032,19 @@ impl Trigger {
     fn matches(self, event: &PluginEvent<'_>) -> bool {
         matches!(
             (self, event),
-            (Self::Requested, PluginEvent::ToolCallRequested { .. })
+            (
+                Self::StepStart,
+                PluginEvent::Record(RecordEvent::StepStart { .. })
+            ) | (Self::Requested, PluginEvent::ToolCallRequested { .. })
                 | (Self::Finished, PluginEvent::ToolCallFinished { .. })
                 | (
                     Self::ApprovalRequested,
                     PluginEvent::ApprovalRequested { .. }
                 )
-                | (Self::TurnEnd, PluginEvent::Core(CoreEvent::TurnEnd { .. }))
+                | (
+                    Self::TurnEnd,
+                    PluginEvent::Record(RecordEvent::TurnEnd { .. })
+                )
         )
     }
 }
@@ -1189,7 +1235,7 @@ async fn a_blocked_result_is_replaced_by_feedback() {
     );
     assert!(recorded(&sink.0).iter().any(|event| matches!(
         event,
-        CoreEvent::Message(Message::ToolResult { output, .. }) if output.is_error()
+        RecordEvent::Message(Message::ToolResult { output, .. }) if output.is_error()
     )));
     assert_eq!(
         *seen.lock().unwrap(),
@@ -1482,7 +1528,7 @@ async fn a_plugin_injection_reaches_the_next_request() {
     ));
     assert!(recorded(&sink.0).iter().any(|event| matches!(
         event,
-        CoreEvent::MessagesInjected { count } if *count == 1
+        RecordEvent::MessagesInjected { count } if *count == 1
     )));
     assert!(summary.pending_messages.is_empty());
 }
@@ -1512,7 +1558,42 @@ async fn an_injection_after_the_turn_closes_is_returned_to_the_host() {
     assert!(
         !recorded(&sink.0)
             .iter()
-            .any(|event| matches!(event, CoreEvent::MessagesInjected { .. }))
+            .any(|event| matches!(event, RecordEvent::MessagesInjected { .. }))
+    );
+}
+
+#[tokio::test]
+async fn abort_on_step_start_stops_before_the_model_call() {
+    let llm = ScriptedLlm::new(vec![response(completed("should not be called"))]);
+    let mut host = Host::builder(&llm, &NoInput)
+        .model(model())
+        .plugin(Aborter::new(Trigger::StepStart))
+        .build()
+        .unwrap();
+
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(config(4), Log::default(), &mut sink))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::Interrupted);
+    assert!(llm.requests().is_empty());
+    assert_eq!(
+        summary.aborted.as_ref().map(|aborted| aborted.by),
+        Some("aborter")
+    );
+    assert_eq!(
+        shape(&recorded(&sink.0)),
+        vec![
+            "header",
+            "message",
+            "turn_start",
+            "step_start",
+            "message_start",
+            "step_end",
+            "turn_end"
+        ]
     );
 }
 
@@ -1713,15 +1794,27 @@ async fn a_plugin_can_add_a_tool_for_the_next_model_call_in_the_same_turn() {
     assert_eq!(names(0), vec!["note"]);
     assert_eq!(names(1), vec!["injected", "note"]);
     // turn 开局一条 + 工具变更一条
+    let events = summary.log.events();
     assert_eq!(
-        summary
-            .log
-            .events()
+        events
             .iter()
-            .filter(|event| matches!(event, CoreEvent::Header(_)))
+            .filter(|event| matches!(event, RecordEvent::Header(_)))
             .count(),
         2
     );
+    // 新 header 必须先于下一个 step 开始，请求才与日志里的环境一致。
+    let last_header = events
+        .iter()
+        .rposition(|event| matches!(event, RecordEvent::Header(_)))
+        .unwrap();
+    let second_step_start = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, RecordEvent::StepStart { .. }))
+        .nth(1)
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(last_header < second_step_start);
     assert!(host.tools().contains(&injected_name));
 }
 
@@ -1795,7 +1888,7 @@ async fn a_tool_added_on_turn_end_is_applied_to_the_next_turn() {
             .log
             .events()
             .iter()
-            .filter(|event| matches!(event, CoreEvent::Header(_)))
+            .filter(|event| matches!(event, RecordEvent::Header(_)))
             .count(),
         1
     );
@@ -1844,7 +1937,7 @@ async fn a_duplicate_tool_add_is_a_noop() {
             .log
             .events()
             .iter()
-            .filter(|event| matches!(event, CoreEvent::Header(_)))
+            .filter(|event| matches!(event, RecordEvent::Header(_)))
             .count(),
         1
     );
@@ -1887,7 +1980,7 @@ async fn a_missing_tool_remove_is_a_noop() {
             .log
             .events()
             .iter()
-            .filter(|event| matches!(event, CoreEvent::Header(_)))
+            .filter(|event| matches!(event, RecordEvent::Header(_)))
             .count(),
         1
     );

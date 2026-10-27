@@ -1,15 +1,15 @@
-//! 会话日志：一次运行的唯一状态 —— 按发生顺序排列的事件序列。
+//! 会话日志：一次运行的唯一记录 —— 按发生顺序排列的事件序列。
 //!
 //! 消息、会话配置（系统提示与工具环境，见 [`Event::Header`]）以及
 //! step/turn 生命周期都是事件，所以日志就是历史：[`Log::messages`] 是
-//! 构造模型请求的投影，[`Log::header`] 是最近一次生效的配置。日志之外
-//! 没有状态。
+//! 重建上下文的投影，[`Log::header`] 是最近一次生效的配置。日志之外没有
+//! 状态。
 //!
-//! core 的状态机只产生事件动作；驱动是唯一的写者，并把日志交还给宿主
-//! 以延续会话。请求长什么样是宿主的事 —— 由 [`crate::RequestBuilder`]
-//! 决定。
+//! 事件词汇归宿主（[`crate::record`]）：驱动是唯一的写者，把日志交还给
+//! 宿主以延续会话。请求长什么样是宿主的事 —— 由
+//! [`crate::RequestBuilder`] 从 core 的 `Context` 决定。
 
-use agnes_core::event::Event;
+use crate::record::Event;
 use agnes_core::header::Header;
 use agnes_core::message::Message;
 
@@ -56,8 +56,7 @@ impl Log {
         self.events.clear();
     }
 
-    /// 追加一条事件。驱动记录机器以动作形式产生的事件；机器本身不持有
-    /// 历史。
+    /// 追加一条事件。驱动按发生顺序记录自己铸造的事件；core 不持有历史。
     pub(crate) fn record(&mut self, event: Event) -> &Event {
         self.events.push(event);
         self.events

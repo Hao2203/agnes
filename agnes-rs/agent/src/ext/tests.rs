@@ -1,6 +1,6 @@
 use super::*;
+use crate::record::Event as RecordEvent;
 use agnes_core::content::Content;
-use agnes_core::event::Event as CoreEvent;
 use agnes_core::message::{ToolArguments, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::tool::ToolName;
 use std::str::FromStr;
@@ -121,7 +121,7 @@ impl Plugin for Injector {
 
     fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
         match event {
-            PluginEvent::Core(CoreEvent::TurnStart) => vec![
+            PluginEvent::Record(RecordEvent::TurnStart) => vec![
                 Command::InjectMessage {
                     content: Content::try_from("first").unwrap(),
                 },
@@ -344,7 +344,7 @@ fn commands_for_other_calls_stay_queued() {
 fn injections_are_fifo() {
     let mut extensions = Extensions::new();
     extensions.register(Injector);
-    extensions.publish(&PluginEvent::Core(&CoreEvent::TurnStart));
+    extensions.publish(&PluginEvent::Record(&RecordEvent::TurnStart));
 
     let first = extensions.take_injection().unwrap();
     assert_eq!(first.by(), "injector");

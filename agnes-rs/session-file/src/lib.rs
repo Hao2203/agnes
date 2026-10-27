@@ -19,7 +19,7 @@
 //!
 //! - `seq` 从 1 起严格连续（跨两种行）；不连续 = 损坏，拒绝加载（fail closed）。
 //! - 读不懂的 `format` 拒绝加载，不猜；旧格式（v1–v5）同样拒载。
-//! - `event` 载荷的具体形状由 [`wire`] 定义（core 的类型不实现序列化）：
+//! - `event` 载荷的具体形状由私有的 `wire` 模块定义（领域类型不实现序列化）：
 //!   未知变体与非法载荷一律拒载，不猜。
 //! - 只有**最后一行**允许是撕裂的半行（崩溃时没写完）：丢弃并截断到物理
 //!   有效前缀；其他位置的不完整行是损坏。
@@ -37,10 +37,10 @@ use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use agnes_core::event::Event;
+use agnes_agent::record::{Event, HostEvent, StepOutcome};
+use agnes_agent::{SessionError, SessionLog};
 use agnes_core::message::{AssistantMessage, Message, ToolCall, ToolOutput};
-use agnes_core::turn::{Outcome, StepNumber, StepOutcome};
-use agnes_io::session::{HostEvent, SessionError, SessionLog};
+use agnes_core::turn::{Outcome, StepNumber};
 use async_trait::async_trait;
 use jiff::Timestamp;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -550,15 +550,13 @@ pub fn repairs(events: &[Event]) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::config::{ModelName, StepBudget, SystemPrompt};
+    use agnes_agent::approval::ApprovalOutcome;
+    use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::content::Content;
     use agnes_core::header::{Environment, Header};
-    use agnes_core::llm::{LlmResponse, StopReason};
+    use agnes_core::llm::StopKind;
     use agnes_core::message::{TokenUsage, ToolArguments, ToolCallId};
     use agnes_core::tool::ToolName;
-    use agnes_core::turn::{
-        Action, AgentConfig, AwaitingMessage, MessageReplied, ToolsAdvanced, Turn,
-    };
     use agnes_util::NonEmpty;
     use std::num::NonZeroU32;
     use std::str::FromStr;
@@ -575,72 +573,93 @@ mod tests {
         }
     }
 
-    fn config() -> AgentConfig {
-        AgentConfig {
-            header: Header::new(system(), Environment::default()),
-            goal: Content::try_from("take notes").unwrap(),
-            budget: StepBudget::new(NonZeroU32::new(4).unwrap()),
+    fn step(number: u32) -> StepNumber {
+        StepNumber::new(NonZeroU32::new(number).unwrap())
+    }
+
+    fn goal() -> Message {
+        Message::User {
+            content: Content::try_from("take notes").unwrap(),
         }
     }
 
-    /// 像驱动一样把机器动作里的事件按序取出（丢弃模型调用/工具派发，
-    /// 这个测试只关心日志内容）。
-    fn pump<S>(turn: &mut Turn<S>) -> Vec<Event> {
-        let mut events = Vec::new();
-        while let Some(action) = turn.poll_actions() {
-            if let Action::Record(event) = action {
-                events.push(event);
-            }
-        }
-        events
+    /// 驱动在 turn 开局 + 第一个 step 开始时记录的事件。
+    fn started(events: &mut Vec<Event>) {
+        events.push(Event::Header(Header::new(system(), Environment::default())));
+        events.push(Event::Message(goal()));
+        events.push(Event::TurnStart);
+        events.push(Event::StepStart { step: step(1) });
+        events.push(Event::MessageStart { step: step(1) });
     }
 
-    fn tool_use(calls: Vec<ToolCall>) -> LlmResponse {
-        LlmResponse {
-            model: ModelName::from_str("test-model").unwrap(),
-            stop_reason: StopReason::ToolUse {
-                content: None,
-                calls: NonEmpty::from_vec(calls).unwrap(),
-            },
-            usage: TokenUsage::default(),
-        }
-    }
-
-    /// 走到「模型要了两个调用、第一个跑完、第二个挂着」为止。
+    /// 写到「模型要了两个调用、第一个跑完、第二个挂着」为止。
     fn half_finished_turn() -> (Vec<Event>, Vec<Event>) {
-        let mut turn = Turn::<AwaitingMessage>::start(config());
-        let mut prefix = pump(&mut turn);
-        let MessageReplied::Tools { mut turn } =
-            turn.model_responded(tool_use(vec![call("c1"), call("c2")]))
-        else {
-            panic!("expected a tool phase")
-        };
-        prefix.extend(pump(&mut turn));
-        turn.tool_started();
-        let ToolsAdvanced::Ongoing { mut turn } =
-            turn.tool_finished(ToolCallId::new("c1"), ToolOutput::success("noted"))
-        else {
-            panic!("expected the batch to stay open")
-        };
-        prefix.extend(pump(&mut turn));
+        let mut prefix = Vec::new();
+        started(&mut prefix);
+        prefix.push(Event::Message(Message::Assistant(
+            AssistantMessage::ToolCalls {
+                content: None,
+                calls: NonEmpty::from_vec(vec![call("c1"), call("c2")]).unwrap(),
+            },
+        )));
+        prefix.push(Event::MessageEnd {
+            step: step(1),
+            model: ModelName::from_str("test-model").unwrap(),
+            stop: StopKind::ToolUse,
+            usage: TokenUsage::default(),
+        });
+        prefix.push(Event::ToolExecutionStart {
+            step: step(1),
+            call: call("c1"),
+        });
+        prefix.push(Event::ToolExecutionEnd {
+            step: step(1),
+            call_id: ToolCallId::new("c1"),
+        });
+        prefix.push(Event::Message(Message::ToolResult {
+            call_id: ToolCallId::new("c1"),
+            output: ToolOutput::success("noted"),
+        }));
 
-        let mut closed = turn.interrupted();
-        let closer = pump(&mut closed);
-        (prefix, closer)
+        let expected = vec![
+            Event::ToolExecutionEnd {
+                step: step(1),
+                call_id: ToolCallId::new("c2"),
+            },
+            Event::Message(Message::ToolResult {
+                call_id: ToolCallId::new("c2"),
+                output: ToolOutput::not_run(),
+            }),
+            Event::StepEnd {
+                step: step(1),
+                outcome: StepOutcome::Interrupted,
+            },
+            Event::TurnEnd {
+                outcome: Outcome::Interrupted,
+            },
+        ];
+        (prefix, expected)
     }
 
     #[test]
-    fn repairs_match_what_the_machine_emits_on_interrupt() {
+    fn repairs_match_what_the_driver_emits_on_interrupt() {
         let (prefix, expected) = half_finished_turn();
         assert_eq!(repairs(&prefix), expected);
     }
 
     #[test]
     fn repairs_close_a_step_that_never_saw_a_response() {
-        let mut turn = Turn::<AwaitingMessage>::start(config());
-        let prefix = pump(&mut turn);
-        let mut closed = turn.interrupted();
-        let expected = pump(&mut closed);
+        let mut prefix = Vec::new();
+        started(&mut prefix);
+        let expected = vec![
+            Event::StepEnd {
+                step: step(1),
+                outcome: StepOutcome::Interrupted,
+            },
+            Event::TurnEnd {
+                outcome: Outcome::Interrupted,
+            },
+        ];
         assert_eq!(repairs(&prefix), expected);
     }
 
@@ -680,7 +699,7 @@ mod tests {
                 Timestamp::now(),
                 &HostEvent::ApprovalResolved {
                     call_id: ToolCallId::new("c1"),
-                    outcome: agnes_io::session::ApprovalOutcome::Rejected,
+                    outcome: ApprovalOutcome::Rejected,
                 },
             )
             .await
@@ -715,7 +734,7 @@ mod tests {
         assert!(matches!(
             notes[1].event,
             HostEvent::ApprovalResolved {
-                outcome: agnes_io::session::ApprovalOutcome::Rejected,
+                outcome: ApprovalOutcome::Rejected,
                 ..
             }
         ));

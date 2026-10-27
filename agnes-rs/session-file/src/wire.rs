@@ -6,17 +6,17 @@
 //! 日志不猜，直接拒载；形状非法（空内容、空工具调用集合、step 0、带空白
 //! 的工具名、非对象的参数模式）在换回领域类型时同样拒载。
 
+use agnes_agent::approval::ApprovalOutcome;
+use agnes_agent::record::{Event, HostEvent, StepOutcome};
 use agnes_core::config::{ConfigError, ModelName, SystemPrompt};
 use agnes_core::content::Content;
-use agnes_core::event::Event;
 use agnes_core::header::{Environment, Header};
 use agnes_core::llm::StopKind;
 use agnes_core::message::{
     AssistantMessage, Message, TokenUsage, ToolArguments, ToolCall, ToolCallId, ToolOutput,
 };
 use agnes_core::tool::{JsonSchema, SchemaError, ToolName, ToolSpec};
-use agnes_core::turn::{Outcome, StepOutcome};
-use agnes_io::session::{ApprovalOutcome, HostEvent};
+use agnes_core::turn::Outcome;
 use agnes_util::NonEmpty;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,8 @@ pub enum WireError {
     ModelName(#[source] ConfigError),
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    #[error("tool `{name}` is declared twice in one environment")]
+    DuplicateTool { name: String },
 }
 
 /// 一行日志：版本标记、core 记录或宿主审计记录。
@@ -287,7 +289,7 @@ impl From<&Header> for WireHeader {
 impl From<&Environment> for WireEnvironment {
     fn from(environment: &Environment) -> Self {
         Self {
-            tools: environment.tools().iter().map(Into::into).collect(),
+            tools: environment.tools().map(Into::into).collect(),
         }
     }
 }
@@ -469,17 +471,15 @@ impl TryFrom<WireHeader> for Header {
     type Error = WireError;
 
     fn try_from(header: WireHeader) -> Result<Self, Self::Error> {
-        Ok(Header::new(
-            SystemPrompt::new(header.system),
-            Environment::new(
-                header
-                    .environment
-                    .tools
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-        ))
+        let mut environment = Environment::default();
+        for tool in header.environment.tools {
+            let spec = ToolSpec::try_from(tool)?;
+            let name = spec.name().as_str().to_owned();
+            if !environment.add(spec) {
+                return Err(WireError::DuplicateTool { name });
+            }
+        }
+        Ok(Header::new(SystemPrompt::new(header.system), environment))
     }
 }
 
@@ -656,6 +656,25 @@ mod tests {
 
     fn content(text: &str) -> Content {
         Content::try_from(text).unwrap()
+    }
+
+    #[test]
+    fn duplicate_tool_names_in_a_header_are_refused() {
+        let tool = || WireToolSpec {
+            name: "read_file".into(),
+            description: "reads".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let header = WireHeader {
+            system: "sys".into(),
+            environment: WireEnvironment {
+                tools: vec![tool(), tool()],
+            },
+        };
+        assert!(matches!(
+            Header::try_from(header),
+            Err(WireError::DuplicateTool { name }) if name == "read_file"
+        ));
     }
 
     fn call(id: &str) -> ToolCall {

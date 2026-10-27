@@ -80,8 +80,8 @@ dependencies = [
 name = "agnes-session-file"
 version = "0.1.0"
 dependencies = [
+ "agnes-agent",
  "agnes-core",
- "agnes-io",
  "agnes-util",
  "async-trait",
  "jiff",
