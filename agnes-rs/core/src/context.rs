@@ -1,5 +1,5 @@
 //! Context：一个 turn 携带的全部领域状态 —— 会话消息、模型侧配置、
-//! 待注入消息、用量与 step 记账。
+//! 用量与 step 记账。
 //!
 //! 状态机不记录日志、不产出事件：需要什么由下游通过这里的访问器读取。
 //! 系统提示只有 [`Context::header`] 一个表示，[`Context::prompt`] 把它
@@ -11,7 +11,6 @@ use crate::llm::Prompt;
 use crate::message::{Message, TokenUsage};
 use crate::tool::{ToolName, ToolSpec};
 use crate::turn::StepNumber;
-use std::mem;
 use std::num::NonZeroU32;
 
 /// 一个 turn 的领域状态。
@@ -19,7 +18,6 @@ use std::num::NonZeroU32;
 pub struct Context {
     header: Header,
     messages: Vec<Message>,
-    buffered: Vec<Message>,
     budget: StepBudget,
     usage: TokenUsage,
     steps_started: u32,
@@ -31,7 +29,6 @@ impl Context {
         Self {
             header,
             messages: Vec::new(),
-            buffered: Vec::new(),
             budget,
             usage: TokenUsage::default(),
             steps_started: 0,
@@ -56,11 +53,6 @@ impl Context {
         &self.messages
     }
 
-    /// 尚未在 step 边界生效的注入消息。
-    pub fn buffered(&self) -> &[Message] {
-        &self.buffered
-    }
-
     pub fn usage(&self) -> TokenUsage {
         self.usage
     }
@@ -82,12 +74,6 @@ impl Context {
         }
     }
 
-    /// 运行中注入一条消息：先缓存，在下一个 step 边界生效。消息不限于
-    /// 用户发出 —— 角色由 [`Message`] 本身保留。
-    pub fn inject(&mut self, message: Message) {
-        self.buffered.push(message);
-    }
-
     /// 运行期增加一个工具；重名是 no-op。
     pub fn add_tool(&mut self, spec: ToolSpec) -> bool {
         self.header.environment_mut().add(spec)
@@ -107,34 +93,34 @@ impl Context {
         self.messages.push(message);
     }
 
-    /// 开启下一个 step 并返回其编号。调用方必须先确认预算允许。
-    pub(crate) fn begin_step(&mut self) -> StepNumber {
-        // steps_started < 预算 ≤ u32::MAX，这里加一不会溢出。
-        let number = self.steps_started + 1;
-        self.steps_started = number;
-        StepNumber::new(NonZeroU32::new(number).expect("step count fits a u32"))
+    /// 预算允许时返回下一个 step 的编号（尚未计步）；预算耗尽返回 `None`。
+    /// 预算判定只在这里发生。
+    pub(crate) fn next_step_if_allowed(&self) -> Option<StepNumber> {
+        self.budget
+            .allows(self.steps_started)
+            .then(|| self.next_step())
     }
 
-    pub(crate) fn budget_allows_next(&self) -> bool {
-        self.budget.allows(self.steps_started)
+    /// 开启一个已由 [`Context::next_step_if_allowed`] 放行的 step。
+    pub(crate) fn begin_step(&mut self) -> StepNumber {
+        debug_assert!(
+            self.budget.allows(self.steps_started),
+            "a step can only begin when the budget allows it"
+        );
+        let step = self.next_step();
+        self.steps_started = step.get();
+        step
+    }
+
+    /// 下一个 step 的编号（不判定预算）。调用方必须已经放行。
+    fn next_step(&self) -> StepNumber {
+        // steps_started < 预算 ≤ u32::MAX，这里加一不会溢出。
+        let number = self.steps_started + 1;
+        StepNumber::new(NonZeroU32::new(number).expect("step count fits a u32"))
     }
 
     pub(crate) fn note_usage(&mut self, usage: TokenUsage) {
         self.usage = self.usage.saturating_add(usage);
-    }
-
-    pub(crate) fn has_buffered(&self) -> bool {
-        !self.buffered.is_empty()
-    }
-
-    /// 把所有待注入消息按发生顺序并入会话。
-    pub(crate) fn apply_injections(&mut self) {
-        self.messages.append(&mut self.buffered);
-    }
-
-    /// 收走仍未生效的注入消息（收场时还给宿主）。
-    pub(crate) fn take_buffered(&mut self) -> Vec<Message> {
-        mem::take(&mut self.buffered)
     }
 }
 
@@ -190,18 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn injections_wait_for_a_boundary() {
-        let mut context = Context::new(header(), budget(4));
-        context.inject(user("later"));
-        assert_eq!(context.messages().len(), 0);
-        assert_eq!(context.buffered().len(), 1);
-
-        context.apply_injections();
-        assert_eq!(context.messages().len(), 1);
-        assert!(context.buffered().is_empty());
-    }
-
-    #[test]
     fn tools_are_added_and_removed_by_spec() {
         let mut context = Context::new(header(), budget(4));
         let name = ToolName::from_str("read_file").unwrap();
@@ -213,11 +187,20 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_gate_stops_after_the_last_step() {
+        let mut context = Context::new(header(), budget(1));
+        assert_eq!(context.next_step_if_allowed().map(StepNumber::get), Some(1));
+        assert_eq!(context.begin_step().get(), 1);
+        assert!(context.next_step_if_allowed().is_none());
+    }
+
+    #[test]
     fn steps_and_usage_accumulate() {
         let mut context = Context::new(header(), budget(4));
+        assert_eq!(context.next_step_if_allowed().map(StepNumber::get), Some(1));
         assert_eq!(context.begin_step().get(), 1);
+        assert_eq!(context.next_step_if_allowed().map(StepNumber::get), Some(2));
         assert_eq!(context.begin_step().get(), 2);
-        assert!(context.budget_allows_next());
         context.note_usage(TokenUsage {
             input: 2,
             output: 3,

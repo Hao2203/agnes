@@ -1,15 +1,17 @@
 //! 宿主驱动：把 core 的 typestate 与宿主的 IO / 策略接起来。
 //!
-//! 阶段即动作：[`Turn<AwaitingModel>`] 表示该调模型，[`Turn<AwaitingTools>`]
-//! 表示该跑这批调用。驱动在两种阶段之间循环；记录事件由驱动自己铸造
-//! （记入日志、分发给插件、上报宿主），core 不产出事件。
+//! 阶段即动作：[`Turn<Ready>`] 表示可以开始，[`Turn<AwaitingCall>`] 表示
+//! 该调模型，[`Turn<AwaitingModel>`] 表示等响应，[`Turn<AwaitingTools>`]
+//! 表示该跑这批调用。驱动记录完开局事件后才 `start`，随后在待调用与等工具
+//! 两个循环边界之间推进；记录事件由驱动自己铸造（记入日志、分发给插件、
+//! 上报宿主），core 不产出事件。
 //!
 //! 插件只有一条处理入口（`on_event`）：它看不到派发/执行/审批这些阶段，
 //! 只接收事件、返回指令。内核把指令收进 outbox，系统在检查点执行：
 //!
 //! - 门禁：`ToolCallRequested` 前取 `Deny` / `RequireApproval`；
 //! - 结果：`ToolCallFinished` 后取 `ReplaceResult`；
-//! - 注入：每次发布事件后排空注入队列，交给机器的注入缓冲；
+//! - 注入：只在待调用阶段排空，构建请求前并入会话；
 //! - 中止：在每次模型调用 / 每个工具调用前取 `Abort`；
 //! - 工具变更：在模型调用前应用，并记录一条新 `Header`。
 //!
@@ -23,7 +25,8 @@ use agnes_core::header::{Environment, Header};
 use agnes_core::llm::StopKind;
 use agnes_core::message::{Message, ToolCall, ToolOutput};
 use agnes_core::turn::{
-    Advanced, AwaitingModel, AwaitingTools, Closed, OpenPhase, Outcome, Replied, StepNumber, Turn,
+    Advanced, AwaitingCall, AwaitingModel, AwaitingTools, Closed, Outcome, Ready, Replied,
+    StepNumber, Turn,
 };
 use jiff::Timestamp;
 use tokio::sync::oneshot::Receiver as AnswerReceiver;
@@ -54,7 +57,7 @@ enum GateOutcome {
 
 /// 驱动侧动态阶段：机器在运行时以枚举持有，阶段本身提示下一步动作。
 enum Staged {
-    AwaitingModel(Turn<AwaitingModel>),
+    AwaitingCall(Turn<AwaitingCall>),
     AwaitingTools(Turn<AwaitingTools>),
     Closed(Turn<Closed>),
 }
@@ -62,7 +65,7 @@ enum Staged {
 /// 一次工具结果落位后的去向。
 enum Settled {
     Ongoing(Turn<AwaitingTools>),
-    Next(Turn<AwaitingModel>),
+    Next(Turn<AwaitingCall>),
     Closed(Turn<Closed>),
 }
 
@@ -89,10 +92,10 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     /// 一路驱动到收场；中止时把原因写进审计记录，再原样返回错误。
     pub(crate) async fn run(
         mut self,
-        mut started: Turn<AwaitingModel>,
+        mut ready: Turn<Ready>,
     ) -> Result<(Turn<Closed>, Option<Aborted>), AgentError> {
-        let outcome = match self.record_start(&mut started).await {
-            Ok(()) => self.drive(started).await,
+        let outcome = match self.record_start(&mut ready).await {
+            Ok(()) => self.drive(ready.start()).await,
             Err(err) => Err(err),
         };
         match outcome {
@@ -114,69 +117,69 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         }
     }
 
-    async fn drive(&mut self, started: Turn<AwaitingModel>) -> Result<Turn<Closed>, AgentError> {
-        let mut staged = Staged::AwaitingModel(started);
+    async fn drive(&mut self, started: Turn<AwaitingCall>) -> Result<Turn<Closed>, AgentError> {
+        let mut staged = Staged::AwaitingCall(started);
         loop {
             staged = match staged {
-                Staged::AwaitingModel(turn) => self.call_model(turn).await?,
+                Staged::AwaitingCall(turn) => self.call_model(turn).await?,
                 Staged::AwaitingTools(turn) => self.run_tools(turn).await?,
                 Staged::Closed(turn) => return Ok(turn),
             };
         }
     }
 
-    /// turn 开局的记录：header、goal 消息、turn 边界。
-    async fn record_start(&mut self, turn: &mut Turn<AwaitingModel>) -> Result<(), AgentError> {
+    /// turn 开局的记录：header、goal 消息、turn 边界。goal 从就绪阶段读取，
+    /// 记录完成后才进入上下文。此时还不能注入，插件指令留在队列里。
+    async fn record_start(&mut self, turn: &mut Turn<Ready>) -> Result<(), AgentError> {
         let header = turn.context().header().clone();
-        self.record_live(turn, RecordEvent::Header(header)).await?;
-        let goal = turn
-            .context()
-            .messages()
-            .last()
-            .cloned()
-            .ok_or(AgentError::Invariant {
-                reason: "a started turn always carries the goal message",
-            })?;
-        self.record_live(turn, RecordEvent::Message(goal)).await?;
-        self.record_live(turn, RecordEvent::TurnStart).await
+        self.record(RecordEvent::Header(header)).await?;
+        let goal = turn.goal().clone();
+        self.record(RecordEvent::Message(Message::User { content: goal }))
+            .await?;
+        self.record(RecordEvent::TurnStart).await
     }
 
     /// step 的起点：先 `StepStart`，再 `MessageStart`。
-    async fn record_step_start(
-        &mut self,
-        turn: &mut Turn<AwaitingModel>,
-        step: StepNumber,
-    ) -> Result<(), AgentError> {
-        self.record_live(turn, RecordEvent::StepStart { step })
-            .await?;
-        self.record_live(turn, RecordEvent::MessageStart { step })
-            .await
+    async fn record_step_start(&mut self, step: StepNumber) -> Result<(), AgentError> {
+        self.record(RecordEvent::StepStart { step }).await?;
+        self.record(RecordEvent::MessageStart { step }).await
     }
 
-    /// 一次模型往返：输入/注入 → 工具变更 → step 边界 → 请求 → 响应落账。
-    async fn call_model(&mut self, mut turn: Turn<AwaitingModel>) -> Result<Staged, AgentError> {
+    /// 一次模型往返：注入 → 工具变更 → 请求快照 → call → 响应落账。
+    async fn call_model(&mut self, mut turn: Turn<AwaitingCall>) -> Result<Staged, AgentError> {
+        // 注入立即进会话；先入账，再检查中止，保证日志里的消息不少。
+        let before = turn.context().messages().len();
         self.drain_input(&mut turn);
         self.drain_injections(&mut turn);
+        let injected = new_messages(&turn, before);
+        self.record_injected(&injected).await?;
 
-        let step = turn.step();
         // 中止优先：不再启动新的模型调用。
         if self.take_abort().await?.is_some() {
-            self.record_step_start(&mut turn, step).await?;
-            return self.close_interrupted_model(turn).await;
+            return self.close_interrupted_call(turn).await;
         }
-        // 工具变更与新 header 必须在 step 开始前落账：请求用到的环境
-        // 与日志里的最后一条 header 一致。
+        // 工具变更与新 header 必须在请求构建前落账：请求用到的环境与
+        // 日志里的最后一条 header 一致。
         if self.ports.extensions.has_tool_changes() {
             if let Some(event) = self.apply_tool_changes(&mut turn) {
-                self.record_live(&mut turn, event).await?;
+                self.record(event).await?;
             }
-            // header 已经分发；插件可能借此中止。
+            // header 已经分发；插件可能借此注入或中止。
+            let before = turn.context().messages().len();
+            self.drain_input(&mut turn);
+            self.drain_injections(&mut turn);
+            let injected = new_messages(&turn, before);
+            self.record_injected(&injected).await?;
             if self.take_abort().await?.is_some() {
-                self.record_step_start(&mut turn, step).await?;
-                return self.close_interrupted_model(turn).await;
+                return self.close_interrupted_call(turn).await;
             }
         }
-        self.record_step_start(&mut turn, step).await?;
+
+        let request = self.ports.requests.build(turn.context());
+        let model = request.model.clone();
+        let turn = turn.call();
+        let step = turn.step();
+        self.record_step_start(step).await?;
         // step 的事件也可能触发中止；请求尚未发出，收场仍然干净。
         if self.take_abort().await?.is_some() {
             return self.close_interrupted_model(turn).await;
@@ -184,8 +187,6 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
 
         // 提交边界：请求发出前，日志已经耐久。
         self.flush_session().await?;
-        let request = self.ports.requests.build(turn.context());
-        let model = request.model.clone();
         let raced = tokio::select! {
             biased;
             () = self.ports.input.interrupted() => None,
@@ -196,63 +197,25 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         };
         let response = response.map_err(AgentError::Llm)?;
 
-        // 插件注入在模型回复落账前进入缓冲：答复后的续跑判断与下一个
-        // step 边界都能看到。用户输入不在这里排空 —— 收场后它们属于下一次
-        // run，留在 Input 队列里由宿主取走。
-        self.drain_injections(&mut turn);
-
         let stop = StopKind::from(&response.stop_reason);
         let usage = response.usage;
         let step_outcome = StepOutcome::from(stop);
         let before = turn.context().messages().len();
 
         match turn.respond(response) {
-            Replied::Tools(mut turn) => {
-                self.record_messages_live(&mut turn, before).await?;
-                self.record_live(
-                    &mut turn,
-                    RecordEvent::MessageEnd {
-                        step,
-                        model,
-                        stop,
-                        usage,
-                    },
-                )
+            Replied::Tools(turn) => {
+                self.record_messages(&turn, before).await?;
+                self.record(RecordEvent::MessageEnd {
+                    step,
+                    model,
+                    stop,
+                    usage,
+                })
                 .await?;
                 Ok(Staged::AwaitingTools(turn))
             }
-            Replied::Next(mut turn) => {
-                let (primary, injected) = transition_messages(&turn, before);
-                if let Some(assistant) = primary {
-                    self.record_live(&mut turn, RecordEvent::Message(assistant))
-                        .await?;
-                }
-                self.record_live(
-                    &mut turn,
-                    RecordEvent::MessageEnd {
-                        step,
-                        model,
-                        stop,
-                        usage,
-                    },
-                )
-                .await?;
-                self.record_live(
-                    &mut turn,
-                    RecordEvent::StepEnd {
-                        step,
-                        outcome: StepOutcome::Answered,
-                    },
-                )
-                .await?;
-                self.record_injections(&mut turn, &injected).await?;
-                Ok(Staged::AwaitingModel(turn))
-            }
             Replied::Closed(turn) => {
-                let delta = new_messages(&turn, before);
-                for message in delta {
-                    self.record(RecordEvent::Message(message)).await?;
-                }
+                self.record_messages(&turn, before).await?;
                 self.record(RecordEvent::MessageEnd {
                     step,
                     model,
@@ -278,9 +241,6 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     async fn run_tools(&mut self, mut turn: Turn<AwaitingTools>) -> Result<Staged, AgentError> {
         let step = turn.step();
         loop {
-            self.drain_input(&mut turn);
-            self.drain_injections(&mut turn);
-
             let Some(call) = turn.next_unfinished().cloned() else {
                 return Err(AgentError::Invariant {
                     reason: "a tool phase always has an unfinished call",
@@ -291,79 +251,59 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
             if self.take_abort().await?.is_some() {
                 return self.close_interrupted_tools(turn).await;
             }
-            self.publish(&mut turn, &PluginEvent::ToolCallRequested { call: &call });
+            self.publish(&PluginEvent::ToolCallRequested { call: &call });
             // 在 `ToolCallRequested` 上发出的中止必须在派发前生效。
             if self.take_abort().await?.is_some() {
                 return self.close_interrupted_tools(turn).await;
             }
 
-            match self.gate_call(&mut turn, &call).await? {
+            match self.gate_call(&call).await? {
                 GateOutcome::Interrupted => return self.close_interrupted_tools(turn).await,
                 GateOutcome::Denied(denied) => {
-                    self.publish_gated(&mut turn, &call, &denied);
-                    self.record_live(
-                        &mut turn,
-                        RecordEvent::ToolExecutionStart {
-                            step,
-                            call: call.clone(),
-                        },
-                    )
+                    self.publish_gated(&call, &denied);
+                    self.record(RecordEvent::ToolExecutionStart {
+                        step,
+                        call: call.clone(),
+                    })
                     .await?;
                     let output =
                         ToolOutput::error(format!("denied by {}: {}", denied.by, denied.reason));
-                    // 运行中键入/注入的消息必须在 step 边界前进入缓存，
-                    // 与放行路径保持一致。
-                    self.drain_input(&mut turn);
-                    self.drain_injections(&mut turn);
                     match self.settle_tool(turn, &call, output, step).await? {
                         Settled::Ongoing(next) => turn = next,
-                        Settled::Next(turn) => return Ok(Staged::AwaitingModel(turn)),
+                        Settled::Next(turn) => return Ok(Staged::AwaitingCall(turn)),
                         Settled::Closed(turn) => return Ok(Staged::Closed(turn)),
                     }
                 }
                 GateOutcome::Allowed => {
-                    self.record_live(
-                        &mut turn,
-                        RecordEvent::ToolExecutionStart {
-                            step,
-                            call: call.clone(),
-                        },
-                    )
+                    self.record(RecordEvent::ToolExecutionStart {
+                        step,
+                        call: call.clone(),
+                    })
                     .await?;
                     let Some(output) = self.run_tool(&call).await else {
                         return self.close_interrupted_tools(turn).await;
                     };
-                    // 先让插件看到原始结果；注入在这里排空，保证 step 边界生效。
-                    self.publish(
-                        &mut turn,
-                        &PluginEvent::ToolCallFinished {
-                            call: &call,
-                            output: &output,
-                        },
-                    );
+                    // 先让插件看到原始结果；注入留在队列里，等下一次待调用阶段。
+                    self.publish(&PluginEvent::ToolCallFinished {
+                        call: &call,
+                        output: &output,
+                    });
                     // 结果折叠：插件可以在入账前挡回，反馈仍是一条错误结果 ——
                     // 调用/结果始终一一对应。
                     let output = if let Some(blocked) = self.ports.extensions.replacement(&call.id)
                     {
-                        self.publish(
-                            &mut turn,
-                            &PluginEvent::ToolResultBlocked {
-                                call: &call,
-                                by: blocked.by,
-                                feedback: &blocked.feedback,
-                            },
-                        );
+                        self.publish(&PluginEvent::ToolResultBlocked {
+                            call: &call,
+                            by: blocked.by,
+                            feedback: &blocked.feedback,
+                        });
                         ToolOutput::error(blocked.feedback)
                     } else {
                         output
                     };
-                    // 最后一个结果会结算 step：运行中键入的消息必须在
-                    // 边界前进入机器缓存。
-                    self.drain_input(&mut turn);
-                    self.drain_injections(&mut turn);
                     match self.settle_tool(turn, &call, output, step).await? {
                         Settled::Ongoing(next) => turn = next,
-                        Settled::Next(turn) => return Ok(Staged::AwaitingModel(turn)),
+                        Settled::Next(turn) => return Ok(Staged::AwaitingCall(turn)),
                         Settled::Closed(turn) => return Ok(Staged::Closed(turn)),
                     }
                 }
@@ -381,41 +321,27 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     ) -> Result<Settled, AgentError> {
         let before = turn.context().messages().len();
         match turn.finish(call.id.clone(), output) {
-            Advanced::Ongoing(mut turn) => {
-                self.record_live(
-                    &mut turn,
-                    RecordEvent::ToolExecutionEnd {
-                        step,
-                        call_id: call.id.clone(),
-                    },
-                )
+            Advanced::Ongoing(turn) => {
+                self.record(RecordEvent::ToolExecutionEnd {
+                    step,
+                    call_id: call.id.clone(),
+                })
                 .await?;
-                self.record_messages_live(&mut turn, before).await?;
+                self.record_messages(&turn, before).await?;
                 Ok(Settled::Ongoing(turn))
             }
-            Advanced::Next(mut turn) => {
-                self.record_live(
-                    &mut turn,
-                    RecordEvent::ToolExecutionEnd {
-                        step,
-                        call_id: call.id.clone(),
-                    },
-                )
+            Advanced::Next(turn) => {
+                self.record(RecordEvent::ToolExecutionEnd {
+                    step,
+                    call_id: call.id.clone(),
+                })
                 .await?;
-                let (primary, injected) = transition_messages(&turn, before);
-                if let Some(result) = primary {
-                    self.record_live(&mut turn, RecordEvent::Message(result))
-                        .await?;
-                }
-                self.record_live(
-                    &mut turn,
-                    RecordEvent::StepEnd {
-                        step,
-                        outcome: StepOutcome::ToolUse,
-                    },
-                )
+                self.record_messages(&turn, before).await?;
+                self.record(RecordEvent::StepEnd {
+                    step,
+                    outcome: StepOutcome::ToolUse,
+                })
                 .await?;
-                self.record_injections(&mut turn, &injected).await?;
                 Ok(Settled::Next(turn))
             }
             Advanced::Closed(turn) => {
@@ -424,16 +350,12 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                     call_id: call.id.clone(),
                 })
                 .await?;
-                let (primary, injected) = transition_messages(&turn, before);
-                if let Some(result) = primary {
-                    self.record(RecordEvent::Message(result)).await?;
-                }
+                self.record_messages(&turn, before).await?;
                 self.record(RecordEvent::StepEnd {
                     step,
                     outcome: StepOutcome::ToolUse,
                 })
                 .await?;
-                self.record_injections_closed(&injected).await?;
                 self.record(RecordEvent::TurnEnd {
                     outcome: turn.outcome(),
                 })
@@ -441,6 +363,19 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                 Ok(Settled::Closed(turn))
             }
         }
+    }
+
+    /// 调用前被打断：还没有开启 step，只需收 turn。
+    async fn close_interrupted_call(
+        &mut self,
+        turn: Turn<AwaitingCall>,
+    ) -> Result<Staged, AgentError> {
+        let closed = turn.interrupted();
+        self.record(RecordEvent::TurnEnd {
+            outcome: Outcome::Interrupted,
+        })
+        .await?;
+        Ok(Staged::Closed(closed))
     }
 
     /// 模型等待被打断：step 与 turn 都以 `Interrupted` 收场。
@@ -493,11 +428,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     }
 
     /// 门禁与审批：放行、拒绝或被打断。审批等待与打断在这里赛跑。
-    async fn gate_call(
-        &mut self,
-        turn: &mut Turn<AwaitingTools>,
-        call: &ToolCall,
-    ) -> Result<GateOutcome, AgentError> {
+    async fn gate_call(&mut self, call: &ToolCall) -> Result<GateOutcome, AgentError> {
         match self.ports.extensions.gate(&call.id) {
             Gate::Allow => Ok(GateOutcome::Allowed),
             Gate::Deny(denied) => Ok(GateOutcome::Denied(denied)),
@@ -534,7 +465,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                         .await?;
                     return Ok(GateOutcome::Denied(denied));
                 }
-                self.publish(turn, &PluginEvent::ApprovalRequested { call });
+                self.publish(&PluginEvent::ApprovalRequested { call });
                 self.outlets.sink.event(&Event::ApprovalRequested {
                     at: Timestamp::now(),
                     call: call.clone(),
@@ -543,17 +474,14 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                 if self.take_abort().await?.is_some() {
                     self.audit_approval_resolved(call, ApprovalOutcome::Cancelled)
                         .await?;
-                    self.publish(
-                        turn,
-                        &PluginEvent::ApprovalResolved {
-                            call,
-                            outcome: ApprovalOutcome::Cancelled,
-                        },
-                    );
+                    self.publish(&PluginEvent::ApprovalResolved {
+                        call,
+                        outcome: ApprovalOutcome::Cancelled,
+                    });
                     return Ok(GateOutcome::Interrupted);
                 }
                 match self
-                    .resolve_approval(turn, call, answer, channel.timeout())
+                    .resolve_approval(call, answer, channel.timeout())
                     .await?
                 {
                     Resolution::Interrupted => Ok(GateOutcome::Interrupted),
@@ -566,7 +494,6 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                         if self.take_abort().await?.is_some() {
                             return Ok(GateOutcome::Interrupted);
                         }
-                        self.drain_injections(turn);
                         // 第二次门禁：只认新的拒绝；Ask 已经问过，不再重问。
                         match self.ports.extensions.gate(&call.id) {
                             Gate::Deny(denied) => Ok(GateOutcome::Denied(denied)),
@@ -588,8 +515,8 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     }
 
     /// 催化工具拒绝的宿主事件（发布给插件 + 上报）。
-    fn publish_gated(&mut self, turn: &mut Turn<AwaitingTools>, call: &ToolCall, denied: &Denied) {
-        self.publish(turn, &PluginEvent::ToolCallGated { call, denied });
+    fn publish_gated(&mut self, call: &ToolCall, denied: &Denied) {
+        self.publish(&PluginEvent::ToolCallGated { call, denied });
         self.outlets.sink.event(&Event::ToolGated {
             at: Timestamp::now(),
             call: call.clone(),
@@ -637,14 +564,13 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         Ok(())
     }
 
-    /// 把一条事件分发给插件，并把注入队列排进机器。
-    fn publish<P: OpenPhase>(&mut self, turn: &mut Turn<P>, event: &PluginEvent<'_>) {
+    /// 把一条事件分发给插件；注入只入队，等下一次待调用阶段。
+    fn publish(&mut self, event: &PluginEvent<'_>) {
         self.ports.extensions.publish(event);
-        self.drain_injections(turn);
     }
 
-    /// 排空注入队列：插件只入队，系统在这里统一交给机器。
-    fn drain_injections<P: OpenPhase>(&mut self, turn: &mut Turn<P>) {
+    /// 排空插件注入队列，立即并入会话。
+    fn drain_injections(&mut self, turn: &mut Turn<AwaitingCall>) {
         while let Some(queued) = self.ports.extensions.take_injection() {
             turn.inject(Message::User {
                 content: queued.into_content(),
@@ -652,8 +578,8 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         }
     }
 
-    /// 把输入队列里的用户消息收进机器缓存；生效时机由 step 边界决定。
-    fn drain_input<P: OpenPhase>(&mut self, turn: &mut Turn<P>) {
+    /// 把输入队列里的用户消息收进会话。
+    fn drain_input(&mut self, turn: &mut Turn<AwaitingCall>) {
         for content in self.ports.input.drain() {
             turn.inject(Message::User { content });
         }
@@ -680,7 +606,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
 
     /// 应用本轮工具变更：先写候选注册表，成功后才原子替换并让机器的
     /// 环境同步；只有真正变化时才返回一条 `Header` 事件。
-    fn apply_tool_changes(&mut self, turn: &mut Turn<AwaitingModel>) -> Option<RecordEvent> {
+    fn apply_tool_changes(&mut self, turn: &mut Turn<AwaitingCall>) -> Option<RecordEvent> {
         let changes = self.ports.extensions.take_tool_changes();
         if changes.is_empty() {
             return None;
@@ -710,7 +636,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         }
     }
 
-    /// 一条事件的三步落地：先入日志、再分发插件（并排注入）、最后上报。
+    /// 一条事件的三步落地：先入日志、再分发插件、最后上报。
     async fn record(&mut self, event: RecordEvent) -> Result<(), AgentError> {
         let at = Timestamp::now();
         // 克隆一次，供审计/插件/上报共用。
@@ -723,56 +649,20 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         Ok(())
     }
 
-    /// 在未收场阶段记录一条事件，并把插件注入排进机器。
-    async fn record_live<P: OpenPhase>(
-        &mut self,
-        turn: &mut Turn<P>,
-        event: RecordEvent,
-    ) -> Result<(), AgentError> {
-        self.record(event).await?;
-        self.drain_injections(turn);
-        Ok(())
-    }
-
     /// 记录自 `before` 起新增的会话消息。
-    async fn record_messages_live<P: OpenPhase>(
+    async fn record_messages<Phase>(
         &mut self,
-        turn: &mut Turn<P>,
+        turn: &Turn<Phase>,
         before: usize,
     ) -> Result<(), AgentError> {
-        let messages = new_messages(turn, before);
-        for message in messages {
-            self.record_live(turn, RecordEvent::Message(message))
-                .await?;
+        for message in new_messages(turn, before) {
+            self.record(RecordEvent::Message(message)).await?;
         }
         Ok(())
     }
 
-    /// 记录 step 边界生效的注入消息：先记数量，再逐条入账。
-    async fn record_injections<P: OpenPhase>(
-        &mut self,
-        turn: &mut Turn<P>,
-        injected: &[Message],
-    ) -> Result<(), AgentError> {
-        if injected.is_empty() {
-            return Ok(());
-        }
-        self.record_live(
-            turn,
-            RecordEvent::MessagesInjected {
-                count: injected.len(),
-            },
-        )
-        .await?;
-        for message in injected {
-            self.record_live(turn, RecordEvent::Message(message.clone()))
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// 已收场阶段的注入记录：没有可排空的插件队列，只把已生效的消息入账。
-    async fn record_injections_closed(&mut self, injected: &[Message]) -> Result<(), AgentError> {
+    /// 记录调用前生效的注入消息：先记数量，再逐条入账。
+    async fn record_injected(&mut self, injected: &[Message]) -> Result<(), AgentError> {
         if injected.is_empty() {
             return Ok(());
         }
@@ -814,7 +704,6 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     /// 等待审批答覆并落定：写审计、上报、分发。
     async fn resolve_approval(
         &mut self,
-        turn: &mut Turn<AwaitingTools>,
         call: &ToolCall,
         answer: AnswerReceiver<bool>,
         timeout: Option<Duration>,
@@ -847,7 +736,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         };
         let outcome = resolution.outcome();
         self.audit_approval_resolved(call, outcome).await?;
-        self.publish(turn, &PluginEvent::ApprovalResolved { call, outcome });
+        self.publish(&PluginEvent::ApprovalResolved { call, outcome });
         Ok(resolution)
     }
 }
@@ -855,19 +744,4 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
 /// 自 `before` 起新增的会话消息（借看；调用方决定怎么处理）。
 fn new_messages<Phase>(turn: &Turn<Phase>, before: usize) -> Vec<Message> {
     turn.context().messages()[before..].to_vec()
-}
-
-/// 一次转移新增的消息：第一条是转移的主消息（模型答复或工具结果），
-/// 其余是 step 边界注入的消息。
-fn transition_messages<Phase>(
-    turn: &Turn<Phase>,
-    before: usize,
-) -> (Option<Message>, Vec<Message>) {
-    let mut delta = new_messages(turn, before);
-    let primary = if delta.is_empty() {
-        None
-    } else {
-        Some(delta.remove(0))
-    };
-    (primary, delta)
 }

@@ -118,7 +118,7 @@ impl<'a> Host<'a> {
         self.approvals.is_some()
     }
 
-    /// 一次完整 run：从 [`Turn::start`] 到收场。
+    /// 一次完整 run：从 [`Turn::new`]（就绪）到收场。
     ///
     /// 控制：运行中随时可打断（[`InputPort::interrupted`]）—— 模型响应、
     /// 工具执行、审批挂起三个等待点都适用，in-flight 的 future 就地丢弃；
@@ -176,14 +176,14 @@ impl<'a> Host<'a> {
             session,
         };
         // 上下文从持久化日志的历史消息重建；系统提示与工具环境以当前
-        // 配置为准。goal 由 Turn::start 追加。
+        // 配置为准。goal 先留在就绪阶段，start 后进入待调用阶段。
         let context =
             Context::with_messages(header, budget, log.messages().cloned().collect::<Vec<_>>());
-        let started = Turn::start(context, goal);
+        let ready = Turn::new(context, goal);
         let mut log = log;
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
         // 由驱动记录，宿主保留所有权。
-        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(started).await {
+        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(ready).await {
             Ok(done) => done,
             Err(err) => {
                 // 失败 run 里已经产生的工具变更对下一 turn 仍然有效；
@@ -203,14 +203,15 @@ impl<'a> Host<'a> {
 
         let finished_at = Timestamp::now();
         let result = closed.into_result();
-        // 收场时仍在注入队列里的消息交给宿主，和 core 的未生效注入一样
-        // 进 pending_messages。
-        let mut pending_messages = result.unapplied;
-        pending_messages.extend(self.extensions.take_pending_injections().into_iter().map(
-            |queued| Message::User {
+        // 收场时仍在扩展 outbox 里的消息交给宿主；用户输入留在 Input 端口。
+        let pending_messages = self
+            .extensions
+            .take_pending_injections()
+            .into_iter()
+            .map(|queued| Message::User {
                 content: queued.into_content(),
-            },
-        ));
+            })
+            .collect();
         let summary = RunSummary {
             outcome: result.outcome,
             steps_used: result.steps_used,

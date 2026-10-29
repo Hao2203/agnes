@@ -1,21 +1,23 @@
 //! turn：把一次用户请求推进到答复的完整运行 —— 由多个 step（模型往返）组成。
 //!
 //! 这是事件循环驱动的 sans-io 状态机，且状态即类型：机器的阶段由
-//! [`AwaitingModel`]、[`AwaitingTools`]、[`Closed`] 表示，[`Turn<Phase>`]
-//! 每个阶段只提供推进该阶段的方法 —— 在等工具时"喂"响应、在收场后喂
-//! 任何输入，编译期都不可能。
+//! [`Ready`]、[`AwaitingCall`]、[`AwaitingModel`]、[`AwaitingTools`]、
+//! [`Closed`] 表示，[`Turn<Phase>`] 每个阶段只提供推进该阶段的方法 ——
+//! 在等工具时"喂"响应、在等响应时注入、在收场后喂任何输入，编译期都
+//! 不可能。开局前 goal 留在就绪阶段，`start` 后才进入上下文；`call` 才
+//! 冻结请求、开启 step 并进入等响应阶段。
 //!
 //! 机器只持有领域状态、从不记录、也从不执行 IO：[`Turn`] 持有一次 run 的
-//! [`Context`]（消息、模型侧配置、用量、step 记账、待注入消息），转移只
-//! 交还下一个阶段（或其枚举），阶段本身就是动作提示 —— `AwaitingModel`
-//! 表示该调模型，`AwaitingTools` 表示该跑这批调用。事件与日志完全属于
-//! 下游：需要什么由驱动通过访问器读取并自行记录。
+//! [`Context`]（消息、模型侧配置、用量、step 记账），转移只交还下一个阶段
+//! （或其枚举），阶段本身就是动作提示 —— `AwaitingCall` 表示该调模型，
+//! `AwaitingModel` 表示等响应，`AwaitingTools` 表示该跑这批调用。事件与
+//! 日志完全属于下游：需要什么由驱动通过访问器读取并自行记录。
 //!
 //! 只有推进阶段的信息才进机器：完整响应、工具调用的结果、注入与打断。
-//! 流式增量不走这里 —— 适配器把产生中的消息直报宿主界面。注入随时缓存、
-//! 在下一个 step 边界生效；turn 在最终答复、打断或 step 预算耗尽时收场，
-//! [`Turn::into_result`] 交出整个 run 的结果 —— 包括收场时仍未生效的
-//! 注入消息。
+//! 流式增量不走这里 —— 适配器把产生中的消息直报宿主界面。注入只发生在
+//! 调用前的 [`AwaitingCall`]，立即并入会话；缓冲由宿主维护。turn 在最终
+//! 答复、打断或 step 预算耗尽时收场，[`Turn::into_result`] 交出整个 run
+//! 的结果。
 
 use crate::config::StepBudget;
 use crate::content::Content;
@@ -91,7 +93,20 @@ impl fmt::Display for StepNumber {
     }
 }
 
-/// 阶段：等模型消息 —— 只接受完整响应、打断和注入。
+/// 阶段：已就绪、尚未开始 —— goal 还在阶段里，没有进入 [`Context`]。
+#[derive(Debug)]
+pub struct Ready {
+    goal: Content,
+}
+
+/// 阶段：待调用模型 —— 唯一可以注入消息的阶段；`call` 之后进入
+/// [`AwaitingModel`]。
+#[derive(Debug)]
+pub struct AwaitingCall {
+    next: StepNumber,
+}
+
+/// 阶段：等模型响应 —— 调用已发出，只接受完整响应和打断。
 #[derive(Debug)]
 pub struct AwaitingModel {
     step: StepNumber,
@@ -133,24 +148,31 @@ pub struct Closed {
     outcome: Outcome,
 }
 
-/// turn 收场的结果：怎么收场、用量、走过的 step，以及收场时仍未生效的
-/// 注入消息（还给宿主供接续使用）。
+/// turn 收场的结果：怎么收场、用量与走过的 step。
 #[derive(Debug)]
 #[must_use]
 pub struct TurnResult {
     pub outcome: Outcome,
     pub usage: TokenUsage,
     pub steps_used: u32,
-    pub unapplied: Vec<Message>,
 }
 
-/// 分阶段 typestate 的 turn 机器：`Turn<AwaitingModel>` →
-/// `Turn<AwaitingTools>` →（回到 `Turn<AwaitingModel>` 或收为
-/// `Turn<Closed>`），每一步转移都消耗当前阶段、交还下一个。
+/// 分阶段 typestate 的 turn 机器：`Turn<Ready>` → `Turn<AwaitingCall>` →
+/// `Turn<AwaitingModel>` → `Turn<AwaitingTools>` →（回到
+/// `Turn<AwaitingCall>` 或收为 `Turn<Closed>`），每一步转移都消耗当前阶段、
+/// 交还下一个。
 #[derive(Debug)]
 pub struct Turn<Phase> {
     context: Context,
     phase: Phase,
+}
+
+/// 以给定结局收场 —— 所有 `Turn<Closed>` 构造的唯一入口。
+fn close(context: Context, outcome: Outcome) -> Turn<Closed> {
+    Turn {
+        context,
+        phase: Closed { outcome },
+    }
 }
 
 impl<Phase> Turn<Phase> {
@@ -164,12 +186,16 @@ mod sealed {
     pub trait Sealed {}
 }
 
+impl sealed::Sealed for Ready {}
+impl sealed::Sealed for AwaitingCall {}
 impl sealed::Sealed for AwaitingModel {}
 impl sealed::Sealed for AwaitingTools {}
 
-/// 尚未收场的阶段 —— 只有这些阶段可以注入消息、增删工具、替换环境。
+/// 尚未收场的阶段 —— 只有这些阶段可以增删工具、替换环境。
 pub trait OpenPhase: sealed::Sealed {}
 
+impl OpenPhase for Ready {}
+impl OpenPhase for AwaitingCall {}
 impl OpenPhase for AwaitingModel {}
 impl OpenPhase for AwaitingTools {}
 
@@ -178,11 +204,6 @@ impl<P: OpenPhase> Turn<P> {
     /// 取走结果。
     fn context_mut(&mut self) -> &mut Context {
         &mut self.context
-    }
-
-    /// 运行中注入一条消息：先缓存，在下一个 step 边界生效。
-    pub fn inject(&mut self, message: Message) {
-        self.context_mut().inject(message);
     }
 
     /// 运行期增加一个工具；重名是 no-op，返回环境是否变化。
@@ -201,29 +222,75 @@ impl<P: OpenPhase> Turn<P> {
     }
 }
 
-impl Turn<AwaitingModel> {
-    /// 开始 turn：把 goal 追加到上下文，并开启第一个 step。
-    pub fn start(mut context: Context, goal: Content) -> Self {
-        context.push_message(Message::User { content: goal });
-        let step = context.begin_step();
+impl Turn<Ready> {
+    /// 构造一个尚未开始的 turn：goal 留在阶段里，不进入上下文。
+    pub fn new(context: Context, goal: Content) -> Self {
         Self {
+            context,
+            phase: Ready { goal },
+        }
+    }
+
+    /// 开局目标（尚未进入上下文）。
+    pub fn goal(&self) -> &Content {
+        &self.phase.goal
+    }
+
+    /// 开始 turn：把 goal 追加到上下文，进入待调用阶段。step 尚未开始计步。
+    pub fn start(self) -> Turn<AwaitingCall> {
+        let Turn { mut context, phase } = self;
+        context.push_message(Message::User {
+            content: phase.goal,
+        });
+        // 预算非零、step 计数为 0：第一步必然放行，fallback 只是把
+        // 这个不变量写成不 panic 的形式。
+        let next = context.next_step_if_allowed().unwrap_or(StepNumber::FIRST);
+        Turn {
+            context,
+            phase: AwaitingCall { next },
+        }
+    }
+}
+
+impl Turn<AwaitingCall> {
+    /// 下一次模型调用的 step 编号（尚未开始计步）。
+    pub fn next_step(&self) -> StepNumber {
+        self.phase.next
+    }
+
+    /// 调用前注入一条消息：立即并入会话。缓冲由宿主维护。
+    pub fn inject(&mut self, message: Message) {
+        self.context.push_message(message);
+    }
+
+    /// 标准的模型输入投影（system + 已生效消息 + 当前工具表）。
+    pub fn prompt(&self) -> Prompt {
+        self.context.prompt()
+    }
+
+    /// 调用模型：开启 step，进入等响应阶段。
+    pub fn call(self) -> Turn<AwaitingModel> {
+        let Turn { mut context, phase } = self;
+        let step = context.begin_step();
+        debug_assert_eq!(step, phase.next, "the pre-call step number drifted");
+        Turn {
             context,
             phase: AwaitingModel { step },
         }
     }
 
+    /// 调用前被打断：收场。
+    pub fn interrupted(self) -> Turn<Closed> {
+        close(self.context, Outcome::Interrupted)
+    }
+}
+
+impl Turn<AwaitingModel> {
     pub fn step(&self) -> StepNumber {
         self.phase.step
     }
 
-    /// 标准的模型输入投影（system + 消息 + 当前工具表）。
-    pub fn prompt(&self) -> Prompt {
-        self.context.prompt()
-    }
-
-    /// 一次模型往返的响应到达：用量落账，随后要么转入工具执行，要么
-    /// **收件箱里有待处理的注入消息且预算允许时注入并开下一个 step**，
-    /// 否则（答复 / 触顶）收场。
+    /// 一次模型往返的响应到达：用量落账，随后要么转入工具执行，要么收场。
     pub fn respond(self, response: LlmResponse) -> Replied {
         let Turn { mut context, phase } = self;
         let LlmResponse { stop_reason, usage } = response;
@@ -248,45 +315,19 @@ impl Turn<AwaitingModel> {
             }
             StopReason::Completed { content } => {
                 context.push_message(Message::Assistant(AssistantMessage::Text(content)));
-                // 收件箱里有话就不收场：注入后在这个 turn 里开下一个 step。
-                // 预算不允许时仍以答复收场，消息原样留给宿主。
-                if context.has_buffered() && context.budget_allows_next() {
-                    context.apply_injections();
-                    let step = context.begin_step();
-                    Replied::Next(Turn {
-                        context,
-                        phase: AwaitingModel { step },
-                    })
-                } else {
-                    Replied::Closed(Turn {
-                        context,
-                        phase: Closed {
-                            outcome: Outcome::Answered,
-                        },
-                    })
-                }
+                Replied::Closed(close(context, Outcome::Answered))
             }
             StopReason::LengthExceeded { content } => {
                 if let Some(content) = content {
                     context.push_message(Message::Assistant(AssistantMessage::Text(content)));
                 }
-                Replied::Closed(Turn {
-                    context,
-                    phase: Closed {
-                        outcome: Outcome::LengthExceeded,
-                    },
-                })
+                Replied::Closed(close(context, Outcome::LengthExceeded))
             }
             StopReason::ContentFiltered { content } => {
                 if let Some(content) = content {
                     context.push_message(Message::Assistant(AssistantMessage::Text(content)));
                 }
-                Replied::Closed(Turn {
-                    context,
-                    phase: Closed {
-                        outcome: Outcome::ContentFiltered,
-                    },
-                })
+                Replied::Closed(close(context, Outcome::ContentFiltered))
             }
         }
     }
@@ -294,12 +335,7 @@ impl Turn<AwaitingModel> {
     /// 用户打断（响应未达）：turn 以 `Interrupted` 收场，上下文里没有
     /// 被丢弃响应的任何痕迹。
     pub fn interrupted(self) -> Turn<Closed> {
-        Turn {
-            context: self.context,
-            phase: Closed {
-                outcome: Outcome::Interrupted,
-            },
-        }
+        close(self.context, Outcome::Interrupted)
     }
 }
 
@@ -328,8 +364,8 @@ impl Turn<AwaitingTools> {
         self.unfinished().next()
     }
 
-    /// 一个结果落位：可能仍在等其他调用，可能结算并启动下一个 step
-    /// （注入在此生效），可能预算耗尽收场。
+    /// 一个结果落位：可能仍在等其他调用，可能结算并进入下一次调用前的
+    /// 待调用阶段，可能预算耗尽收场。
     ///
     /// 只接受未完成槽位且 id 匹配的结果，顺序不限。未知 id 与重复结果
     /// 是驱动契约违例：debug 构建用 `debug_assert` 暴露，release 构建
@@ -353,24 +389,12 @@ impl Turn<AwaitingTools> {
             return Advanced::Ongoing(Turn { context, phase });
         }
 
-        // step 的边界：只有确实要开下一个 step 时，注入才生效；预算耗尽
-        // 时消息留在缓冲里，由 `into_result` 还给宿主。
-        if context.budget_allows_next() {
-            if context.has_buffered() {
-                context.apply_injections();
-            }
-            let step = context.begin_step();
-            Advanced::Next(Turn {
+        match context.next_step_if_allowed() {
+            Some(next) => Advanced::Next(Turn {
                 context,
-                phase: AwaitingModel { step },
-            })
-        } else {
-            Advanced::Closed(Turn {
-                context,
-                phase: Closed {
-                    outcome: Outcome::BudgetExhausted,
-                },
-            })
+                phase: AwaitingCall { next },
+            }),
+            None => Advanced::Closed(close(context, Outcome::BudgetExhausted)),
         }
     }
 
@@ -386,12 +410,7 @@ impl Turn<AwaitingTools> {
                 });
             }
         }
-        Turn {
-            context,
-            phase: Closed {
-                outcome: Outcome::Interrupted,
-            },
-        }
+        close(context, Outcome::Interrupted)
     }
 }
 
@@ -401,15 +420,13 @@ impl Turn<Closed> {
         self.phase.outcome
     }
 
-    /// 取走收场结果的所有权：结果、用量、走过的 step，以及收场时仍未
-    /// 生效的注入消息，一次交清。
+    /// 取走收场结果的所有权：结果、用量与走过的 step，一次交清。
     pub fn into_result(self) -> TurnResult {
-        let Turn { mut context, phase } = self;
+        let Turn { context, phase } = self;
         TurnResult {
             outcome: phase.outcome,
             usage: context.usage(),
             steps_used: context.steps_started(),
-            unapplied: context.take_buffered(),
         }
     }
 }
@@ -420,9 +437,7 @@ impl Turn<Closed> {
 pub enum Replied {
     /// 模型要工具：进入执行阶段（全部调用已交给宿主）。
     Tools(Turn<AwaitingTools>),
-    /// 模型给出答复，但收件箱里有待处理的注入消息：已注入并开了下一个 step。
-    Next(Turn<AwaitingModel>),
-    /// 答复且没有后续输入、输出触顶，或预算不允许再开一个 step：收场。
+    /// 答复、输出触顶，或内容被过滤：收场。
     Closed(Turn<Closed>),
 }
 
@@ -432,8 +447,8 @@ pub enum Replied {
 pub enum Advanced {
     /// 结果落位但未收齐：继续等其余调用。
     Ongoing(Turn<AwaitingTools>),
-    /// 全部落位并结算：注入已生效，下一个模型往返已就绪。
-    Next(Turn<AwaitingModel>),
+    /// 全部落位并结算：下一次模型调用已就绪（尚未 `call`）。
+    Next(Turn<AwaitingCall>),
     /// 预算耗尽：turn 收场。
     Closed(Turn<Closed>),
 }
@@ -517,11 +532,55 @@ mod tests {
     }
 
     #[test]
-    fn start_appends_the_goal_and_opens_the_first_step() {
-        let turn = Turn::start(context(4), content("flip the flag"));
-        assert_eq!(turn.step().get(), 1);
+    fn a_new_turn_keeps_the_goal_out_of_the_context_until_start() {
+        let turn = Turn::new(context(4), content("flip the flag"));
+        assert!(turn.context().messages().is_empty());
+        assert_eq!(turn.context().steps_started(), 0);
+        assert_eq!(turn.goal().as_str(), "flip the flag");
+
+        let turn = turn.start();
         assert_eq!(turn.context().messages(), &[user("flip the flag")]);
+    }
+
+    #[test]
+    fn a_started_turn_waits_for_the_call_without_burning_a_step() {
+        let turn = Turn::new(context(4), content("flip the flag")).start();
+        assert_eq!(turn.next_step().get(), 1);
+        assert_eq!(turn.context().steps_started(), 0);
+        assert_eq!(turn.prompt().input.len(), 2);
+
+        let turn = turn.call();
+        assert_eq!(turn.step().get(), 1);
         assert_eq!(turn.context().steps_started(), 1);
+    }
+
+    #[test]
+    fn injections_are_immediate_before_the_call() {
+        let mut turn = Turn::new(context(4), content("flip")).start();
+        turn.inject(user("early"));
+
+        assert_eq!(turn.context().messages(), &[user("flip"), user("early")]);
+        assert_eq!(turn.prompt().input.len(), 3);
+        assert_eq!(turn.call().step().get(), 1);
+    }
+
+    #[test]
+    fn interrupting_before_the_call_keeps_the_step_count() {
+        let mut turn = Turn::new(context(4), content("flip")).start();
+        turn.inject(user("hold on"));
+        let turn = turn.interrupted();
+
+        assert_eq!(turn.outcome(), Outcome::Interrupted);
+        assert_eq!(turn.context().messages(), &[user("flip"), user("hold on")]);
+        assert_eq!(turn.into_result().steps_used, 0);
+    }
+
+    #[test]
+    fn start_appends_the_goal_before_the_first_call() {
+        let turn = Turn::new(context(4), content("flip the flag")).start();
+        assert_eq!(turn.next_step().get(), 1);
+        assert_eq!(turn.context().messages(), &[user("flip the flag")]);
+        assert_eq!(turn.context().steps_started(), 0);
 
         let prompt = turn.prompt();
         assert_eq!(prompt.input.len(), 2);
@@ -533,7 +592,7 @@ mod tests {
 
     #[test]
     fn a_tool_use_response_hands_out_every_call_at_once() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -553,7 +612,7 @@ mod tests {
 
     #[test]
     fn results_may_arrive_in_any_order() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -570,17 +629,18 @@ mod tests {
         let Advanced::Next(turn) = turn.finish(ToolCallId::new("c1"), output()) else {
             panic!("expected Next");
         };
-        assert_eq!(turn.step().get(), 2);
+        assert_eq!(turn.next_step().get(), 2);
         assert_eq!(tool_results(turn.context()), ["c2", "c1"]);
 
         // system, goal, assistant(tool calls), result c2, result c1
         assert_eq!(turn.prompt().input.len(), 5);
+        assert_eq!(turn.call().step().get(), 2);
     }
 
     #[cfg(not(debug_assertions))]
     #[test]
     fn unknown_and_duplicate_results_are_ignored_in_release() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -607,7 +667,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unknown or already-finished call")]
     fn an_unknown_result_is_a_driver_contract_violation() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
@@ -618,7 +678,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unknown or already-finished call")]
     fn a_duplicate_result_is_a_driver_contract_violation() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -631,7 +691,7 @@ mod tests {
 
     #[test]
     fn duplicate_call_ids_still_complete_without_livelock() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("dup"), call("dup")])))
         else {
             panic!("expected Tools");
@@ -647,7 +707,7 @@ mod tests {
 
     #[test]
     fn an_answer_ends_the_turn() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Closed(turn) = turn.respond(response(completed("done it"))) else {
             panic!("expected Closed");
         };
@@ -659,43 +719,11 @@ mod tests {
         ));
         let result = turn.into_result();
         assert_eq!(result.steps_used, 1);
-        assert!(result.unapplied.is_empty());
-    }
-
-    #[test]
-    fn a_buffered_message_continues_after_an_answer() {
-        let mut turn = Turn::start(context(4), content("flip"));
-        turn.inject(user("one more thing"));
-        let Replied::Next(turn) = turn.respond(response(completed("first answer"))) else {
-            panic!("expected Next");
-        };
-
-        assert_eq!(turn.step().get(), 2);
-        let prompt = turn.prompt();
-        assert!(prompt.input.iter().any(
-            |message| matches!(message, Message::User { content } if content.as_str() == "one more thing")
-        ));
-        assert!(matches!(
-            prompt.input.last(),
-            Some(Message::User { content }) if content.as_str() == "one more thing"
-        ));
-    }
-
-    #[test]
-    fn a_buffered_message_stays_unapplied_when_the_budget_blocks_another_step() {
-        let mut turn = Turn::start(context(1), content("flip"));
-        turn.inject(user("too late"));
-        let Replied::Closed(turn) = turn.respond(response(completed("done"))) else {
-            panic!("expected Closed");
-        };
-        assert_eq!(turn.outcome(), Outcome::Answered);
-        let result = turn.into_result();
-        assert_eq!(result.unapplied, vec![user("too late")]);
     }
 
     #[test]
     fn the_budget_ends_the_turn_after_a_tool_round() {
-        let turn = Turn::start(context(1), content("flip"));
+        let turn = Turn::new(context(1), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
@@ -706,44 +734,27 @@ mod tests {
     }
 
     #[test]
-    fn a_buffered_message_stays_unapplied_when_the_budget_blocks_the_next_tool_step() {
-        let turn = Turn::start(context(1), content("flip"));
-        let Replied::Tools(mut turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
+    fn injections_take_effect_before_the_next_call() {
+        let turn = Turn::new(context(4), content("flip")).start().call();
+        let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
-        turn.inject(user("too late"));
-
-        let Advanced::Closed(turn) = turn.finish(ToolCallId::new("c1"), output()) else {
-            panic!("expected Closed");
-        };
-        assert_eq!(turn.outcome(), Outcome::BudgetExhausted);
-        let result = turn.into_result();
-        assert_eq!(result.unapplied, vec![user("too late")]);
-    }
-
-    #[test]
-    fn injections_take_effect_at_the_tool_boundary() {
-        let turn = Turn::start(context(4), content("flip"));
-        let Replied::Tools(mut turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
-            panic!("expected Tools");
-        };
-        turn.inject(user("also check the tests"));
-        assert_eq!(turn.context().buffered().len(), 1);
-
-        let Advanced::Next(turn) = turn.finish(ToolCallId::new("c1"), output()) else {
+        let Advanced::Next(mut turn) = turn.finish(ToolCallId::new("c1"), output()) else {
             panic!("expected Next");
         };
-        assert!(turn.context().buffered().is_empty());
+        turn.inject(user("also check the tests"));
+
         let prompt = turn.prompt();
         assert!(matches!(
             prompt.input.last(),
             Some(Message::User { content }) if content.as_str() == "also check the tests"
         ));
+        assert_eq!(turn.call().step().get(), 2);
     }
 
     #[test]
     fn length_and_filtered_responses_close_the_turn() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Closed(turn) =
             turn.respond(response(StopReason::LengthExceeded { content: None }))
         else {
@@ -751,7 +762,7 @@ mod tests {
         };
         assert_eq!(turn.outcome(), Outcome::LengthExceeded);
 
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Closed(turn) = turn.respond(response(StopReason::ContentFiltered {
             content: Some(content("partial")),
         })) else {
@@ -765,27 +776,24 @@ mod tests {
     }
 
     #[test]
-    fn interrupting_the_model_wait_leaves_injections_unapplied() {
-        let mut turn = Turn::start(context(4), content("flip"));
-        turn.inject(user("hold on"));
+    fn interrupting_the_model_wait_closes_after_the_call() {
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let turn = turn.interrupted();
         assert_eq!(turn.outcome(), Outcome::Interrupted);
         let result = turn.into_result();
-        assert_eq!(result.unapplied, vec![user("hold on")]);
         assert_eq!(result.steps_used, 1);
     }
 
     #[test]
     fn interrupting_the_tools_fills_synthetic_results() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
         };
-        let Advanced::Ongoing(mut turn) = turn.finish(ToolCallId::new("c1"), output()) else {
+        let Advanced::Ongoing(turn) = turn.finish(ToolCallId::new("c1"), output()) else {
             panic!("expected Ongoing");
         };
-        turn.inject(user("hold on"));
 
         let turn = turn.interrupted();
         assert_eq!(turn.outcome(), Outcome::Interrupted);
@@ -796,19 +804,19 @@ mod tests {
                 if call_id.as_str() == "c2" && output.is_error()
         ));
         let result = turn.into_result();
-        assert_eq!(result.unapplied, vec![user("hold on")]);
+        assert_eq!(result.steps_used, 1);
     }
 
     #[test]
     fn usage_and_steps_accumulate_across_steps() {
-        let turn = Turn::start(context(4), content("flip"));
+        let turn = Turn::new(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
         let Advanced::Next(turn) = turn.finish(ToolCallId::new("c1"), output()) else {
             panic!("expected Next");
         };
-        let Replied::Closed(turn) = turn.respond(response(completed("done"))) else {
+        let Replied::Closed(turn) = turn.call().respond(response(completed("done"))) else {
             panic!("expected Closed");
         };
 
@@ -825,7 +833,7 @@ mod tests {
 
     #[test]
     fn tools_can_be_added_and_removed_while_open() {
-        let mut turn = Turn::start(context(4), content("flip"));
+        let mut turn = Turn::new(context(4), content("flip")).start();
         let spec = ToolSpec::new(
             ToolName::from_str("injected").unwrap(),
             "an injected tool",

@@ -3,7 +3,7 @@
 //! 三个队列分工：
 //!
 //! - `pending`：定向决议（拒绝 / 审批 / 结果替换 / 中止），按检查点取用；
-//! - `injections`：待注入消息，FIFO，驱动排空后交给 core 的注入缓冲；
+//! - `injections`：待注入消息，FIFO，驱动在待调用阶段排空并立即并入会话；
 //! - `tools`：运行期工具变更，按发布顺序应用。
 
 use std::collections::VecDeque;

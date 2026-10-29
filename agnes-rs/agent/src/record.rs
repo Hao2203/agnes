@@ -76,8 +76,8 @@ pub enum Event {
         step: StepNumber,
         outcome: StepOutcome,
     },
-    /// 运行中被注入、在 step 边界生效的消息数量（消息本身紧随其后逐条
-    /// 作为 [`Event::Message`] 入账）。
+    /// 运行中在模型调用前注入的消息数量（消息本身紧随其后逐条作为
+    /// [`Event::Message`] 入账）。
     MessagesInjected { count: usize },
     /// turn 收场 —— 结果就是整个 run 的结果。
     TurnEnd { outcome: Outcome },

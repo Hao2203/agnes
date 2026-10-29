@@ -274,12 +274,13 @@ mod tests {
             agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
         );
         let model = ModelName::from_str("gpt-test").unwrap();
-        let turn = agnes_core::turn::Turn::start(context, Content::try_from("flip").unwrap());
+        let turn = agnes_core::turn::Turn::new(context, Content::try_from("flip").unwrap()).start();
 
         let request = LlmRequest {
             model: model.clone(),
             prompt: turn.prompt(),
         };
+        let turn = turn.call();
         let response = Llm::complete(&openai, &request).await.unwrap();
         let agnes_core::turn::Replied::Tools(turn) = turn.respond(response) else {
             panic!("expected Tools");
@@ -300,6 +301,7 @@ mod tests {
             model: model.clone(),
             prompt: turn.prompt(),
         };
+        let turn = turn.call();
         let response = Llm::complete(&openai, &request).await.unwrap();
         let agnes_core::turn::Replied::Closed(turn) = turn.respond(response) else {
             panic!("expected Closed");

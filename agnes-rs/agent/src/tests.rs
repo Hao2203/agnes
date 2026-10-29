@@ -636,7 +636,7 @@ impl Tool for HangingTool {
 }
 
 #[tokio::test]
-async fn queued_user_message_is_injected_at_the_step_boundary() {
+async fn queued_user_message_joins_the_first_call() {
     let recorder = Arc::new(Recorder::new());
     let llm = ScriptedLlm::new(vec![
         response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
@@ -660,24 +660,27 @@ async fn queued_user_message_is_injected_at_the_step_boundary() {
     assert_eq!(summary.reply().map(Content::as_str), Some("all done"));
     let requests = llm.requests();
     assert_eq!(requests.len(), 2);
-    let second = &requests[1].prompt.input;
-    // system, goal, assistant (tool calls), tool result, injected user
-    assert_eq!(second.len(), 5);
-    assert!(matches!(&second[3], Message::ToolResult { .. }));
+    // 第一次调用前排空并注入：system, goal, injected user
+    let first = &requests[0].prompt.input;
+    assert_eq!(first.len(), 3);
     assert!(matches!(
-        &second[4],
+        &first[2],
         Message::User { content } if content.as_str() == "also update the readme"
     ));
+    // 第二次请求带着完整历史：tool result 在注入消息之后
+    let second = &requests[1].prompt.input;
+    assert_eq!(second.len(), 5);
+    assert!(matches!(&second[4], Message::ToolResult { .. }));
     // 注入事件随日志上报
     assert!(recorded(&sink.0).iter().any(|event| matches!(
         event,
         RecordEvent::MessagesInjected { count } if *count == 1
     )));
-    // 注入的消息属于继续的会话上下文
+    // 注入的消息属于会话上下文
     let messages = messages_of(&summary.log);
     assert_eq!(messages.len(), 5);
     assert!(matches!(
-        messages[3],
+        messages[1],
         Message::User { content } if content.as_str() == "also update the readme"
     ));
     assert!(summary.pending_messages.is_empty());
@@ -779,43 +782,9 @@ async fn interrupt_during_tools_settles_the_whole_batch() {
 }
 
 #[tokio::test]
-async fn a_queued_message_continues_the_turn_after_an_answer() {
+async fn a_queued_message_joins_the_only_allowed_step() {
     let input = FakeInput::new();
-    // 模型还在生成答复时敲进来的插话：收件箱非空 → 同一 turn 续跑
-    input.queue("also update the readme");
-    let llm = ScriptedLlm::new(vec![
-        response(completed("first answer")),
-        response(completed("second answer")),
-    ]);
-    let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
-
-    let mut sink = Collector(Vec::new());
-    let summary = host
-        .run(RunRequest::new(config(4), Log::default(), &mut sink))
-        .await
-        .unwrap();
-
-    let requests = llm.requests();
-    assert_eq!(requests.len(), 2);
-    // 第二次请求看得见这条插话
-    assert!(requests[1].prompt.input.iter().any(
-        |message| matches!(message, Message::User { content } if content.as_str() == "also update the readme")
-    ));
-    assert_eq!(summary.outcome, Outcome::Answered);
-    assert_eq!(summary.reply().map(Content::as_str), Some("second answer"));
-    assert_eq!(summary.steps_used, 2);
-    assert!(summary.pending_messages.is_empty());
-    assert!(recorded(&sink.0).iter().any(|event| matches!(
-        event,
-        RecordEvent::MessagesInjected { count } if *count == 1
-    )));
-}
-
-#[tokio::test]
-async fn a_queued_message_comes_back_when_the_budget_blocks_another_step() {
-    let input = FakeInput::new();
-    // 一步预算：答复后没有余量续跑，插话还给宿主
-    input.queue("too late for this run");
+    input.queue("only for this step");
     let llm = ScriptedLlm::new(vec![response(completed("all done"))]);
     let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
 
@@ -827,21 +796,27 @@ async fn a_queued_message_comes_back_when_the_budget_blocks_another_step() {
 
     assert_eq!(summary.outcome, Outcome::Answered);
     assert_eq!(summary.reply().map(Content::as_str), Some("all done"));
-    // 注入没有进会话；会话里只有 goal 和答复
-    assert_eq!(
-        summary.pending_messages,
-        vec![Message::User {
-            content: Content::try_from("too late for this run").unwrap()
-        }]
-    );
-    assert_eq!(messages_of(&summary.log).len(), 2);
+    // 唯一允许的一步在调用前排空注入，因此消息进了请求与会话。
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].prompt.input.iter().any(
+        |message| matches!(message, Message::User { content } if content.as_str() == "only for this step")
+    ));
+    assert_eq!(summary.steps_used, 1);
+    assert!(summary.pending_messages.is_empty());
+    // goal、注入消息、答复
+    assert_eq!(messages_of(&summary.log).len(), 3);
+    assert!(recorded(&sink.0).iter().any(|event| matches!(
+        event,
+        RecordEvent::MessagesInjected { count } if *count == 1
+    )));
 }
 
 #[tokio::test]
-async fn a_queued_message_comes_back_when_the_budget_blocks_after_a_tool_round() {
+async fn a_queued_message_joins_the_first_call_before_the_budget_runs_out() {
     let recorder = Arc::new(Recorder::new());
     let input = FakeInput::new();
-    input.queue("too late after the tool");
+    input.queue("also check the tests");
     let llm = ScriptedLlm::new(vec![response(tool_use(vec![call(
         "c1",
         "note",
@@ -860,19 +835,19 @@ async fn a_queued_message_comes_back_when_the_budget_blocks_after_a_tool_round()
         .unwrap();
 
     assert_eq!(summary.outcome, Outcome::BudgetExhausted);
-    assert_eq!(
-        summary.pending_messages,
-        vec![Message::User {
-            content: Content::try_from("too late after the tool").unwrap()
-        }]
-    );
-    // goal、工具调用、工具结果；注入没有进会话。
-    assert_eq!(messages_of(&summary.log).len(), 3);
-    assert!(
-        !recorded(&sink.0)
-            .iter()
-            .any(|event| matches!(event, RecordEvent::MessagesInjected { .. }))
-    );
+    assert_eq!(summary.steps_used, 1);
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].prompt.input.iter().any(
+        |message| matches!(message, Message::User { content } if content.as_str() == "also check the tests")
+    ));
+    assert!(summary.pending_messages.is_empty());
+    // goal、注入消息、工具调用、工具结果
+    assert_eq!(messages_of(&summary.log).len(), 4);
+    assert!(recorded(&sink.0).iter().any(|event| matches!(
+        event,
+        RecordEvent::MessagesInjected { count } if *count == 1
+    )));
 }
 
 struct QueueingModel<'a> {
@@ -1021,6 +996,7 @@ impl Plugin for Witness {
 
 #[derive(Clone, Copy)]
 enum Trigger {
+    TurnStart,
     StepStart,
     Requested,
     Finished,
@@ -1032,10 +1008,12 @@ impl Trigger {
     fn matches(self, event: &PluginEvent<'_>) -> bool {
         matches!(
             (self, event),
-            (
-                Self::StepStart,
-                PluginEvent::Record(RecordEvent::StepStart { .. })
-            ) | (Self::Requested, PluginEvent::ToolCallRequested { .. })
+            (Self::TurnStart, PluginEvent::Record(RecordEvent::TurnStart))
+                | (
+                    Self::StepStart,
+                    PluginEvent::Record(RecordEvent::StepStart { .. })
+                )
+                | (Self::Requested, PluginEvent::ToolCallRequested { .. })
                 | (Self::Finished, PluginEvent::ToolCallFinished { .. })
                 | (
                     Self::ApprovalRequested,
@@ -1559,6 +1537,34 @@ async fn an_injection_after_the_turn_closes_is_returned_to_the_host() {
         !recorded(&sink.0)
             .iter()
             .any(|event| matches!(event, RecordEvent::MessagesInjected { .. }))
+    );
+}
+
+#[tokio::test]
+async fn abort_on_turn_start_closes_before_the_first_call() {
+    let llm = ScriptedLlm::new(vec![response(completed("should not be called"))]);
+    let mut host = Host::builder(&llm, &NoInput)
+        .model(model())
+        .plugin(Aborter::new(Trigger::TurnStart))
+        .build()
+        .unwrap();
+
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(config(4), Log::default(), &mut sink))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::Interrupted);
+    assert_eq!(summary.steps_used, 0);
+    assert!(llm.requests().is_empty());
+    assert_eq!(
+        summary.aborted.as_ref().map(|aborted| aborted.by),
+        Some("aborter")
+    );
+    assert_eq!(
+        shape(&recorded(&sink.0)),
+        vec!["header", "message", "turn_start", "turn_end"]
     );
 }
 

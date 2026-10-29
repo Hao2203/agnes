@@ -163,16 +163,18 @@ util ← core ← io ← agent ← cli
 
 ### 关键设计
 
-- **类型状态机**：`Turn<AwaitingModel>` → `Turn<AwaitingTools>` →
-  `Turn<Closed>`；转移消耗当前状态、交还下一个阶段（或携带下一阶段的
-  枚举），阶段本身就是动作提示。`Turn` 持有一个 `Context`（系统提示与
-  工具环境、会话消息、待注入消息、用量、step 记账）；core 不持有日志、
-  不产出事件，驱动读取 `Context` 并自行铸造、记录事件。
+- **类型状态机**：`Turn<Ready>` → `Turn<AwaitingCall>` →
+  `Turn<AwaitingModel>` → `Turn<AwaitingTools>` → `Turn<Closed>`；转移
+  消耗当前状态、交还下一个阶段（或携带下一阶段的枚举），阶段本身就是
+  动作提示。就绪阶段持有 goal，`start` 后把它追加进 `Context`；只有待调用
+  阶段可以注入消息，`call` 才冻结请求、开启 step 并进入等响应阶段。`Turn`
+  持有一个 `Context`（系统提示与工具环境、会话消息、用量、step 记账）；
+  core 不持有日志、不产出事件，驱动读取 `Context` 并自行铸造、记录事件。
 - **宿主扩展内核**：`Plugin` 只有一个处理入口 `on_event`；它看不到派发/
   执行/审批阶段，只返回 `Command`（拒绝 / 审批 / 替换结果 / 注入 / 中止 /
   增删工具）。`Extensions` 把指令收进 outbox，驱动在明确检查点取用：门禁
   前取拒绝与审批、结果入账前取替换、每次模型调用前取工具变更并记录
-  新 header、注入队列交给 core 的注入缓冲。指令里没有 `Allow`，拒绝单调；
+  新 header、注入队列在待调用阶段立即并入会话。指令里没有 `Allow`，拒绝单调；
   长期注册拿 `Registration`，临时注册用 `Scope`（离开作用域逆序撤销）。
   失败 run 里已产生的工具变更对下一 turn 生效；无法执行的定向指令与注入
   丢弃。
