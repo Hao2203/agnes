@@ -740,7 +740,7 @@ mod tests {
         ));
         assert!(matches!(
             &notes[2].event,
-            HostEvent::Aborted { by, reason } if by == "policy" && reason == "stop here"
+            HostEvent::Aborted { by, reason } if by.as_str() == "policy" && reason == "stop here"
         ));
     }
 

@@ -88,7 +88,7 @@ impl PermissionPlugin {
 }
 
 impl Plugin for PermissionPlugin {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "permission"
     }
 
@@ -142,7 +142,7 @@ impl PolicyBundle {
 }
 
 impl Bundle for PolicyBundle {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "permission"
     }
 
@@ -151,7 +151,7 @@ impl Bundle for PolicyBundle {
             for rule in self.rules.deny.iter().chain(&self.rules.ask) {
                 if !host.tools().names().any(|name| rule.matches(name)) {
                     return Err(LoadError::UnknownTool {
-                        bundle: self.name(),
+                        bundle: self.name().into(),
                         rule: rule.to_string(),
                     });
                 }
@@ -159,7 +159,7 @@ impl Bundle for PolicyBundle {
         }
         if !self.rules.ask.is_empty() && !host.has_approvals() {
             return Err(LoadError::AskWithoutApprovals {
-                bundle: self.name(),
+                bundle: self.name().into(),
             });
         }
         host.extensions_mut()

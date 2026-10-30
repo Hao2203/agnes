@@ -1,8 +1,9 @@
 use super::*;
 use crate::record::Event as RecordEvent;
-use agnes_core::content::Content;
-use agnes_core::message::{ToolArguments, ToolCall, ToolCallId, ToolOutput};
+use crate::test_support::{assistant, user};
+use agnes_core::message::{Message, ToolArguments, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::tool::ToolName;
+use std::cell::Cell;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +26,7 @@ struct Seen {
 }
 
 impl Plugin for Seen {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.name
     }
 
@@ -41,7 +42,7 @@ struct Denier {
 }
 
 impl Plugin for Denier {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.by
     }
 
@@ -59,7 +60,7 @@ impl Plugin for Denier {
 struct Asker;
 
 impl Plugin for Asker {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "asker"
     }
 
@@ -81,7 +82,7 @@ struct Blocker {
 }
 
 impl Plugin for Blocker {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.by
     }
 
@@ -101,7 +102,7 @@ struct Aborter {
 }
 
 impl Plugin for Aborter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "aborter"
     }
 
@@ -115,7 +116,7 @@ impl Plugin for Aborter {
 struct Injector;
 
 impl Plugin for Injector {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "injector"
     }
 
@@ -123,10 +124,103 @@ impl Plugin for Injector {
         match event {
             PluginEvent::Record(RecordEvent::TurnStart) => vec![
                 Command::InjectMessage {
-                    content: Content::try_from("first").unwrap(),
+                    message: user("first"),
                 },
                 Command::InjectMessage {
-                    content: Content::try_from("second").unwrap(),
+                    message: user("second"),
+                },
+            ],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 注入一条非用户消息：角色必须原样保留。
+struct AssistantInjector;
+
+impl Plugin for AssistantInjector {
+    fn name(&self) -> &str {
+        "assistant-injector"
+    }
+
+    fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
+        match event {
+            PluginEvent::Record(RecordEvent::TurnStart) => vec![Command::InjectMessage {
+                message: assistant("prefilled"),
+            }],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 运行时装上的插件：名字在装载时才确定。
+struct RuntimeNamed {
+    name: String,
+}
+
+impl Plugin for RuntimeNamed {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
+        match event {
+            PluginEvent::ToolCallRequested { call } => vec![Command::Deny {
+                call: call.id.clone(),
+                reason: "denied at runtime".into(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 名字在运行时可变：内核应继续使用注册时捕获的名字。
+struct Renamable {
+    name: Cell<&'static str>,
+}
+
+impl Plugin for Renamable {
+    fn name(&self) -> &str {
+        self.name.get()
+    }
+
+    fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
+        match event {
+            PluginEvent::Record(_) => {
+                self.name.set("renamed");
+                Vec::new()
+            }
+            PluginEvent::ToolCallRequested { call } => vec![Command::Deny {
+                call: call.id.clone(),
+                reason: "no".into(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 运行期命名，一次返回注入、挡回与中止。
+struct RuntimeEverything {
+    name: String,
+}
+
+impl Plugin for RuntimeEverything {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
+        match event {
+            PluginEvent::ToolCallRequested { call } => vec![
+                Command::InjectMessage {
+                    message: user("note"),
+                },
+                Command::ReplaceResult {
+                    call: call.id.clone(),
+                    feedback: "blocked".into(),
+                },
+                Command::Abort {
+                    reason: "stop".into(),
                 },
             ],
             _ => Vec::new(),
@@ -165,7 +259,7 @@ fn ask_is_overridden_by_a_deny() {
     assert_eq!(
         extensions.gate(&call.id),
         Gate::Deny(Denied {
-            by: "denier",
+            by: "denier".into(),
             reason: "never on sundays".into(),
         })
     );
@@ -208,7 +302,7 @@ fn the_first_deny_by_order_wins() {
     assert_eq!(
         extensions.gate(&call.id),
         Gate::Deny(Denied {
-            by: "first",
+            by: "first".into(),
             reason: "first reason".into(),
         })
     );
@@ -312,7 +406,7 @@ fn the_first_block_wins() {
         output: &output,
     });
     let blocked = extensions.replacement(&call.id).unwrap();
-    assert_eq!(blocked.by, "blocking");
+    assert_eq!(blocked.by.as_str(), "blocking");
     assert_eq!(blocked.feedback, "looks wrong");
     // 其他调用的结果替换不会被这条事件消费
     assert_eq!(extensions.replacement(&ToolCallId::new("other")), None);
@@ -334,7 +428,7 @@ fn commands_for_other_calls_stay_queued() {
     assert_eq!(
         extensions.gate(&second.id),
         Gate::Deny(Denied {
-            by: "denier",
+            by: "denier".into(),
             reason: "no".into(),
         })
     );
@@ -347,11 +441,22 @@ fn injections_are_fifo() {
     extensions.publish(&PluginEvent::Record(&RecordEvent::TurnStart));
 
     let first = extensions.take_injection().unwrap();
-    assert_eq!(first.by(), "injector");
-    assert_eq!(first.content().as_str(), "first");
+    assert_eq!(first.by().as_str(), "injector");
+    assert!(matches!(first.message(), Message::User { content } if content.as_str() == "first"));
     let second = extensions.take_injection().unwrap();
-    assert_eq!(second.content().as_str(), "second");
+    assert!(matches!(second.message(), Message::User { content } if content.as_str() == "second"));
     assert!(extensions.take_injection().is_none());
+}
+
+#[test]
+fn an_injection_keeps_the_message_role() {
+    let mut extensions = Extensions::new();
+    extensions.register(AssistantInjector);
+    extensions.publish(&PluginEvent::Record(&RecordEvent::TurnStart));
+
+    let queued = extensions.take_injection().unwrap();
+    assert_eq!(queued.by().as_str(), "assistant-injector");
+    assert_eq!(queued.message(), &assistant("prefilled"));
 }
 
 #[test]
@@ -373,7 +478,7 @@ fn the_first_abort_wins() {
     extensions.publish(&requested(&call));
 
     let aborted = extensions.abort().unwrap();
-    assert_eq!(aborted.by, "aborter");
+    assert_eq!(aborted.by.as_str(), "aborter");
     assert_eq!(aborted.reason, "first reason");
     assert!(extensions.abort().is_none());
 }
@@ -390,4 +495,80 @@ fn a_consumed_deny_does_not_fire_again() {
     assert!(matches!(extensions.gate(&call.id), Gate::Deny(_)));
     // 同一个检查点不会重复消费同一条拒绝
     assert_eq!(extensions.gate(&call.id), Gate::Allow);
+}
+
+#[test]
+fn an_origin_holds_both_static_and_runtime_names() {
+    let literal: Origin = "denier".into();
+    let owned: Origin = String::from("denier").into();
+    assert_eq!(literal, owned);
+    assert_eq!(literal.as_str(), "denier");
+    assert_eq!(literal.to_string(), "denier");
+    assert_eq!(format!("{literal:?}"), r#"Origin("denier")"#);
+    assert_eq!(literal.clone(), literal);
+
+    // 长名字引用计数：克隆共享同一份分配。
+    let long: Origin = "a runtime plugin name longer than one word".into();
+    assert_eq!(long.as_str().as_ptr(), long.clone().as_str().as_ptr());
+}
+
+#[test]
+fn a_runtime_name_reaches_the_gate() {
+    let mut extensions = Extensions::new();
+    extensions.register(RuntimeNamed {
+        name: "memory@1.2".into(),
+    });
+    assert_eq!(extensions.names().collect::<Vec<_>>(), vec!["memory@1.2"]);
+
+    let call = call("c1", "note");
+    extensions.publish(&requested(&call));
+    assert_eq!(
+        extensions.gate(&call.id),
+        Gate::Deny(Denied {
+            by: "memory@1.2".into(),
+            reason: "denied at runtime".into(),
+        })
+    );
+}
+
+#[test]
+fn the_name_is_fixed_at_registration() {
+    let mut extensions = Extensions::new();
+    extensions.register(Renamable {
+        name: Cell::new("original"),
+    });
+
+    // 事件把插件内部的名字改掉，注册名不该跟着变。
+    extensions.publish(&PluginEvent::Record(&RecordEvent::TurnStart));
+    let call = call("c1", "note");
+    extensions.publish(&requested(&call));
+
+    assert_eq!(extensions.names().collect::<Vec<_>>(), vec!["original"]);
+    assert_eq!(
+        extensions.gate(&call.id),
+        Gate::Deny(Denied {
+            by: "original".into(),
+            reason: "no".into(),
+        })
+    );
+}
+
+#[test]
+fn a_runtime_name_reaches_every_queue() {
+    let mut extensions = Extensions::new();
+    extensions.register(RuntimeEverything {
+        name: "memory@1.2".into(),
+    });
+    let call = call("c1", "note");
+    extensions.publish(&requested(&call));
+
+    assert_eq!(
+        extensions.take_injection().unwrap().by().as_str(),
+        "memory@1.2"
+    );
+    assert_eq!(
+        extensions.replacement(&call.id).unwrap().by.as_str(),
+        "memory@1.2"
+    );
+    assert_eq!(extensions.abort().unwrap().by.as_str(), "memory@1.2");
 }

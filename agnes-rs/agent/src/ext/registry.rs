@@ -4,14 +4,17 @@ use agnes_core::message::ToolCallId;
 
 use super::command::{QueuedMessage, ToolChange};
 use super::decision::{Aborted, Blocked, Gate};
+use super::origin::Origin;
 use super::outbox::Outbox;
 use super::plugin::{Plugin, PluginEvent};
 
-/// 一个插件槽位；`order` 小的先被问询，同序按注册先后。
+/// 一个插件槽位；`order` 小的先被问询，同序按注册先后。名字在注册时
+/// 捕获，之后不再向插件查询 —— 注册名就是身份。
 struct Slot {
     order: i32,
     seq: u64,
     id: u64,
+    name: Origin,
     plugin: Box<dyn Plugin>,
 }
 
@@ -47,10 +50,12 @@ impl Extensions {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.next_id += 1;
+        let name = Origin::new(plugin.name());
         let slot = Slot {
             order,
             seq,
             id,
+            name,
             plugin: Box::new(plugin),
         };
         let at = self
@@ -81,8 +86,8 @@ impl Extensions {
     }
 
     /// 已注册插件的名字，按问询顺序。
-    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.slots.iter().map(|slot| slot.plugin.name())
+    pub fn names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.slots.iter().map(|slot| slot.name.as_str())
     }
 
     /// 把一条事件按序分发给所有插件，指令进入各自的队列。
@@ -91,9 +96,10 @@ impl Extensions {
     pub fn publish(&mut self, event: &PluginEvent<'_>) {
         let Self { slots, outbox, .. } = self;
         for slot in slots {
-            let by = slot.plugin.name();
             let commands = slot.plugin.on_event(event);
-            outbox.issue(by, commands);
+            if !commands.is_empty() {
+                outbox.issue(slot.name.clone(), commands);
+            }
         }
     }
 

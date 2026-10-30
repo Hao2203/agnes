@@ -46,7 +46,7 @@ impl FsBundle {
 }
 
 impl Bundle for FsBundle {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "fs-tools"
     }
 

@@ -14,6 +14,7 @@
 mod bundle;
 mod command;
 mod decision;
+mod origin;
 mod outbox;
 mod plugin;
 mod registry;
@@ -21,6 +22,7 @@ mod registry;
 pub use bundle::{Bundle, Empty};
 pub use command::{Command, QueuedMessage, ToolChange};
 pub use decision::{Aborted, ApprovalOutcome, Blocked, Denied, Gate};
+pub use origin::Origin;
 pub use plugin::{Plugin, PluginEvent};
 pub use registry::{Extensions, Registration, Scope};
 

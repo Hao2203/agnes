@@ -403,7 +403,7 @@ impl From<&HostEvent> for WireHostEvent {
                 outcome: (*outcome).into(),
             },
             HostEvent::Aborted { by, reason } => Self::Aborted {
-                by: by.clone(),
+                by: by.as_str().to_owned(),
                 reason: reason.clone(),
             },
             HostEvent::Failed { cause } => Self::Failed {
@@ -612,7 +612,10 @@ impl TryFrom<WireHostEvent> for HostEvent {
                 call_id: ToolCallId::new(call_id),
                 outcome: outcome.into(),
             },
-            WireHostEvent::Aborted { by, reason } => Self::Aborted { by, reason },
+            WireHostEvent::Aborted { by, reason } => Self::Aborted {
+                by: by.into(),
+                reason,
+            },
             WireHostEvent::Failed { cause } => Self::Failed { cause },
         })
     }

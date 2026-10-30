@@ -44,7 +44,7 @@ use agnes_io::llm::LlmError;
 use jiff::Timestamp;
 
 use approval::ApprovalOutcome;
-use ext::{Aborted, Denied};
+use ext::{Aborted, Denied, Origin};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -133,7 +133,7 @@ pub enum Event {
     /// 插件中止了 run；turn 以 [`Outcome::Interrupted`] 收场，原因在这里。
     Aborted {
         at: Timestamp,
-        by: &'static str,
+        by: Origin,
         reason: String,
     },
     Finished {
@@ -197,5 +197,7 @@ impl RunSummary {
     }
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

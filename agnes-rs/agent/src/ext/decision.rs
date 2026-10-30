@@ -1,5 +1,7 @@
 //! 系统侧的决议词汇：插件只表达意图，系统折叠成可执行结果。
 
+use super::origin::Origin;
+
 /// 门禁检查点的系统决议。
 ///
 /// 插件侧没有 `Allow`：放行是「无人拒绝且无人要求审批」的系统默认，
@@ -17,8 +19,8 @@ pub enum Gate {
 /// 一次拒绝：谁拒的、为什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Denied {
-    /// 拒绝者（插件名），由内核从 [`Plugin::name`](crate::ext::Plugin::name) 盖章。
-    pub by: &'static str,
+    /// 拒绝者（注册时捕获的插件名）。
+    pub by: Origin,
     /// 理由（随合成结果一起给到模型）。
     pub reason: String,
 }
@@ -26,8 +28,8 @@ pub struct Denied {
 /// 挡回后的系统决议。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
-    /// 挡回者（插件名）。
-    pub by: &'static str,
+    /// 挡回者（注册时捕获的插件名）。
+    pub by: Origin,
     /// 入账的反馈。
     pub feedback: String,
 }
@@ -35,8 +37,8 @@ pub struct Blocked {
 /// 一次插件中止：谁中止的、为什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Aborted {
-    /// 中止者（插件名），由内核盖章。
-    pub by: &'static str,
+    /// 中止者（注册时捕获的插件名）。
+    pub by: Origin,
     /// 中止原因（随宿主事件一起落盘/上报）。
     pub reason: String,
 }

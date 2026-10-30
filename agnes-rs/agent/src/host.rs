@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use agnes_core::config::ModelName;
 use agnes_core::context::Context;
-use agnes_core::message::Message;
 use agnes_core::turn::{AgentConfig, Turn};
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
@@ -19,7 +18,7 @@ use jiff::Timestamp;
 
 use crate::approval::ApprovalChannel;
 use crate::driver::{Driver, Outlets, Ports, Start};
-use crate::ext::{Bundle, Extensions, Plugin};
+use crate::ext::{Bundle, Extensions, Origin, Plugin};
 use crate::{
     AgentError, Event, Log, RequestBuilder, RunSummary, SessionLog, Sink, StandardRequestBuilder,
 };
@@ -32,10 +31,10 @@ pub enum LoadError {
     MissingModel,
     /// 一条永远不可能命中的规则（工具名拼错、前缀无人匹配）。
     #[error("bundle `{bundle}` has a rule that can never fire: {rule}")]
-    UnknownTool { bundle: &'static str, rule: String },
+    UnknownTool { bundle: Origin, rule: String },
     /// 配了 ask 规则，却没有接审批口 —— 运行期只会全部失败。
     #[error("bundle `{bundle}` asks for approval, but no approval channel is wired")]
-    AskWithoutApprovals { bundle: &'static str },
+    AskWithoutApprovals { bundle: Origin },
     #[error(transparent)]
     DuplicateTool(#[from] DuplicateTool),
 }
@@ -211,9 +210,7 @@ impl<'a> Host<'a> {
             .extensions
             .take_pending_injections()
             .into_iter()
-            .map(|queued| Message::User {
-                content: queued.into_content(),
-            })
+            .map(|queued| queued.into_message())
             .collect();
         let summary = RunSummary {
             outcome: result.outcome,

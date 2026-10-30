@@ -10,6 +10,7 @@ agnes-core.workspace = true
 agnes-io.workspace = true
 agnes-util.workspace = true
 async-trait.workspace = true
+cold-string.workspace = true
 jiff.workspace = true
 thiserror.workspace = true
 serde.workspace = true

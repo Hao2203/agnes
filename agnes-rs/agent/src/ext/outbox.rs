@@ -12,10 +12,11 @@ use agnes_core::message::ToolCallId;
 
 use super::command::{Command, QueuedMessage, ToolChange};
 use super::decision::{Aborted, Blocked, Denied, Gate};
+use super::origin::Origin;
 
 /// 一条带来源的定向指令；来源由内核盖章，插件无法伪造。
 struct Issued {
-    by: &'static str,
+    by: Origin,
     command: Command,
 }
 
@@ -29,15 +30,19 @@ pub(super) struct Outbox {
 
 impl Outbox {
     /// 收下某插件对一次事件返回的全部指令。
-    pub(super) fn issue(&mut self, by: &'static str, commands: Vec<Command>) {
+    pub(super) fn issue(&mut self, by: Origin, commands: Vec<Command>) {
         for command in commands {
             match command {
-                Command::InjectMessage { content } => {
-                    self.injections.push_back(QueuedMessage::new(by, content));
+                Command::InjectMessage { message } => {
+                    self.injections
+                        .push_back(QueuedMessage::new(by.clone(), message));
                 }
                 Command::AddTool { tool } => self.tools.push(ToolChange::Add(tool)),
                 Command::RemoveTool { name } => self.tools.push(ToolChange::Remove(name)),
-                command => self.pending.push(Issued { by, command }),
+                command => self.pending.push(Issued {
+                    by: by.clone(),
+                    command,
+                }),
             }
         }
     }
@@ -71,7 +76,7 @@ impl Outbox {
                     if target == call
             )
         });
-        let mut denied: Option<(&'static str, String)> = None;
+        let mut denied: Option<(Origin, String)> = None;
         let mut ask = false;
         for issued in matched {
             match issued.command {

@@ -10,6 +10,7 @@ dependencies = [
  "agnes-io",
  "agnes-util",
  "async-trait",
+ "cold-string",
  "http",
  "jiff",
  "serde",

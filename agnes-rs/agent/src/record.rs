@@ -15,6 +15,7 @@ use agnes_core::tool::ToolName;
 use agnes_core::turn::{Outcome, StepNumber};
 
 use crate::approval::ApprovalOutcome;
+use crate::ext::Origin;
 
 /// 一个 step 的结局。只属于记录词汇：core 不再需要它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +96,7 @@ pub enum HostEvent {
     },
     /// A plugin aborted the run; the turn closes as interrupted, but the
     /// cause belongs to the host, not to core.
-    Aborted { by: String, reason: String },
+    Aborted { by: Origin, reason: String },
     /// The run stopped with an error (model, transport or session write).
     /// Core does not model I/O failures, so the cause lives here.
     Failed { cause: String },

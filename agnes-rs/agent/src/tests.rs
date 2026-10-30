@@ -3,6 +3,7 @@ use crate::approval::ApprovalChannel;
 use crate::ext::{Command, Plugin, PluginEvent};
 use crate::permission::{PermissionPlugin, PermissionRules, Rule};
 use crate::record::{Event as RecordEvent, HostEvent};
+use crate::test_support::{assistant, user};
 use agnes_core::config::{StepBudget, SystemPrompt};
 use agnes_core::context::Context;
 use agnes_core::header::{Environment, Header};
@@ -1046,7 +1047,7 @@ impl Witness {
 }
 
 impl Plugin for Witness {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "witness"
     }
 
@@ -1129,7 +1130,7 @@ impl Aborter {
 }
 
 impl Plugin for Aborter {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "aborter"
     }
 
@@ -1147,22 +1148,22 @@ impl Plugin for Aborter {
 /// 在指定事件上入队一条注入。
 struct Injector {
     trigger: Trigger,
-    content: &'static str,
+    message: Message,
     fired: bool,
 }
 
 impl Injector {
-    fn new(trigger: Trigger, content: &'static str) -> Self {
+    fn new(trigger: Trigger, message: Message) -> Self {
         Self {
             trigger,
-            content,
+            message,
             fired: false,
         }
     }
 }
 
 impl Plugin for Injector {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "injector"
     }
 
@@ -1172,8 +1173,28 @@ impl Plugin for Injector {
         }
         self.fired = true;
         vec![Command::InjectMessage {
-            content: Content::try_from(self.content).unwrap(),
+            message: self.message.clone(),
         }]
+    }
+}
+
+/// 运行期命名的中止插件。
+struct RuntimeAborter {
+    name: String,
+}
+
+impl Plugin for RuntimeAborter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn on_event(&mut self, event: &PluginEvent<'_>) -> Vec<Command> {
+        if matches!(event, PluginEvent::Record(RecordEvent::TurnStart)) {
+            return vec![Command::Abort {
+                reason: "runtime stop".into(),
+            }];
+        }
+        Vec::new()
     }
 }
 
@@ -1195,7 +1216,7 @@ impl AddToolOn {
 }
 
 impl Plugin for AddToolOn {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "tool-injector"
     }
 
@@ -1228,7 +1249,7 @@ impl RemoveToolOn {
 }
 
 impl Plugin for RemoveToolOn {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "tool-remover"
     }
 
@@ -1343,7 +1364,7 @@ async fn denied_tool_never_runs_and_the_model_carries_on() {
         sink.0
             .iter()
             .any(|event| matches!(event, Event::ToolGated { denied, .. }
-            if denied.by == "permission" && denied.reason.contains("denied by policy")))
+            if denied.by.as_str() == "permission" && denied.reason.contains("denied by policy")))
     );
     assert!(matches!(summary.outcome, Outcome::Answered));
     // 事件序列与一次真实工具往返一致（core 视角无法区分拒绝）
@@ -1573,7 +1594,7 @@ async fn a_plugin_injection_reaches_the_next_request() {
     ]);
     let mut host = Host::builder(&llm, &NoInput)
         .model(model())
-        .plugin(Injector::new(Trigger::Finished, "remember the note"))
+        .plugin(Injector::new(Trigger::Finished, user("remember the note")))
         .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
         .build()
         .unwrap();
@@ -1598,11 +1619,56 @@ async fn a_plugin_injection_reaches_the_next_request() {
 }
 
 #[tokio::test]
-async fn an_injection_after_the_turn_closes_is_returned_to_the_host() {
-    let llm = ScriptedLlm::new(vec![response(completed("done"))]);
+async fn an_injected_message_keeps_its_role() {
+    let recorder = Arc::new(Recorder::new());
+    let llm = ScriptedLlm::new(vec![
+        response(tool_use(vec![call("c1", "note", r#"{"text":"hi"}"#)])),
+        response(completed("done")),
+    ]);
+    let injected = assistant("a prefilled assistant turn");
     let mut host = Host::builder(&llm, &NoInput)
         .model(model())
-        .plugin(Injector::new(Trigger::TurnEnd, "too late"))
+        .plugin(Injector::new(Trigger::Finished, injected.clone()))
+        .tool(Arc::clone(&recorder) as Arc<dyn Tool>)
+        .build()
+        .unwrap();
+    let config = config_with(host.tools().specs(), 8);
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(config, Log::default(), &mut sink))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::Answered);
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    // 第二次请求里原样保留角色，没有被包成 User。
+    assert!(
+        requests[1]
+            .prompt
+            .input
+            .iter()
+            .any(|message| message == &injected)
+    );
+    assert!(
+        recorded(&sink.0)
+            .iter()
+            .any(|event| matches!(event, RecordEvent::Message(message) if message == &injected))
+    );
+    assert!(recorded(&sink.0).iter().any(|event| matches!(
+        event,
+        RecordEvent::MessagesInjected { count } if *count == 1
+    )));
+    assert!(summary.pending_messages.is_empty());
+}
+
+#[tokio::test]
+async fn an_injection_after_the_turn_closes_is_returned_to_the_host() {
+    let llm = ScriptedLlm::new(vec![response(completed("done"))]);
+    let injected = assistant("too late");
+    let mut host = Host::builder(&llm, &NoInput)
+        .model(model())
+        .plugin(Injector::new(Trigger::TurnEnd, injected.clone()))
         .build()
         .unwrap();
     let config = config_with(host.tools().specs(), 4);
@@ -1613,16 +1679,41 @@ async fn an_injection_after_the_turn_closes_is_returned_to_the_host() {
         .unwrap();
 
     assert_eq!(summary.outcome, Outcome::Answered);
-    assert_eq!(
-        summary.pending_messages,
-        vec![Message::User {
-            content: Content::try_from("too late").unwrap()
-        }]
-    );
+    assert_eq!(summary.pending_messages, vec![injected]);
     assert!(
         !recorded(&sink.0)
             .iter()
             .any(|event| matches!(event, RecordEvent::MessagesInjected { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_runtime_named_plugin_aborts_with_its_registered_name() {
+    let llm = ScriptedLlm::new(vec![response(completed("should not be called"))]);
+    let mut host = Host::builder(&llm, &NoInput)
+        .model(model())
+        .plugin(RuntimeAborter {
+            name: "memory@1.2".into(),
+        })
+        .build()
+        .unwrap();
+
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(config(4), Log::default(), &mut sink))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::Interrupted);
+    assert!(llm.requests().is_empty());
+    assert_eq!(
+        summary.aborted.as_ref().map(|aborted| aborted.by.as_str()),
+        Some("memory@1.2")
+    );
+    assert!(
+        sink.0
+            .iter()
+            .any(|event| matches!(event, Event::Aborted { by, .. } if by.as_str() == "memory@1.2"))
     );
 }
 
@@ -1645,7 +1736,7 @@ async fn abort_on_turn_start_closes_before_the_first_call() {
     assert_eq!(summary.steps_used, 0);
     assert!(llm.requests().is_empty());
     assert_eq!(
-        summary.aborted.as_ref().map(|aborted| aborted.by),
+        summary.aborted.as_ref().map(|aborted| aborted.by.as_str()),
         Some("aborter")
     );
     assert_eq!(
@@ -1672,7 +1763,7 @@ async fn abort_on_step_start_stops_before_the_model_call() {
     assert_eq!(summary.outcome, Outcome::Interrupted);
     assert!(llm.requests().is_empty());
     assert_eq!(
-        summary.aborted.as_ref().map(|aborted| aborted.by),
+        summary.aborted.as_ref().map(|aborted| aborted.by.as_str()),
         Some("aborter")
     );
     assert_eq!(
@@ -1718,7 +1809,7 @@ async fn abort_before_dispatch_never_runs_the_tool() {
 
     assert_eq!(summary.outcome, Outcome::Interrupted);
     assert_eq!(
-        summary.aborted.as_ref().map(|aborted| aborted.by),
+        summary.aborted.as_ref().map(|aborted| aborted.by.as_str()),
         Some("aborter")
     );
     assert!(recorder.calls.lock().unwrap().is_empty());
@@ -1726,14 +1817,14 @@ async fn abort_before_dispatch_never_runs_the_tool() {
     assert!(
         sink.0
             .iter()
-            .any(|event| matches!(event, Event::Aborted { by, .. } if *by == "aborter"))
+            .any(|event| matches!(event, Event::Aborted { by, .. } if by.as_str() == "aborter"))
     );
     assert!(
         notes
             .lock()
             .unwrap()
             .iter()
-            .any(|note| matches!(note, HostEvent::Aborted { by, .. } if by == "aborter"))
+            .any(|note| matches!(note, HostEvent::Aborted { by, .. } if by.as_str() == "aborter"))
     );
     // 未执行的调用仍有一条 not_run 结果，会话完整。
     assert!(matches!(

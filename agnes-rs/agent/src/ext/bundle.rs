@@ -12,7 +12,7 @@ use crate::host::{Host, LoadError};
 /// 一组可复用的注册与校验。
 pub trait Bundle {
     /// 装载单元的名字，用于错误信息。
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// 把注册装进宿主；校验失败即中止装配。
     ///
@@ -27,7 +27,7 @@ pub trait Bundle {
 pub struct Empty;
 
 impl Bundle for Empty {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "empty"
     }
 

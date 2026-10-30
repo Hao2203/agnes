@@ -34,7 +34,7 @@ use jiff::Timestamp;
 use tokio::sync::oneshot::Receiver as AnswerReceiver;
 
 use crate::approval::{ApprovalOutcome, ApprovalRequest};
-use crate::ext::{Aborted, Denied, Gate, PluginEvent};
+use crate::ext::{Aborted, Denied, Gate, Origin, PluginEvent};
 use crate::log::Log;
 use crate::record::{Event as RecordEvent, HostEvent, StepOutcome};
 use crate::session::SessionError;
@@ -328,8 +328,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                     {
                         self.publish(&PluginEvent::ToolResultBlocked {
                             call: &call,
-                            by: blocked.by,
-                            feedback: &blocked.feedback,
+                            blocked: &blocked,
                         });
                         ToolOutput::error(blocked.feedback)
                     } else {
@@ -520,7 +519,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                 {
                     Resolution::Interrupted => Ok(GateOutcome::Interrupted),
                     Resolution::Denied { detail, .. } => Ok(GateOutcome::Denied(Denied {
-                        by: APPROVAL_DENIER,
+                        by: Origin::new(APPROVAL_DENIER),
                         reason: detail.into(),
                     })),
                     Resolution::Allowed => {
@@ -606,9 +605,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     /// 排空插件注入队列，立即并入会话。
     fn drain_injections(&mut self, turn: &mut Turn<AwaitingCall>) {
         while let Some(queued) = self.ports.extensions.take_injection() {
-            turn.inject(Message::User {
-                content: queued.into_content(),
-            });
+            turn.inject(queued.into_message());
         }
     }
 
@@ -625,13 +622,13 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
             return Ok(None);
         };
         self.record_host(HostEvent::Aborted {
-            by: aborted.by.to_owned(),
+            by: aborted.by.clone(),
             reason: aborted.reason.clone(),
         })
         .await?;
         self.outlets.sink.event(&Event::Aborted {
             at: Timestamp::now(),
-            by: aborted.by,
+            by: aborted.by.clone(),
             reason: aborted.reason.clone(),
         });
         self.aborted = Some(aborted.clone());
@@ -730,7 +727,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         })
         .await?;
         Ok(Denied {
-            by: APPROVAL_DENIER,
+            by: Origin::new(APPROVAL_DENIER),
             reason,
         })
     }

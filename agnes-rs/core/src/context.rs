@@ -48,7 +48,9 @@ impl Context {
         &self.header
     }
 
-    /// 会话消息，按发生顺序（不含 system prompt）。
+    /// 会话消息，按发生顺序；header 的系统提示不在这里，由
+    /// [`Context::prompt`] 投影为第一条。`System` 消息与其他角色一样，
+    /// 只是普通会话消息的一种。
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }

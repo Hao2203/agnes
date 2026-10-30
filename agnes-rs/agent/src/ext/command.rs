@@ -7,10 +7,11 @@
 use std::fmt;
 use std::sync::Arc;
 
-use agnes_core::content::Content;
-use agnes_core::message::ToolCallId;
+use agnes_core::message::{Message, ToolCallId};
 use agnes_core::tool::ToolName;
 use agnes_io::tool::{Tool, ToolRegistry};
+
+use super::origin::Origin;
 
 /// 插件对一次事件表达的意图。
 ///
@@ -23,8 +24,9 @@ pub enum Command {
     RequireApproval { call: ToolCallId },
     /// 挡回一次工具结果：入账的是反馈（仍是一条错误结果）。
     ReplaceResult { call: ToolCallId, feedback: String },
-    /// 向会话注入一条用户消息；由系统放进注入队列，在 step 边界生效。
-    InjectMessage { content: Content },
+    /// 向会话注入一条消息（任意角色）；由系统放进注入队列，在 step 边界
+    /// 生效，模型看到的角色与这里一致。
+    InjectMessage { message: Message },
     /// 中止整个 run。收场复用 core 的 `interrupted`。
     Abort { reason: String },
     /// 运行期注入一个工具；系统在下一个模型调用前应用并记录新 header。
@@ -50,9 +52,9 @@ impl fmt::Debug for Command {
                 .field("call", call)
                 .field("feedback", feedback)
                 .finish(),
-            Self::InjectMessage { content } => f
+            Self::InjectMessage { message } => f
                 .debug_struct("InjectMessage")
-                .field("content", content)
+                .field("message", message)
                 .finish(),
             Self::Abort { reason } => f.debug_struct("Abort").field("reason", reason).finish(),
             Self::AddTool { tool } => f
@@ -67,29 +69,29 @@ impl fmt::Debug for Command {
 /// 注入队列里的一条消息。
 #[derive(Debug)]
 pub struct QueuedMessage {
-    by: &'static str,
-    content: Content,
+    by: Origin,
+    message: Message,
 }
 
 impl QueuedMessage {
     /// 内核入队时使用；插件只返回 [`Command::InjectMessage`]。
-    pub(super) fn new(by: &'static str, content: Content) -> Self {
-        Self { by, content }
+    pub(super) fn new(by: Origin, message: Message) -> Self {
+        Self { by, message }
     }
 
     /// 入队的插件名（溯源）。
-    pub fn by(&self) -> &'static str {
-        self.by
+    pub fn by(&self) -> &Origin {
+        &self.by
     }
 
-    /// 消息内容。
-    pub fn content(&self) -> &Content {
-        &self.content
+    /// 待注入的消息。
+    pub fn message(&self) -> &Message {
+        &self.message
     }
 
-    /// 取走内容。
-    pub fn into_content(self) -> Content {
-        self.content
+    /// 取走消息。
+    pub fn into_message(self) -> Message {
+        self.message
     }
 }
 

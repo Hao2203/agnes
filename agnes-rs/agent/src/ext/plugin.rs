@@ -8,7 +8,7 @@
 use agnes_core::message::{ToolCall, ToolOutput};
 
 use super::command::Command;
-use super::decision::{ApprovalOutcome, Denied};
+use super::decision::{ApprovalOutcome, Blocked, Denied};
 use crate::record::Event as RecordEvent;
 
 /// 插件看到的统一事件流，按发生顺序。
@@ -32,8 +32,7 @@ pub enum PluginEvent<'a> {
     /// 结果被挡回，入账的是这条反馈。
     ToolResultBlocked {
         call: &'a ToolCall,
-        by: &'static str,
-        feedback: &'a str,
+        blocked: &'a Blocked,
     },
     /// 系统发出了审批问询。
     ApprovalRequested { call: &'a ToolCall },
@@ -46,8 +45,9 @@ pub enum PluginEvent<'a> {
 
 /// 参与 agent 循环的策略层。
 pub trait Plugin: Send {
-    /// 插件名；也是拒绝、挡回与中止的溯源标签。
-    fn name(&self) -> &'static str;
+    /// 插件名；也是拒绝、挡回与中止的溯源标签。内核在注册时捕获它，
+    /// 因此名字可以是运行期才决定的（运行时安装的插件）。
+    fn name(&self) -> &str;
 
     /// 处理一条事件，返回意图。返回空 `Vec` 表示只观察、不表态。
     fn on_event(&mut self, _event: &PluginEvent<'_>) -> Vec<Command> {
@@ -57,7 +57,7 @@ pub trait Plugin: Send {
 
 /// 装箱的插件仍是插件：装配器可以统一按 `Box<dyn Plugin>` 持有。
 impl Plugin for Box<dyn Plugin> {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         (**self).name()
     }
 
