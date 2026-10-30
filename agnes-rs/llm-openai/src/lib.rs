@@ -274,7 +274,8 @@ mod tests {
             agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
         );
         let model = ModelName::from_str("gpt-test").unwrap();
-        let turn = agnes_core::turn::Turn::new(context, Content::try_from("flip").unwrap()).start();
+        let turn =
+            agnes_core::turn::Turn::with_goal(context, Content::try_from("flip").unwrap()).start();
 
         let request = LlmRequest {
             model: model.clone(),

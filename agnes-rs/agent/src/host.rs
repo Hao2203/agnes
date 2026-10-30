@@ -18,7 +18,7 @@ use agnes_io::tool::{DuplicateTool, Tool, ToolRegistry};
 use jiff::Timestamp;
 
 use crate::approval::ApprovalChannel;
-use crate::driver::{Driver, Outlets, Ports};
+use crate::driver::{Driver, Outlets, Ports, Start};
 use crate::ext::{Bundle, Extensions, Plugin};
 use crate::{
     AgentError, Event, Log, RequestBuilder, RunSummary, SessionLog, Sink, StandardRequestBuilder,
@@ -118,7 +118,7 @@ impl<'a> Host<'a> {
         self.approvals.is_some()
     }
 
-    /// 一次完整 run：从 [`Turn::new`]（就绪）到收场。
+    /// 一次完整 run：从就绪阶段（有/无 goal）到收场。
     ///
     /// 控制：运行中随时可打断（[`InputPort::interrupted`]）—— 模型响应、
     /// 工具执行、审批挂起三个等待点都适用，in-flight 的 future 就地丢弃；
@@ -176,14 +176,17 @@ impl<'a> Host<'a> {
             session,
         };
         // 上下文从持久化日志的历史消息重建；系统提示与工具环境以当前
-        // 配置为准。goal 先留在就绪阶段，start 后进入待调用阶段。
+        // 配置为准。goal 可选：有则先留在就绪阶段，无则直接基于历史启动。
         let context =
             Context::with_messages(header, budget, log.messages().cloned().collect::<Vec<_>>());
-        let ready = Turn::new(context, goal);
+        let start = match goal {
+            Some(goal) => Start::Goal(Turn::with_goal(context, goal)),
+            None => Start::Empty(Turn::new(context)),
+        };
         let mut log = log;
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
         // 由驱动记录，宿主保留所有权。
-        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(ready).await {
+        let (closed, aborted) = match Driver::new(&mut log, ports, outlets).run(start).await {
             Ok(done) => done,
             Err(err) => {
                 // 失败 run 里已经产生的工具变更对下一 turn 仍然有效；

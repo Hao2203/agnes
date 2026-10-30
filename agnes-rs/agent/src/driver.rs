@@ -1,10 +1,10 @@
 //! 宿主驱动：把 core 的 typestate 与宿主的 IO / 策略接起来。
 //!
-//! 阶段即动作：[`Turn<Ready>`] 表示可以开始，[`Turn<AwaitingCall>`] 表示
-//! 该调模型，[`Turn<AwaitingModel>`] 表示等响应，[`Turn<AwaitingTools>`]
-//! 表示该跑这批调用。驱动记录完开局事件后才 `start`，随后在待调用与等工具
-//! 两个循环边界之间推进；记录事件由驱动自己铸造（记入日志、分发给插件、
-//! 上报宿主），core 不产出事件。
+//! 阶段即动作：[`Turn<Ready>`] / [`Turn<ReadyWithGoal>`] 表示可以开始，
+//! [`Turn<AwaitingCall>`] 表示该调模型，[`Turn<AwaitingModel>`] 表示等响应，
+//! [`Turn<AwaitingTools>`] 表示该跑这批调用。驱动记录完开局事件后才 `start`，
+//! 随后在待调用与等工具两个循环边界之间推进；记录事件由驱动自己铸造
+//! （记入日志、分发给插件、上报宿主），core 不产出事件。
 //!
 //! 插件只有一条处理入口（`on_event`）：它看不到派发/执行/审批这些阶段，
 //! 只接收事件、返回指令。内核把指令收进 outbox，系统在检查点执行：
@@ -21,12 +21,14 @@
 
 use std::time::Duration;
 
+use agnes_core::content::Content;
+use agnes_core::context::Context;
 use agnes_core::header::{Environment, Header};
 use agnes_core::llm::StopKind;
 use agnes_core::message::{Message, ToolCall, ToolOutput};
 use agnes_core::turn::{
-    Advanced, AwaitingCall, AwaitingModel, AwaitingTools, Closed, Outcome, Ready, Replied,
-    StepNumber, Turn,
+    Advanced, AwaitingCall, AwaitingModel, AwaitingTools, Closed, Outcome, Ready, ReadyWithGoal,
+    Replied, StepNumber, Turn,
 };
 use jiff::Timestamp;
 use tokio::sync::oneshot::Receiver as AnswerReceiver;
@@ -69,6 +71,35 @@ enum Settled {
     Closed(Turn<Closed>),
 }
 
+/// 驱动入口的两种开局：无 goal / 带 goal。
+pub(crate) enum Start {
+    Empty(Turn<Ready>),
+    Goal(Turn<ReadyWithGoal>),
+}
+
+impl Start {
+    fn context(&self) -> &Context {
+        match self {
+            Self::Empty(turn) => turn.context(),
+            Self::Goal(turn) => turn.context(),
+        }
+    }
+
+    fn opening_goal(&self) -> Option<&Content> {
+        match self {
+            Self::Empty(_) => None,
+            Self::Goal(turn) => Some(turn.goal()),
+        }
+    }
+
+    fn into_started(self) -> Turn<AwaitingCall> {
+        match self {
+            Self::Empty(turn) => turn.start(),
+            Self::Goal(turn) => turn.start(),
+        }
+    }
+}
+
 /// 驱动状态机。
 pub(crate) struct Driver<'a, 's, 'q> {
     ports: Ports<'a>,
@@ -92,10 +123,10 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     /// 一路驱动到收场；中止时把原因写进审计记录，再原样返回错误。
     pub(crate) async fn run(
         mut self,
-        mut ready: Turn<Ready>,
+        start: Start,
     ) -> Result<(Turn<Closed>, Option<Aborted>), AgentError> {
-        let outcome = match self.record_start(&mut ready).await {
-            Ok(()) => self.drive(ready.start()).await,
+        let outcome = match self.record_start(&start).await {
+            Ok(()) => self.drive(start.into_started()).await,
             Err(err) => Err(err),
         };
         match outcome {
@@ -128,14 +159,17 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         }
     }
 
-    /// turn 开局的记录：header、goal 消息、turn 边界。goal 从就绪阶段读取，
-    /// 记录完成后才进入上下文。此时还不能注入，插件指令留在队列里。
-    async fn record_start(&mut self, turn: &mut Turn<Ready>) -> Result<(), AgentError> {
-        let header = turn.context().header().clone();
+    /// turn 开局的记录：header、（可选）goal 消息、turn 边界。goal 从
+    /// 就绪阶段读取，记录完成后才进入上下文。此时还不能注入，插件指令
+    /// 留在队列里。
+    async fn record_start(&mut self, start: &Start) -> Result<(), AgentError> {
+        let header = start.context().header().clone();
         self.record(RecordEvent::Header(header)).await?;
-        let goal = turn.goal().clone();
-        self.record(RecordEvent::Message(Message::User { content: goal }))
-            .await?;
+        if let Some(goal) = start.opening_goal() {
+            let goal = goal.clone();
+            self.record(RecordEvent::Message(Message::User { content: goal }))
+                .await?;
+        }
         self.record(RecordEvent::TurnStart).await
     }
 

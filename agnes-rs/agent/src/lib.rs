@@ -101,7 +101,8 @@ impl RequestBuilder for StandardRequestBuilder {
 pub enum Event {
     Started {
         at: Timestamp,
-        goal: Content,
+        /// 本轮的开局目标；无 goal 启动时为 `None`。
+        goal: Option<Content>,
         tools: Vec<ToolName>,
     },
     /// Agent 循环里发生的一条记录事件 —— turn/step 生命周期或消息；

@@ -86,7 +86,7 @@ async fn run_staged(
     // 从这一轮开始对模型可见。
     let config = AgentConfig {
         header: session_header(host.tools()),
-        goal,
+        goal: Some(goal),
         budget: wiring.max_steps,
     };
     let log = session

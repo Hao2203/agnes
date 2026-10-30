@@ -1,11 +1,12 @@
 //! turn：把一次用户请求推进到答复的完整运行 —— 由多个 step（模型往返）组成。
 //!
 //! 这是事件循环驱动的 sans-io 状态机，且状态即类型：机器的阶段由
-//! [`Ready`]、[`AwaitingCall`]、[`AwaitingModel`]、[`AwaitingTools`]、
-//! [`Closed`] 表示，[`Turn<Phase>`] 每个阶段只提供推进该阶段的方法 ——
-//! 在等工具时"喂"响应、在等响应时注入、在收场后喂任何输入，编译期都
-//! 不可能。开局前 goal 留在就绪阶段，`start` 后才进入上下文；`call` 才
-//! 冻结请求、开启 step 并进入等响应阶段。
+//! [`Ready`]、[`ReadyWithGoal`]、[`AwaitingCall`]、[`AwaitingModel`]、
+//! [`AwaitingTools`]、[`Closed`] 表示，[`Turn<Phase>`] 每个阶段只提供推进
+//! 该阶段的方法 —— 在等工具时"喂"响应、在等响应时注入、在收场后喂任何
+//! 输入，编译期都不可能。开局可以带 goal（[`ReadyWithGoal`]）或不带
+//! （[`Ready`]）：前者在 `start` 时把 goal 追加进上下文，后者直接基于
+//! 已有历史；`call` 才冻结请求、开启 step 并进入等响应阶段。
 //!
 //! 机器只持有领域状态、从不记录、也从不执行 IO：[`Turn`] 持有一次 run 的
 //! [`Context`]（消息、模型侧配置、用量、step 记账），转移只交还下一个阶段
@@ -30,13 +31,14 @@ use agnes_util::NonEmpty;
 use std::fmt;
 use std::num::NonZeroU32;
 
-/// 把一个 turn 带起来的全部输入：这一轮生效的模型侧配置、开局的目标
-/// 消息，以及最多可以启动多少个模型往返。已有会话历史不在这里 —— 它由
+/// 把一个 turn 带起来的全部输入：这一轮生效的模型侧配置、可选的
+/// 开局目标消息，以及最多可以启动多少个模型往返。`goal` 为 `None` 时
+/// 直接基于已有会话历史或调用前注入启动。已有会话历史不在这里 —— 它由
 /// 宿主重建进 [`Context`]。
 #[derive(Debug)]
 pub struct AgentConfig {
     pub header: Header,
-    pub goal: Content,
+    pub goal: Option<Content>,
     pub budget: StepBudget,
 }
 
@@ -93,9 +95,13 @@ impl fmt::Display for StepNumber {
     }
 }
 
+/// 阶段：已就绪、尚未开始 —— 没有开局目标。
+#[derive(Debug)]
+pub struct Ready;
+
 /// 阶段：已就绪、尚未开始 —— goal 还在阶段里，没有进入 [`Context`]。
 #[derive(Debug)]
-pub struct Ready {
+pub struct ReadyWithGoal {
     goal: Content,
 }
 
@@ -157,10 +163,10 @@ pub struct TurnResult {
     pub steps_used: u32,
 }
 
-/// 分阶段 typestate 的 turn 机器：`Turn<Ready>` → `Turn<AwaitingCall>` →
-/// `Turn<AwaitingModel>` → `Turn<AwaitingTools>` →（回到
-/// `Turn<AwaitingCall>` 或收为 `Turn<Closed>`），每一步转移都消耗当前阶段、
-/// 交还下一个。
+/// 分阶段 typestate 的 turn 机器：`Turn<Ready>` / `Turn<ReadyWithGoal>` →
+/// `Turn<AwaitingCall>` → `Turn<AwaitingModel>` → `Turn<AwaitingTools>` →
+///（回到 `Turn<AwaitingCall>` 或收为 `Turn<Closed>`），每一步转移都消耗
+/// 当前阶段、交还下一个。
 #[derive(Debug)]
 pub struct Turn<Phase> {
     context: Context,
@@ -172,6 +178,17 @@ fn close(context: Context, outcome: Outcome) -> Turn<Closed> {
     Turn {
         context,
         phase: Closed { outcome },
+    }
+}
+
+/// 两个就绪阶段共用的开局：进入待调用阶段，step 尚未计步。
+fn open_first_call(context: Context) -> Turn<AwaitingCall> {
+    // 预算非零、step 计数为 0：第一步必然放行，fallback 只是把
+    // 这个不变量写成不 panic 的形式。
+    let next = context.next_step_if_allowed().unwrap_or(StepNumber::FIRST);
+    Turn {
+        context,
+        phase: AwaitingCall { next },
     }
 }
 
@@ -187,6 +204,7 @@ mod sealed {
 }
 
 impl sealed::Sealed for Ready {}
+impl sealed::Sealed for ReadyWithGoal {}
 impl sealed::Sealed for AwaitingCall {}
 impl sealed::Sealed for AwaitingModel {}
 impl sealed::Sealed for AwaitingTools {}
@@ -195,6 +213,7 @@ impl sealed::Sealed for AwaitingTools {}
 pub trait OpenPhase: sealed::Sealed {}
 
 impl OpenPhase for Ready {}
+impl OpenPhase for ReadyWithGoal {}
 impl OpenPhase for AwaitingCall {}
 impl OpenPhase for AwaitingModel {}
 impl OpenPhase for AwaitingTools {}
@@ -223,11 +242,26 @@ impl<P: OpenPhase> Turn<P> {
 }
 
 impl Turn<Ready> {
-    /// 构造一个尚未开始的 turn：goal 留在阶段里，不进入上下文。
-    pub fn new(context: Context, goal: Content) -> Self {
+    /// 构造一个无 goal 的 turn：直接基于已有历史或调用前注入启动。
+    pub fn new(context: Context) -> Self {
         Self {
             context,
-            phase: Ready { goal },
+            phase: Ready,
+        }
+    }
+
+    /// 开始 turn：不追加消息，进入待调用阶段。step 尚未开始计步。
+    pub fn start(self) -> Turn<AwaitingCall> {
+        open_first_call(self.context)
+    }
+}
+
+impl Turn<ReadyWithGoal> {
+    /// 构造一个携带 goal 的 turn：goal 留在阶段里，不进入上下文。
+    pub fn with_goal(context: Context, goal: Content) -> Self {
+        Self {
+            context,
+            phase: ReadyWithGoal { goal },
         }
     }
 
@@ -242,13 +276,7 @@ impl Turn<Ready> {
         context.push_message(Message::User {
             content: phase.goal,
         });
-        // 预算非零、step 计数为 0：第一步必然放行，fallback 只是把
-        // 这个不变量写成不 panic 的形式。
-        let next = context.next_step_if_allowed().unwrap_or(StepNumber::FIRST);
-        Turn {
-            context,
-            phase: AwaitingCall { next },
-        }
+        open_first_call(context)
     }
 }
 
@@ -533,7 +561,7 @@ mod tests {
 
     #[test]
     fn a_new_turn_keeps_the_goal_out_of_the_context_until_start() {
-        let turn = Turn::new(context(4), content("flip the flag"));
+        let turn = Turn::with_goal(context(4), content("flip the flag"));
         assert!(turn.context().messages().is_empty());
         assert_eq!(turn.context().steps_started(), 0);
         assert_eq!(turn.goal().as_str(), "flip the flag");
@@ -543,8 +571,33 @@ mod tests {
     }
 
     #[test]
+    fn a_goal_less_turn_starts_without_adding_a_message() {
+        let turn = Turn::new(context(4));
+        assert!(turn.context().messages().is_empty());
+
+        let turn = turn.start();
+        assert!(turn.context().messages().is_empty());
+        assert_eq!(turn.next_step().get(), 1);
+        assert_eq!(turn.prompt().input.len(), 1); // system only
+        assert_eq!(turn.call().step().get(), 1);
+    }
+
+    #[test]
+    fn a_goal_less_turn_can_be_driven_by_an_injection() {
+        let mut turn = Turn::new(context(4)).start();
+        turn.inject(user("summarize the repo"));
+
+        let prompt = turn.prompt();
+        assert_eq!(prompt.input.len(), 2);
+        assert!(matches!(
+            &prompt.input[1],
+            Message::User { content } if content.as_str() == "summarize the repo"
+        ));
+    }
+
+    #[test]
     fn a_started_turn_waits_for_the_call_without_burning_a_step() {
-        let turn = Turn::new(context(4), content("flip the flag")).start();
+        let turn = Turn::with_goal(context(4), content("flip the flag")).start();
         assert_eq!(turn.next_step().get(), 1);
         assert_eq!(turn.context().steps_started(), 0);
         assert_eq!(turn.prompt().input.len(), 2);
@@ -556,7 +609,7 @@ mod tests {
 
     #[test]
     fn injections_are_immediate_before_the_call() {
-        let mut turn = Turn::new(context(4), content("flip")).start();
+        let mut turn = Turn::with_goal(context(4), content("flip")).start();
         turn.inject(user("early"));
 
         assert_eq!(turn.context().messages(), &[user("flip"), user("early")]);
@@ -566,7 +619,7 @@ mod tests {
 
     #[test]
     fn interrupting_before_the_call_keeps_the_step_count() {
-        let mut turn = Turn::new(context(4), content("flip")).start();
+        let mut turn = Turn::with_goal(context(4), content("flip")).start();
         turn.inject(user("hold on"));
         let turn = turn.interrupted();
 
@@ -577,7 +630,7 @@ mod tests {
 
     #[test]
     fn start_appends_the_goal_before_the_first_call() {
-        let turn = Turn::new(context(4), content("flip the flag")).start();
+        let turn = Turn::with_goal(context(4), content("flip the flag")).start();
         assert_eq!(turn.next_step().get(), 1);
         assert_eq!(turn.context().messages(), &[user("flip the flag")]);
         assert_eq!(turn.context().steps_started(), 0);
@@ -592,7 +645,7 @@ mod tests {
 
     #[test]
     fn a_tool_use_response_hands_out_every_call_at_once() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -612,7 +665,7 @@ mod tests {
 
     #[test]
     fn results_may_arrive_in_any_order() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -640,7 +693,7 @@ mod tests {
     #[cfg(not(debug_assertions))]
     #[test]
     fn unknown_and_duplicate_results_are_ignored_in_release() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -667,7 +720,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unknown or already-finished call")]
     fn an_unknown_result_is_a_driver_contract_violation() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
@@ -678,7 +731,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unknown or already-finished call")]
     fn a_duplicate_result_is_a_driver_contract_violation() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -691,7 +744,7 @@ mod tests {
 
     #[test]
     fn duplicate_call_ids_still_complete_without_livelock() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("dup"), call("dup")])))
         else {
             panic!("expected Tools");
@@ -707,7 +760,7 @@ mod tests {
 
     #[test]
     fn an_answer_ends_the_turn() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Closed(turn) = turn.respond(response(completed("done it"))) else {
             panic!("expected Closed");
         };
@@ -723,7 +776,7 @@ mod tests {
 
     #[test]
     fn the_budget_ends_the_turn_after_a_tool_round() {
-        let turn = Turn::new(context(1), content("flip")).start().call();
+        let turn = Turn::with_goal(context(1), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
@@ -735,7 +788,7 @@ mod tests {
 
     #[test]
     fn injections_take_effect_before_the_next_call() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
@@ -754,7 +807,7 @@ mod tests {
 
     #[test]
     fn length_and_filtered_responses_close_the_turn() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Closed(turn) =
             turn.respond(response(StopReason::LengthExceeded { content: None }))
         else {
@@ -762,7 +815,7 @@ mod tests {
         };
         assert_eq!(turn.outcome(), Outcome::LengthExceeded);
 
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Closed(turn) = turn.respond(response(StopReason::ContentFiltered {
             content: Some(content("partial")),
         })) else {
@@ -777,7 +830,7 @@ mod tests {
 
     #[test]
     fn interrupting_the_model_wait_closes_after_the_call() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let turn = turn.interrupted();
         assert_eq!(turn.outcome(), Outcome::Interrupted);
         let result = turn.into_result();
@@ -786,7 +839,7 @@ mod tests {
 
     #[test]
     fn interrupting_the_tools_fills_synthetic_results() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1"), call("c2")])))
         else {
             panic!("expected Tools");
@@ -809,7 +862,7 @@ mod tests {
 
     #[test]
     fn usage_and_steps_accumulate_across_steps() {
-        let turn = Turn::new(context(4), content("flip")).start().call();
+        let turn = Turn::with_goal(context(4), content("flip")).start().call();
         let Replied::Tools(turn) = turn.respond(response(tool_use(vec![call("c1")]))) else {
             panic!("expected Tools");
         };
@@ -833,7 +886,7 @@ mod tests {
 
     #[test]
     fn tools_can_be_added_and_removed_while_open() {
-        let mut turn = Turn::new(context(4), content("flip")).start();
+        let mut turn = Turn::with_goal(context(4), content("flip")).start();
         let spec = ToolSpec::new(
             ToolName::from_str("injected").unwrap(),
             "an injected tool",

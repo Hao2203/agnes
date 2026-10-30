@@ -120,7 +120,15 @@ impl Sink for Collector {
 fn config_with(tools: Vec<ToolSpec>, budget: u32) -> agnes_core::turn::AgentConfig {
     agnes_core::turn::AgentConfig {
         header: Header::new(SystemPrompt::new("sys"), Environment::new(tools)),
-        goal: Content::try_from("take a note").unwrap(),
+        goal: Some(Content::try_from("take a note").unwrap()),
+        budget: StepBudget::new(NonZeroU32::new(budget).unwrap()),
+    }
+}
+
+fn config_without_goal(tools: Vec<ToolSpec>, budget: u32) -> agnes_core::turn::AgentConfig {
+    agnes_core::turn::AgentConfig {
+        header: Header::new(SystemPrompt::new("sys"), Environment::new(tools)),
+        goal: None,
         budget: StepBudget::new(NonZeroU32::new(budget).unwrap()),
     }
 }
@@ -273,6 +281,84 @@ async fn happy_path_runs_tools_and_finishes() {
     // 上报的核心事件就是日志里的那些
     assert_eq!(recorded(events).len(), summary.log.events().len());
     assert!(summary.pending_messages.is_empty());
+}
+
+#[tokio::test]
+async fn a_goal_less_run_starts_from_the_existing_history() {
+    let llm = ScriptedLlm::new(vec![response(completed("done"))]);
+    let mut host = Host::builder(&llm, &NoInput)
+        .model(model())
+        .build()
+        .unwrap();
+
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(
+            config_without_goal(Vec::new(), 4),
+            Log::default(),
+            &mut sink,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::Answered);
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].prompt.input.len(), 1);
+    assert!(matches!(
+        requests[0].prompt.input[0],
+        Message::System { .. }
+    ));
+
+    assert!(matches!(sink.0[0], Event::Started { goal: None, .. }));
+    assert_eq!(
+        shape(&recorded(&sink.0)),
+        vec![
+            "header",
+            "turn_start",
+            "step_start",
+            "message_start",
+            "message",
+            "message_end",
+            "step_end",
+            "turn_end"
+        ]
+    );
+    // 日志里只有模型答复，没有 goal。
+    let messages = messages_of(&summary.log);
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(messages[0], Message::Assistant(_)));
+}
+
+#[tokio::test]
+async fn a_goal_less_run_can_be_driven_by_queued_input() {
+    let input = FakeInput::new();
+    input.queue("summarize the repo");
+    let llm = ScriptedLlm::new(vec![response(completed("summary"))]);
+    let mut host = Host::builder(&llm, &input).model(model()).build().unwrap();
+
+    let mut sink = Collector(Vec::new());
+    let summary = host
+        .run(RunRequest::new(
+            config_without_goal(Vec::new(), 4),
+            Log::default(),
+            &mut sink,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome, Outcome::Answered);
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].prompt.input.len(), 2);
+    assert!(matches!(
+        &requests[0].prompt.input[1],
+        Message::User { content } if content.as_str() == "summarize the repo"
+    ));
+    assert!(recorded(&sink.0).iter().any(|event| matches!(
+        event,
+        RecordEvent::MessagesInjected { count } if *count == 1
+    )));
 }
 
 /// 记录落盘事件、审计记录与 flush 次数的会话日志。
