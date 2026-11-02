@@ -314,6 +314,53 @@ impl ServiceHost {
         })
     }
 
+    /// 同步回卷一个 fiber 的 effect；用于 future 被取消或 `Drop` 路径。
+    fn unwind_fiber_sync(&self, fiber: Fiber) {
+        loop {
+            let effect = {
+                let mut inner = self.lock();
+                inner
+                    .effects
+                    .get_mut(&fiber)
+                    .and_then(|effects| effects.pop())
+            };
+            let Some(effect) = effect else {
+                break;
+            };
+            match effect {
+                Effect::RemoveService { id, provider } => {
+                    self.lock().services.remove(id, provider);
+                }
+                Effect::RemoveListener(listener) => {
+                    let mut inner = self.lock();
+                    event::remove_listener(&mut inner, listener);
+                }
+                Effect::DisposeChild(child) => self.dispose_fiber_sync(child),
+                Effect::Custom(disposer) => disposer(),
+            }
+        }
+    }
+
+    /// 同步销毁一个 fiber；异步 `shutdown` 无法在取消路径里 await，会被跳过。
+    fn dispose_fiber_sync(&self, fiber: Fiber) {
+        let (plugin, name) = {
+            let mut inner = self.lock();
+            let Some(slot) = inner.fibers.get_mut(fiber.id()) else {
+                return;
+            };
+            if slot.state == FiberState::Disposed {
+                return;
+            }
+            slot.state = FiberState::Disposed;
+            (slot.plugin.take(), slot.name.clone())
+        };
+        if plugin.is_some() {
+            warn!("plugin `{name}` was disposed synchronously; async shutdown was skipped");
+        }
+        drop(plugin);
+        self.unwind_fiber_sync(fiber);
+    }
+
     /// 把所有可激活的 `Pending` fiber 推进到 `Active`。
     pub async fn settle(&self) {
         self.settle_inner().await;
@@ -351,17 +398,25 @@ impl ServiceHost {
             };
             transitions += 1;
 
-            let mut instance = {
+            let instance = {
                 let mut inner = self.lock();
                 inner.fibers[fiber.id()].plugin.take()
             };
-            let Some(current) = instance.as_mut() else {
-                error!("plugin `{}` has no instance before apply", fiber.id());
-                break;
+            let Some(instance) = instance else {
+                let name = {
+                    let inner = self.lock();
+                    inner.fibers[fiber.id()].name.clone()
+                };
+                error!("plugin `{name}` has no instance before apply");
+                self.lock().fibers[fiber.id()].state = FiberState::Failed;
+                continue;
             };
 
             let ctx = Ctx::new(self, fiber);
-            let result = current.apply(&ctx).await;
+            let mut guard = ApplyGuard::new(self, fiber, instance);
+            let result = guard.plugin_mut().apply(&ctx).await;
+            guard.commit();
+            let mut instance = guard.take();
 
             let (outcome, effects, needs_shutdown) = {
                 let mut inner = self.lock();
@@ -513,6 +568,65 @@ struct SettlingGuard<'a> {
 impl Drop for SettlingGuard<'_> {
     fn drop(&mut self) {
         self.host.lock().settling = false;
+    }
+}
+
+/// 保证 `apply` future 被取消时，插件实例和 fiber 状态不会卡在 `Loading`。
+struct ApplyGuard<'a> {
+    host: &'a ServiceHost,
+    fiber: Fiber,
+    plugin: Option<Box<dyn ErasedPlugin>>,
+    committed: bool,
+}
+
+impl<'a> ApplyGuard<'a> {
+    fn new(host: &'a ServiceHost, fiber: Fiber, plugin: Box<dyn ErasedPlugin>) -> Self {
+        Self {
+            host,
+            fiber,
+            plugin: Some(plugin),
+            committed: false,
+        }
+    }
+
+    fn plugin_mut(&mut self) -> &mut Box<dyn ErasedPlugin> {
+        self.plugin
+            .as_mut()
+            .expect("apply guard owns its plugin until commit")
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    fn take(&mut self) -> Option<Box<dyn ErasedPlugin>> {
+        self.plugin.take()
+    }
+}
+
+impl Drop for ApplyGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let plugin = self.plugin.take();
+        let (dispose, name) = {
+            let mut inner = self.host.lock();
+            match inner.fibers.get_mut(self.fiber.id()) {
+                Some(slot) if slot.state == FiberState::Loading => {
+                    slot.plugin = plugin;
+                    slot.state = FiberState::Pending;
+                    (slot.dispose_requested, slot.name.clone())
+                }
+                _ => return,
+            }
+        };
+        warn!("plugin `{name}` apply was cancelled; restored to pending");
+        if dispose {
+            self.host.dispose_fiber_sync(self.fiber);
+        } else {
+            self.host.unwind_fiber_sync(self.fiber);
+        }
     }
 }
 

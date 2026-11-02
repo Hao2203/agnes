@@ -60,6 +60,47 @@ fn first_plugin_runs_apply() {
     });
 }
 
+struct SlowApply {
+    log: Log,
+}
+
+#[async_trait]
+impl Plugin for SlowApply {
+    type Deps = ();
+
+    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+        let log = Arc::clone(&self.log);
+        ctx.effect(move || {
+            (
+                (),
+                Box::new(move || log.lock().unwrap().push("cancelled-apply-cleanup".into())),
+            )
+        });
+        futures_lite::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+#[test]
+fn cancelling_apply_restores_pending_and_unwinds_effects() {
+    block_on(async {
+        let log = log();
+        let host = ServiceHost::new();
+        let outcome = futures_lite::future::poll_once(Box::pin(host.mount(SlowApply {
+            log: Arc::clone(&log),
+        })))
+        .await;
+        assert!(outcome.is_none());
+        assert_eq!(entries(&log), ["cancelled-apply-cleanup"]);
+
+        let fiber = host.fibers()[0].fiber;
+        assert_eq!(host.fiber(fiber).unwrap().state, FiberState::Pending);
+        assert!(host.unmount(fiber).await);
+        assert_eq!(host.fiber(fiber).unwrap().state, FiberState::Disposed);
+        host.shutdown().await;
+    });
+}
+
 struct Failing;
 
 #[async_trait]
