@@ -160,7 +160,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     }
 
     /// turn 开局的记录：header、（可选）goal 消息、turn 边界。goal 从
-    /// 就绪阶段读取，记录完成后才进入上下文。此时还不能注入，插件指令
+    /// 就绪阶段读取，记录完成后才并入 `Turn`。此时还不能注入，插件指令
     /// 留在队列里。
     async fn record_start(&mut self, start: &Start) -> Result<(), AgentError> {
         let header = start.turn().header().clone();
