@@ -50,8 +50,10 @@ pub use effect::Disposer;
 pub use error::{PluginError, ServiceError};
 pub use event::{
     BailKey, BailListener, EmitListener, EventKey, Listener, Next, WaterfallKey, WaterfallListener,
-    next,
 };
 pub use host::{Ctx, ServiceHost};
 pub use plugin::{Fiber, FiberInfo, FiberState, Plugin};
 pub use service::{ServiceDep, ServiceInfo, ServiceParam};
+
+#[cfg(test)]
+mod tests;

@@ -4,11 +4,13 @@ use std::any::TypeId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agnes_service::{
-    BailKey, Ctx, EventKey, Fiber, FiberInfo, FiberState, Listener, Plugin, PluginError,
-    ServiceDep, ServiceHost, ServiceParam, WaterfallKey, async_trait, next,
-};
 use futures_lite::future::block_on;
+
+use crate::event::next;
+use crate::{
+    BailKey, Ctx, EventKey, Fiber, FiberInfo, FiberState, Listener, Plugin, PluginError,
+    ServiceDep, ServiceHost, ServiceParam, WaterfallKey, async_trait,
+};
 
 type Log = Arc<Mutex<Vec<String>>>;
 

@@ -19,7 +19,7 @@ use crate::plugin::Fiber;
 pub type Next<'a, R> = Pin<Box<dyn Future<Output = R> + Send + 'a>>;
 
 /// 把 future 装箱成 [`Next`]，便于监听器返回。
-pub fn next<'a, R>(future: impl Future<Output = R> + Send + 'a) -> Next<'a, R> {
+pub(crate) fn next<'a, R>(future: impl Future<Output = R> + Send + 'a) -> Next<'a, R> {
     Box::pin(future)
 }
 
