@@ -9,7 +9,7 @@ use futures_lite::future::block_on;
 use crate::event::next;
 use crate::{
     BailKey, Ctx, EventKey, Fiber, FiberInfo, FiberState, Listener, Plugin, PluginError,
-    ServiceDep, ServiceHost, ServiceParam, WaterfallKey, async_trait,
+    ServiceDep, ServiceError, ServiceHost, ServiceParam, WaterfallKey, async_trait,
 };
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -120,7 +120,10 @@ fn apply_failure_marks_failed() {
         let info = host.fiber(fiber).unwrap();
 
         assert_eq!(info.state, FiberState::Failed);
-        assert_eq!(info.error.as_deref(), Some("boom"));
+        assert_eq!(
+            info.error.as_ref().map(|error| error.to_string()),
+            Some("boom".to_string())
+        );
 
         assert!(host.unmount(fiber).await);
         assert_eq!(host.fiber(fiber).unwrap().state, FiberState::Disposed);
@@ -353,11 +356,12 @@ fn duplicate_service_fails() {
         let info = host.fiber(second).unwrap();
 
         assert_eq!(info.state, FiberState::Failed);
-        assert!(
+        assert!(matches!(
             info.error
-                .as_deref()
-                .is_some_and(|error| error.contains("already provided"))
-        );
+                .as_ref()
+                .and_then(|error| error.downcast_ref::<ServiceError>()),
+            Some(ServiceError::ServiceTaken { .. })
+        ));
         host.shutdown().await;
     });
 }

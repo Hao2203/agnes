@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use log::{error, info, warn};
 
 use crate::effect::{Disposer, Effect};
-use crate::error::ServiceError;
+use crate::error::{PluginError, ServiceError};
 use crate::event::{
     self, BailKey, EventKey, Listener, ListenerSet, ListenerSetId, Next, WaterfallKey,
 };
-use crate::plugin::{Adapter, ErasedPlugin, Fiber, FiberInfo, FiberState, Plugin};
+use crate::plugin::{Adapter, ApplyError, ErasedPlugin, Fiber, FiberInfo, FiberState, Plugin};
 use crate::service::{ServiceDep, ServiceInfo, ServiceParam, ServiceTable};
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -54,14 +54,15 @@ struct FiberSlot {
     state: FiberState,
     parent: Option<Fiber>,
     plugin: Option<Box<dyn ErasedPlugin>>,
-    error: Option<String>,
+    error: Option<Arc<PluginError>>,
     dispose_requested: bool,
 }
 
 enum StepOutcome {
     Active(String),
-    Failed { name: String, message: String },
-    Retired(String),
+    Pending(String),
+    Failed { name: String, error: Arc<PluginError> },
+    Retired,
 }
 
 impl Default for ServiceHost {
@@ -427,29 +428,45 @@ impl ServiceHost {
                         slot.dispose_requested = false;
                         slot.state = FiberState::Disposed;
                         let effects = inner.effects.remove(&fiber).unwrap_or_default();
-                        (StepOutcome::Retired(name), effects, true)
+                        (StepOutcome::Retired, effects, true)
                     }
                     Ok(()) => {
                         slot.plugin = instance.take();
                         slot.state = FiberState::Active;
                         (StepOutcome::Active(name), Vec::new(), false)
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        slot.error = Some(message.clone());
+                    Err(ApplyError::MissingDeps) => {
+                        if slot.dispose_requested {
+                            slot.dispose_requested = false;
+                            slot.state = FiberState::Disposed;
+                            let effects = inner.effects.remove(&fiber).unwrap_or_default();
+                            (StepOutcome::Retired, effects, false)
+                        } else {
+                            slot.plugin = instance.take();
+                            slot.state = FiberState::Pending;
+                            let effects = inner.effects.remove(&fiber).unwrap_or_default();
+                            (StepOutcome::Pending(name), effects, false)
+                        }
+                    }
+                    Err(ApplyError::Plugin(error)) => {
+                        let error = Arc::new(error);
+                        slot.error = Some(Arc::clone(&error));
                         slot.state = FiberState::Failed;
                         let effects = inner.effects.remove(&fiber).unwrap_or_default();
-                        (StepOutcome::Failed { name, message }, effects, true)
+                        (StepOutcome::Failed { name, error }, effects, true)
                     }
                 }
             };
 
             match &outcome {
                 StepOutcome::Active(name) => info!("plugin `{name}` is active"),
-                StepOutcome::Failed { name, message } => {
-                    error!("plugin `{name}` failed: {message}");
+                StepOutcome::Pending(name) => {
+                    warn!("plugin `{name}` is pending: dependencies vanished before apply");
                 }
-                StepOutcome::Retired(name) => info!("plugin `{name}` disposed"),
+                StepOutcome::Failed { name, error } => {
+                    error!("plugin `{name}` failed: {error}");
+                }
+                StepOutcome::Retired => {}
             }
 
             if needs_shutdown

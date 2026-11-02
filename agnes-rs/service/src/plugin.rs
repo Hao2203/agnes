@@ -4,6 +4,8 @@
 //! `apply`。挂载收实例，不使用闭包工厂；依赖恢复时复用同一个实例再次
 //! `apply`，因此 `apply` 必须可重复调用，`shutdown` 必须幂等。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::error::PluginError;
@@ -71,6 +73,7 @@ impl Fiber {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum FiberState {
     /// 已挂载，但依赖（或父插件）尚未就绪；这是合法状态。
     Pending,
@@ -92,14 +95,20 @@ pub struct FiberInfo {
     pub state: FiberState,
     /// 仅 `Pending` 时有值：还缺哪些服务。
     pub missing: Vec<ServiceDep>,
-    /// 仅 `Failed` 时有值：`apply` 的错误文本。
-    pub error: Option<String>,
+    /// `apply` 的错误；`Failed` 以及由失败转入 `Disposed` 的 fiber 上保留。
+    pub error: Option<Arc<PluginError>>,
+}
+
+/// 适配器内部的失败：区分“依赖在 check 与 resolve 之间消失”和插件错误。
+pub(crate) enum ApplyError {
+    MissingDeps,
+    Plugin(PluginError),
 }
 
 /// 类型擦除后的插件：宿主只存这个 trait object。
 #[async_trait]
 pub(crate) trait ErasedPlugin: Send {
-    async fn apply(&mut self, ctx: &Ctx<'_>) -> Result<(), PluginError>;
+    async fn apply(&mut self, ctx: &Ctx<'_>) -> Result<(), ApplyError>;
     async fn shutdown(&mut self) -> Result<(), PluginError>;
 }
 
@@ -113,10 +122,10 @@ impl<P: Plugin> Adapter<P> {
 
 #[async_trait]
 impl<P: Plugin> ErasedPlugin for Adapter<P> {
-    async fn apply(&mut self, ctx: &Ctx<'_>) -> Result<(), PluginError> {
-        let deps = <P::Deps as ServiceParam>::resolve(ctx)
-            .ok_or("plugin dependencies vanished before apply")?;
-        self.0.apply(ctx, deps).await
+    async fn apply(&mut self, ctx: &Ctx<'_>) -> Result<(), ApplyError> {
+        let deps =
+            <P::Deps as ServiceParam>::resolve(ctx).ok_or(ApplyError::MissingDeps)?;
+        self.0.apply(ctx, deps).await.map_err(ApplyError::Plugin)
     }
 
     async fn shutdown(&mut self) -> Result<(), PluginError> {
