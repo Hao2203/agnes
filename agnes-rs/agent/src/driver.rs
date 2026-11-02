@@ -230,7 +230,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
 
         match agent.respond(response) {
             Replied::Tools(agent) => {
-                self.record_messages(&agent, before).await?;
+                self.record_messages(agent.turn(), before).await?;
                 self.record(RecordEvent::MessageEnd {
                     step,
                     model,
@@ -241,7 +241,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                 Ok(Staged::AwaitingTools(agent))
             }
             Replied::Closed(agent) => {
-                self.record_messages(&agent, before).await?;
+                self.record_messages(agent.turn(), before).await?;
                 self.record(RecordEvent::MessageEnd {
                     step,
                     model,
@@ -345,42 +345,31 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         step: StepNumber,
     ) -> Result<Settled, AgentError> {
         let before = agent.turn().messages().len();
-        match agent.finish(call.id.clone(), output) {
-            Advanced::Ongoing(agent) => {
-                self.record(RecordEvent::ToolExecutionEnd {
-                    step,
-                    call_id: call.id.clone(),
-                })
-                .await?;
-                self.record_messages(&agent, before).await?;
-                Ok(Settled::Ongoing(agent))
-            }
-            Advanced::Next(agent) => {
-                self.record(RecordEvent::ToolExecutionEnd {
-                    step,
-                    call_id: call.id.clone(),
-                })
-                .await?;
-                self.record_messages(&agent, before).await?;
-                self.record(RecordEvent::StepEnd {
-                    step,
-                    outcome: StepOutcome::ToolUse,
-                })
-                .await?;
-                Ok(Settled::Next(agent))
-            }
+        let advanced = agent.finish(call.id.clone(), output);
+        let turn = match &advanced {
+            Advanced::Ongoing(agent) => agent.turn(),
+            Advanced::Next(agent) => agent.turn(),
+            Advanced::Closed(agent) => agent.turn(),
+        };
+
+        self.record(RecordEvent::ToolExecutionEnd {
+            step,
+            call_id: call.id.clone(),
+        })
+        .await?;
+        self.record_messages(turn, before).await?;
+        if !matches!(&advanced, Advanced::Ongoing(_)) {
+            self.record(RecordEvent::StepEnd {
+                step,
+                outcome: StepOutcome::ToolUse,
+            })
+            .await?;
+        }
+
+        match advanced {
+            Advanced::Ongoing(agent) => Ok(Settled::Ongoing(agent)),
+            Advanced::Next(agent) => Ok(Settled::Next(agent)),
             Advanced::Closed(agent) => {
-                self.record(RecordEvent::ToolExecutionEnd {
-                    step,
-                    call_id: call.id.clone(),
-                })
-                .await?;
-                self.record_messages(&agent, before).await?;
-                self.record(RecordEvent::StepEnd {
-                    step,
-                    outcome: StepOutcome::ToolUse,
-                })
-                .await?;
                 self.record(RecordEvent::TurnEnd {
                     outcome: agent.outcome(),
                 })
@@ -431,7 +420,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         let before = agent.turn().messages().len();
         let pending: Vec<ToolCall> = agent.unfinished().cloned().collect();
         let closed = agent.interrupted();
-        let synthetic = new_messages(&closed, before);
+        let synthetic = new_messages(closed.turn(), before);
         for (call, message) in pending.iter().zip(synthetic) {
             self.record(RecordEvent::ToolExecutionEnd {
                 step,
@@ -616,7 +605,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         let before = agent.turn().messages().len();
         self.drain_input(agent);
         self.drain_injections(agent);
-        let injected = new_messages(agent, before);
+        let injected = new_messages(agent.turn(), before);
         self.record_injected(&injected).await
     }
 
@@ -685,12 +674,8 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     }
 
     /// 记录自 `before` 起新增的会话消息。
-    async fn record_messages<Phase>(
-        &mut self,
-        agent: &Agent<Phase>,
-        before: usize,
-    ) -> Result<(), AgentError> {
-        for message in new_messages(agent, before) {
+    async fn record_messages(&mut self, turn: &Turn, before: usize) -> Result<(), AgentError> {
+        for message in new_messages(turn, before) {
             self.record(RecordEvent::Message(message)).await?;
         }
         Ok(())
@@ -777,6 +762,6 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
 }
 
 /// 自 `before` 起新增的会话消息（借看；调用方决定怎么处理）。
-fn new_messages<Phase>(agent: &Agent<Phase>, before: usize) -> Vec<Message> {
-    agent.turn().messages()[before..].to_vec()
+fn new_messages(turn: &Turn, before: usize) -> Vec<Message> {
+    turn.messages()[before..].to_vec()
 }
