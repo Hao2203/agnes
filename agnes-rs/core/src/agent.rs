@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_turn_keeps_the_goal_out_until_start() {
+    fn a_new_turn_keeps_the_goal_out_of_the_turn_until_start() {
         let agent = Agent::with_goal(new_turn(4), content("flip the flag"));
         assert!(agent.turn().messages().is_empty());
         assert_eq!(agent.turn().steps_started(), 0);
