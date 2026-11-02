@@ -317,8 +317,12 @@ impl Agent<AwaitingTools> {
     /// 待调用阶段，可能预算耗尽收场。
     ///
     /// 只接受未完成槽位且 id 匹配的结果，顺序不限。未知 id 与重复结果
-    /// 是驱动契约违例：debug 构建用 `debug_assert` 暴露，release 构建
-    /// 幂等忽略，不污染 turn。
+    /// 是驱动契约违例，不污染 turn。
+    ///
+    /// # Panics
+    ///
+    /// debug 构建中，未知或已完成的 `call_id` 会触发 `debug_assert!`；
+    /// release 构建幂等忽略。
     pub fn finish(self, call_id: ToolCallId, output: ToolOutput) -> Advanced {
         let Agent {
             mut turn,

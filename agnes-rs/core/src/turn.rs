@@ -1,9 +1,10 @@
-//! Turn：一个 turn 携带的全部领域状态 —— 会话消息、模型侧配置、
-//! 用量与 step 记账，以及开局配置与收场词汇。
+//! Turn：一个 turn 的领域状态 —— 会话消息、模型侧配置、用量与 step 记账，
+//! 以及开局配置与收场词汇。
 //!
-//! 状态机不记录日志、不产出事件：需要什么由下游通过这里的访问器读取。
-//! 系统提示只有 [`Turn::header`] 一个表示，[`Turn::prompt`] 把它
-//! 投影成模型输入的第一条 `system` 消息。
+//! `Turn` 只承载状态；推进它的 [`Agent`](crate::agent::Agent) 不记录日志、
+//! 不产出事件：需要什么由下游通过这里的访问器读取。系统提示只有
+//! [`Turn::header`] 一个表示，[`Turn::prompt`] 把它投影成模型输入的第一条
+//! `system` 消息。
 
 use crate::config::StepBudget;
 use crate::content::Content;
