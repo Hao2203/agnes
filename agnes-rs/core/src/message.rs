@@ -175,7 +175,7 @@ pub enum AssistantMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// The system prompt as a model input element. The prompt itself is a
-    /// field of the [`Context`](crate::context::Context); this variant exists
+    /// field of the [`Turn`](crate::turn::Turn); this variant exists
     /// for the projection into a model request.
     System {
         content: SystemPrompt,

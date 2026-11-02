@@ -5,11 +5,11 @@ use crate::permission::{PermissionPlugin, PermissionRules, Rule};
 use crate::record::{Event as RecordEvent, HostEvent};
 use crate::test_support::{assistant, user};
 use agnes_core::config::{StepBudget, SystemPrompt};
-use agnes_core::context::Context;
 use agnes_core::header::{Environment, Header};
 use agnes_core::llm::{LlmResponse, StopReason};
 use agnes_core::message::{Message, ToolArguments, ToolOutput};
 use agnes_core::tool::{JsonSchema, ToolError, ToolSpec};
+use agnes_core::turn::Turn;
 use agnes_io::input::{Input as InputPort, NoInput};
 use agnes_io::llm::{ApiBody, Llm};
 use agnes_io::tool::Tool;
@@ -606,8 +606,8 @@ struct PrimingRequests {
 }
 
 impl RequestBuilder for PrimingRequests {
-    fn build(&self, context: &Context) -> LlmRequest {
-        let mut prompt = context.prompt();
+    fn build(&self, turn: &Turn) -> LlmRequest {
+        let mut prompt = turn.prompt();
         prompt.tools.clear();
         prompt.input.insert(
             0,

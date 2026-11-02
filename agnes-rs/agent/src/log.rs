@@ -7,7 +7,7 @@
 //!
 //! 事件词汇归宿主（[`crate::record`]）：驱动是唯一的写者，把日志交还给
 //! 宿主以延续会话。请求长什么样是宿主的事 —— 由
-//! [`crate::RequestBuilder`] 从 core 的 `Context` 决定。
+//! [`crate::RequestBuilder`] 从 core 的 [`Turn`](agnes_core::turn::Turn) 决定。
 
 use crate::record::Event;
 use agnes_core::header::Header;

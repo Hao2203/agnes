@@ -266,7 +266,7 @@ mod tests {
             ApiKey::try_from("sk-test").unwrap(),
         );
 
-        let context = agnes_core::context::Context::new(
+        let turn = agnes_core::turn::Turn::new(
             agnes_core::header::Header::new(
                 SystemPrompt::new("sys"),
                 agnes_core::header::Environment::default(),
@@ -274,42 +274,42 @@ mod tests {
             agnes_core::config::StepBudget::new(NonZeroU32::new(4).unwrap()),
         );
         let model = ModelName::from_str("gpt-test").unwrap();
-        let turn =
-            agnes_core::turn::Turn::with_goal(context, Content::try_from("flip").unwrap()).start();
+        let agent =
+            agnes_core::agent::Agent::with_goal(turn, Content::try_from("flip").unwrap()).start();
 
         let request = LlmRequest {
             model: model.clone(),
-            prompt: turn.prompt(),
+            prompt: agent.prompt(),
         };
-        let turn = turn.call();
+        let agent = agent.call();
         let response = Llm::complete(&openai, &request).await.unwrap();
-        let agnes_core::turn::Replied::Tools(turn) = turn.respond(response) else {
+        let agnes_core::agent::Replied::Tools(agent) = agent.respond(response) else {
             panic!("expected Tools");
         };
-        let calls: Vec<_> = turn.calls().cloned().collect();
+        let calls: Vec<_> = agent.calls().cloned().collect();
         assert!(
             matches!(&calls[..], [tool] if tool.id.as_str() == "call_1" && tool.name.as_str() == "flag"),
             "第一个响应应该派发 flag 调用"
         );
 
         let call = calls.into_iter().next().unwrap();
-        let agnes_core::turn::Advanced::Next(turn) =
-            turn.finish(call.id, agnes_core::message::ToolOutput::success("ok"))
+        let agnes_core::agent::Advanced::Next(agent) =
+            agent.finish(call.id, agnes_core::message::ToolOutput::success("ok"))
         else {
             panic!("expected Next");
         };
         let request = LlmRequest {
             model: model.clone(),
-            prompt: turn.prompt(),
+            prompt: agent.prompt(),
         };
-        let turn = turn.call();
+        let agent = agent.call();
         let response = Llm::complete(&openai, &request).await.unwrap();
-        let agnes_core::turn::Replied::Closed(turn) = turn.respond(response) else {
+        let agnes_core::agent::Replied::Closed(agent) = agent.respond(response) else {
             panic!("expected Closed");
         };
-        assert_eq!(turn.outcome(), agnes_core::turn::Outcome::Answered);
+        assert_eq!(agent.outcome(), agnes_core::turn::Outcome::Answered);
         assert!(matches!(
-            turn.context().messages().last(),
+            agent.turn().messages().last(),
             Some(Message::Assistant(agnes_core::message::AssistantMessage::Text(content)))
                 if content.as_str() == "flipped it"
         ));

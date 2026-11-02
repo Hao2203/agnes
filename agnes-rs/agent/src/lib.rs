@@ -1,4 +1,4 @@
-//! 驱动器：宿主状态机（私有模块 `driver`）解释 [`agnes_core::turn`] 状态机
+//! 驱动器：宿主状态机（私有模块 `driver`）解释 [`agnes_core::agent`] 状态机
 //! 的转移 —— 机器只持有领域状态，动作由阶段提示（等模型 / 等工具）。
 //!
 //! 机器是类型状态的（阶段即类型）；这个 crate 做 IO —— 通过 `agnes-io`
@@ -8,7 +8,7 @@
 //!
 //! 宿主用 [`Host`] 装配：模型、输入、工具、扩展内核、审批口与会话日志在
 //! 装载期一次性解析。驱动从不自己组装提示词：[`RequestBuilder`] 是宿主
-//! 的转换者，在每次模型调用前由它把 [`Context`] 变成请求。
+//! 的转换者，在每次模型调用前由它把 [`Turn`] 变成请求。
 //!
 //! 工具执行前先过扩展内核（[`ext`]）：插件只处理事件、返回指令
 //! （[`ext::Command`]），执行权在系统 —— 放行执行、拒绝则以合成失败结果
@@ -35,11 +35,10 @@ pub use session::{SessionError, SessionLog};
 
 use agnes_core::config::ModelName;
 use agnes_core::content::Content;
-use agnes_core::context::Context;
 use agnes_core::llm::LlmRequest;
 use agnes_core::message::{AssistantMessage, Message, TokenUsage, ToolCall, ToolCallId};
 use agnes_core::tool::ToolName;
-use agnes_core::turn::Outcome;
+use agnes_core::turn::{Outcome, Turn};
 use agnes_io::llm::LlmError;
 use jiff::Timestamp;
 
@@ -66,13 +65,13 @@ pub enum AgentError {
     },
 }
 
-/// 把 [`Context`] 转换成具体请求。宿主提供一个，驱动在每次模型调用前询问
-/// 它 —— 提示词长什么样完全是宿主的事，[`Context::prompt`] 只是标准投影。
+/// 把 [`Turn`] 转换成具体请求。宿主提供一个，驱动在每次模型调用前询问
+/// 它 —— 提示词长什么样完全是宿主的事，[`Turn::prompt`] 只是标准投影。
 pub trait RequestBuilder {
-    fn build(&self, context: &Context) -> LlmRequest;
+    fn build(&self, turn: &Turn) -> LlmRequest;
 }
 
-/// 标准转换者：上下文的标准投影（[`Context::prompt`]）加模型名。
+/// 标准转换者：turn 的标准投影（[`Turn::prompt`]）加模型名。
 /// 对提示词有想法的宿主自己实现 [`RequestBuilder`]。
 #[derive(Debug, Clone)]
 pub struct StandardRequestBuilder {
@@ -86,10 +85,10 @@ impl StandardRequestBuilder {
 }
 
 impl RequestBuilder for StandardRequestBuilder {
-    fn build(&self, context: &Context) -> LlmRequest {
+    fn build(&self, turn: &Turn) -> LlmRequest {
         LlmRequest {
             model: self.model.clone(),
-            prompt: context.prompt(),
+            prompt: turn.prompt(),
         }
     }
 }

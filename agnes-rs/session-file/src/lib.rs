@@ -23,11 +23,11 @@
 //!   未知变体与非法载荷一律拒载，不猜。
 //! - 只有**最后一行**允许是撕裂的半行（崩溃时没写完）：丢弃并截断到物理
 //!   有效前缀；其他位置的不完整行是损坏。
-//! - 恢复 = 补写收尾事件（形状与 [`Turn::interrupted`] 一致），**绝不重写**
+//! - 恢复 = 补写收尾事件（形状与 [`Agent::interrupted`] 一致），**绝不重写**
 //!   已有记录。补写内容随 `Opened::repairs` 一并返回。
 //! - 单写者：打开时取文件锁；已被占用即失败。
 //!
-//! [`Turn::interrupted`]: agnes_core::turn::Turn::interrupted
+//! [`Agent::interrupted`]: agnes_core::agent::Agent::interrupted
 
 mod wire;
 
@@ -459,7 +459,7 @@ fn parse(raw: &str) -> Result<Parsed, OpenError> {
 
 // —— 崩溃恢复 ——
 
-/// 从日志推导崩溃时要补的收尾事件（与 `Turn::interrupted` 同形）：
+/// 从日志推导崩溃时要补的收尾事件（与 `Agent::interrupted` 同形）：
 ///
 /// 1. 当前 step 里模型声明过、却没有结果的调用 → `tool_execution_end`
 ///    + 错误 `tool_result`（按声明顺序）；

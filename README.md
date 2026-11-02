@@ -11,7 +11,7 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
-  `turn_end`）由驱动按序铸造并记入 `Log`；core 只持有领域状态（`Context`），
+  `turn_end`）由驱动按序铸造并记入 `Log`；core 只持有领域状态（`Turn`），
   消息、系统提示与工具环境都可从日志复原，一次请求也能从日志单独推导
 - 宿主扩展内核：插件只处理事件、返回指令，系统在检查点执行；拒绝单调
   （插件无法把拒绝变回放行），注入进队列，可在运行期增删工具与中止，
@@ -35,7 +35,7 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 cd agnes-rs
 cargo build --release
 export AGNES_API_KEY=sk-...
-./target/release/agnes run "解释 core/src/turn.rs 中的状态机"
+./target/release/agnes run "解释 core/src/agent.rs 中的状态机"
 ```
 
 也可以安装到 `PATH`：
@@ -153,7 +153,7 @@ util ← core ← io ← agent ← cli
 | crate | 职责 |
 | --- | --- |
 | `agnes-util` | 零依赖基础类型：`NonEmpty<T>`、`EmptyError` |
-| `agnes-core` | 纯领域模型与类型状态机（`Turn` + `Context`），无 I/O、无异步、不含序列化、不产出事件 |
+| `agnes-core` | 纯领域模型与类型状态机（`Agent` + `Turn`），无 I/O、无异步、不含序列化、不产出事件 |
 | `agnes-io` | 异步端口 trait：`Llm`、`Tool`、`HttpTransport`、`Input` |
 | `agnes-llm-openai` | OpenAI Chat Completions 协议适配，泛型于传输层 |
 | `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器 |
@@ -163,14 +163,14 @@ util ← core ← io ← agent ← cli
 
 ### 关键设计
 
-- **类型状态机**：`Turn<Ready>` / `Turn<ReadyWithGoal>` →
-  `Turn<AwaitingCall>` → `Turn<AwaitingModel>` → `Turn<AwaitingTools>` →
-  `Turn<Closed>`；转移消耗当前状态、交还下一个阶段（或携带下一阶段的
+- **类型状态机**：`Agent<Ready>` / `Agent<ReadyWithGoal>` →
+  `Agent<AwaitingCall>` → `Agent<AwaitingModel>` → `Agent<AwaitingTools>` →
+  `Agent<Closed>`；转移消耗当前状态、交还下一个阶段（或携带下一阶段的
   枚举），阶段本身就是动作提示。就绪阶段可以携带 goal（`start` 时追加进
-  `Context`），也可以不带 goal 直接基于已有历史启动；只有待调用阶段可以
-  注入消息，`call` 才冻结请求、开启 step 并进入等响应阶段。`Turn` 持有
-  一个 `Context`（系统提示与工具环境、会话消息、用量、step 记账）；core
-  不持有日志、不产出事件，驱动读取 `Context` 并自行铸造、记录事件。
+  `Turn`），也可以不带 goal 直接基于已有历史启动；只有待调用阶段可以
+  注入消息，`call` 才冻结请求、开启 step 并进入等响应阶段。`Agent` 持有
+  一个 `Turn`（系统提示与工具环境、会话消息、用量、step 记账）；core
+  不持有日志、不产出事件，驱动读取 `Turn` 并自行铸造、记录事件。
 - **宿主扩展内核**：`Plugin` 只有一个处理入口 `on_event`；它看不到派发/
   执行/审批阶段，只返回 `Command`（拒绝 / 审批 / 替换结果 / 注入 / 中止 /
   增删工具）。`Extensions` 把指令收进 outbox，驱动在明确检查点取用：门禁
@@ -192,11 +192,11 @@ util ← core ← io ← agent ← cli
 - **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型（拒绝、
   挡回、超时同样如此）；只有模型或传输错误会中止运行。
 - **日志即账本**：`Log` 类型位于宿主侧（`agnes-agent`），由驱动持有，是唯一
-  的持久化状态；core 只持有领域状态 `Context`，不产出事件。系统提示与工具
-  环境是 `Context` 的 header 字段；驱动在每个 turn 开局记录一条
+  的持久化状态；core 只持有领域状态 `Turn`，不产出事件。系统提示与工具
+  环境是 `Turn` 的 header 字段；驱动在每个 turn 开局记录一条
   `record::Event::Header`，工具环境运行中变化时再记一条。消息也是事件
   （`record::Event::Message`），用户输入与插件注入都是带角色的消息事件。
-  `Context::prompt()` 把 header、消息与工具表投影成模型输入，因此一次请求
+  `Turn::prompt()` 把 header、消息与工具表投影成模型输入，因此一次请求
   完全可以从日志复原；`RunSummary.log` 可直接传回下一次运行。
   工具集变化（含插件运行期注入/移除）在下一个模型调用前记一条新 header，
   同一 turn 内生效；在飞调用不受影响。
@@ -204,7 +204,7 @@ util ← core ← io ← agent ← cli
   前与收场时 `flush`（fsync）。格式 v6：首行版本标记，之后是 `record`
   事件行与 `host` 审计行（审批问询/决定、插件中止、失败原因），共享一个
   连续 `seq`；恢复时校验连续性并**补写**未收尾的 step/turn（与
-  `Turn::interrupted` 同形），从不重写已有记录；旧格式（含 v5）与重名
+  `Agent::interrupted` 同形），从不重写已有记录；旧格式（含 v5）与重名
   工具环境拒载。`seq` 只在实际写成功后提交，写失败会 poison 会话句柄，
   避免半行之后继续追加。v6 里 `MessageEnd` 只记无载荷的 `StopKind`，
   `StepOutcome`/`Outcome` 不再复制答复文本。
@@ -212,8 +212,8 @@ util ← core ← io ← agent ← cli
   `LlmRequest.model` 记录），切换模型后日志仍能归因；审批落定、插件中止
   与 run 失败原因不扩 core 词汇，作为 `HostEvent` 与事件一起落盘。
 - **转换者由宿主决定**：`core` 不组装提示词；驱动器在每次模型调用前用
-  宿主侧的 `RequestBuilder`（`agnes-agent`）把 `Context` 转成 `LlmRequest`。
-- **格式由上层定义**：core 与 agent 的领域词汇（`Context`、`record::Event`、
+  宿主侧的 `RequestBuilder`（`agnes-agent`）把 `Turn` 转成 `LlmRequest`。
+- **格式由上层定义**：core 与 agent 的领域词汇（`Turn`、`record::Event`、
   `HostEvent`）不实现序列化 —— 会话的 JSONL 形状由 `agnes-session-file` 的
   `wire` 层定义（同 `agnes-llm-openai` 的 `wire.rs`），校验与拒载规则跟着
   格式走，领域词汇保持格式无关。

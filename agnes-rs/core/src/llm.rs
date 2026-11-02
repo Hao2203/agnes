@@ -1,7 +1,7 @@
 //! Model-call data: the semantic prompt and the concrete request.
 //!
 //! `core` never assembles a request itself — the host decides what the model
-//! sees. [`Context::prompt`](crate::context::Context::prompt) is the standard
+//! sees. [`Turn::prompt`](crate::turn::Turn::prompt) is the standard
 //! projection of the turn's state; [`Prompt`] is only the resulting data.
 
 use crate::config::ModelName;

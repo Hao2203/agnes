@@ -1,11 +1,11 @@
 //! 下游记录词汇：一次 run 的持久化事件与宿主审计记录。
 //!
-//! 记录格式归宿主所有 —— core 只持有领域状态（[`Context`]），不产出事件。
+//! 记录格式归宿主所有 —— core 只持有领域状态（[`Turn`]），不产出事件。
 //! 驱动按发生顺序铸造这些事件并写入日志；会话格式、插件观察、界面渲染
 //! 都使用这一套词汇。`HostEvent` 是 core 不该知道的宿主语义（审批、中止、
 //! 失败），与事件共享同一条顺序。
 //!
-//! [`Context`]: agnes_core::context::Context
+//! [`Turn`]: agnes_core::turn::Turn
 
 use agnes_core::config::ModelName;
 use agnes_core::header::Header;

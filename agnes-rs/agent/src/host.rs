@@ -8,8 +8,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use agnes_core::agent::Agent;
 use agnes_core::config::ModelName;
-use agnes_core::context::Context;
 use agnes_core::turn::{AgentConfig, Turn};
 use agnes_io::input::Input as InputPort;
 use agnes_io::llm::Llm;
@@ -174,13 +174,12 @@ impl<'a> Host<'a> {
             sink: &mut *sink,
             session,
         };
-        // 上下文从持久化日志的历史消息重建；系统提示与工具环境以当前
+        // turn 从持久化日志的历史消息重建；系统提示与工具环境以当前
         // 配置为准。goal 可选：有则先留在就绪阶段，无则直接基于历史启动。
-        let context =
-            Context::with_messages(header, budget, log.messages().cloned().collect::<Vec<_>>());
+        let turn = Turn::with_messages(header, budget, log.messages().cloned().collect::<Vec<_>>());
         let start = match goal {
-            Some(goal) => Start::Goal(Turn::with_goal(context, goal)),
-            None => Start::Empty(Turn::new(context)),
+            Some(goal) => Start::Goal(Agent::with_goal(turn, goal)),
+            None => Start::Empty(Agent::new(turn)),
         };
         let mut log = log;
         // 驱动状态机一路跑到收场（收场前的报告事件由它的泵补完）；日志
