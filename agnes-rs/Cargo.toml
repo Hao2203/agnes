@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "service",
     "core",
     "util",
     "io",
@@ -18,6 +19,7 @@ rust-version = "1.89"
 license = "MIT"
 
 [workspace.dependencies]
+agnes-service = { path = "service" }
 agnes-core = { path = "core" }
 agnes-util = { path = "util" }
 agnes-io = { path = "io" }
@@ -26,6 +28,8 @@ agnes-llm-openai = { path = "llm-openai" }
 agnes-session-file = { path = "session-file" }
 agnes-agent = { path = "agent" }
 async-trait = "0.1"
+log = "0.4"
+futures-lite = "2"
 cold-string = "0.5"
 secrecy = "0.10"
 url = "2"
