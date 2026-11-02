@@ -182,11 +182,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
     /// 一次模型往返：注入 → 工具变更 → 请求快照 → call → 响应落账。
     async fn call_model(&mut self, mut agent: Agent<AwaitingCall>) -> Result<Staged, AgentError> {
         // 注入立即进会话；先入账，再检查中止，保证日志里的消息不少。
-        let before = agent.turn().messages().len();
-        self.drain_input(&mut agent);
-        self.drain_injections(&mut agent);
-        let injected = new_messages(&agent, before);
-        self.record_injected(&injected).await?;
+        self.drain_and_record(&mut agent).await?;
 
         // 中止优先：不再启动新的模型调用。
         if self.take_abort().await?.is_some() {
@@ -199,11 +195,7 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
                 self.record(event).await?;
             }
             // header 已经分发；插件可能借此注入或中止。
-            let before = agent.turn().messages().len();
-            self.drain_input(&mut agent);
-            self.drain_injections(&mut agent);
-            let injected = new_messages(&agent, before);
-            self.record_injected(&injected).await?;
+            self.drain_and_record(&mut agent).await?;
             if self.take_abort().await?.is_some() {
                 return self.close_interrupted_call(agent).await;
             }
@@ -614,6 +606,18 @@ impl<'a, 's, 'q> Driver<'a, 's, 'q> {
         for content in self.ports.input.drain() {
             agent.inject(Message::User { content });
         }
+    }
+
+    /// 排空输入与插件注入，并立即把新增消息记入日志。
+    async fn drain_and_record(
+        &mut self,
+        agent: &mut Agent<AwaitingCall>,
+    ) -> Result<(), AgentError> {
+        let before = agent.turn().messages().len();
+        self.drain_input(agent);
+        self.drain_injections(agent);
+        let injected = new_messages(agent, before);
+        self.record_injected(&injected).await
     }
 
     /// 取走一条中止指令。
