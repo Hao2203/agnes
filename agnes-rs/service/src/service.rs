@@ -6,10 +6,14 @@
 use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+use async_trait::async_trait;
 
 use crate::ctx::Ctx;
+use crate::effect::EffectGuard;
 use crate::error::ServiceError;
+use crate::host::{ServiceHost, Shared};
 use crate::plugin::Fiber;
 
 /// 一个服务依赖。`id` 是身份，`name` 只进日志与诊断。
@@ -79,7 +83,7 @@ impl<T: ?Sized + Send + Sync + 'static> ServiceParam for Arc<T> {
     }
 
     fn resolve(ctx: &Ctx<'_>) -> Option<Self::Output> {
-        ctx.get::<T>()
+        ctx.host().lock().services.get::<T>()
     }
 }
 
@@ -90,7 +94,7 @@ impl<T: ?Sized + Send + Sync + 'static> ServiceParam for Option<Arc<T>> {
     fn deps_into(_deps: &mut Vec<ServiceDep>) {}
 
     fn resolve(ctx: &Ctx<'_>) -> Option<Self::Output> {
-        Some(ctx.get::<T>())
+        Some(ctx.host().lock().services.get::<T>())
     }
 }
 
@@ -124,6 +128,95 @@ pub struct ServiceInfo {
     pub type_name: &'static str,
     pub provider: Fiber,
     pub provider_name: String,
+}
+
+/// 服务注册表 capability；根服务，插件通过 `Deps` 注入。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Services;
+
+impl Services {
+    /// 以当前 fiber 为提供者注册服务。
+    ///
+    /// # Errors
+    ///
+    /// 同一类型已经有提供者时返回 [`ServiceError::ServiceTaken`]。
+    pub async fn provide<T>(&self, ctx: &Ctx<'_>, service: Arc<T>) -> Result<(), ServiceError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        let id = TypeId::of::<T>();
+        let owner = ctx.fiber();
+        let result = ctx
+            .effect(async move {
+                let result = ctx.host().lock().services.provide::<T>(owner, service);
+                let guard = ServiceGuard {
+                    host: ctx.host().downgrade(),
+                    id,
+                    provider: owner,
+                    inserted: result.is_ok(),
+                };
+                (result, guard)
+            })
+            .await;
+        if result.is_ok() {
+            ctx.host().settle_if_idle().await;
+        }
+        result
+    }
+
+    /// 查找服务；不存在时返回 `None`。可选依赖用这个。
+    pub fn get<T>(&self, ctx: &Ctx<'_>) -> Option<Arc<T>>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        ctx.host().lock().services.get::<T>()
+    }
+
+    /// 查找服务；不存在时报错。
+    ///
+    /// # Errors
+    ///
+    /// 服务不存在时返回 [`ServiceError::MissingService`]。
+    pub fn require<T>(&self, ctx: &Ctx<'_>) -> Result<Arc<T>, ServiceError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.get::<T>(ctx).ok_or(ServiceError::MissingService {
+            type_name: std::any::type_name::<T>(),
+        })
+    }
+}
+
+struct ServiceGuard {
+    host: Weak<Shared>,
+    id: TypeId,
+    provider: Fiber,
+    inserted: bool,
+}
+
+impl ServiceGuard {
+    fn remove(&self) {
+        if !self.inserted {
+            return;
+        }
+        if let Some(shared) = self.host.upgrade() {
+            let host = ServiceHost::from_shared(shared);
+            host.lock().services.remove(self.id, self.provider);
+        }
+    }
+}
+
+#[async_trait]
+impl EffectGuard for ServiceGuard {
+    async fn close(&mut self) {
+        self.remove();
+    }
+}
+
+impl Drop for ServiceGuard {
+    fn drop(&mut self) {
+        self.remove();
+    }
 }
 
 pub(crate) struct ServiceEntry {

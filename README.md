@@ -152,9 +152,10 @@ service（独立，无 agnes 依赖，暂未被其他 crate 依赖）
 `type Deps = Arc<…>` 自动推导依赖；缺依赖时停在 `Pending` 并写 `log`
 日志。提供者卸载后依赖者回到 `Pending`，重新提供时复用同一实例再次
 `apply`。生命周期是异步的（`mount`/`unmount`/`shutdown`、
-`Plugin::apply`/`shutdown`、`waterfall`），但 crate 不绑定运行时；effect
-的 disposer 仍是同步的，异步收尾放在 `Plugin::shutdown`，未调用
-`shutdown().await` 就丢弃宿主时只会回卷同步 effect。
+`Plugin::apply`/`shutdown`、`waterfall`），但 crate 不绑定运行时。服务
+查询/提供、事件、子挂载分别是 `Services`/`Events`/`Mounts` root service，
+`Ctx` 只提供 `effect`；effect 是每个 fiber 的 LIFO guard 容器，正常卸载时
+`close().await`，取消或宿主 Drop 时靠 guard 的 `Drop` 兜底。
 
 `agnes-transport-reqwest` 与 `agnes-llm-openai` 是挂在 `io` 之上的适配器；
 `agnes-session-file` 挂在 `agnes-agent` 之上，因为持久化事件词汇归宿主。
@@ -162,7 +163,7 @@ service（独立，无 agnes 依赖，暂未被其他 crate 依赖）
 
 | crate | 职责 |
 | --- | --- |
-| `agnes-service` | 独立服务编排：`TypeId` 服务表、类型级依赖（`type Deps`）、异步生命周期、可逆 effect、同步 `emit`/`bail` + 异步 `waterfall`、`log` 日志；暂未被其他 crate 依赖 |
+| `agnes-service` | 独立服务编排：`TypeId` 服务表、类型级依赖（`type Deps`）、异步生命周期、异步 LIFO effect guard、独立 `Services`/`Events`/`Mounts` root service、同步 `emit`/`bail` + 异步 `waterfall`、`log` 日志；暂未被其他 crate 依赖 |
 | `agnes-util` | 零依赖基础类型：`NonEmpty<T>`、`EmptyError` |
 | `agnes-core` | 纯领域模型与类型状态机（`Agent` + `Turn`），无 I/O、无异步、不含序列化、不产出事件 |
 | `agnes-io` | 异步端口 trait：`Llm`、`Tool`、`HttpTransport`、`Input` |

@@ -1,4 +1,4 @@
-//! Cordis 教程 1–6 章的 Rust 等价测试：异步生命周期 + 类型级依赖。
+//! Cordis 教程 1–6 章的 Rust 等价测试：异步生命周期 + 类型级依赖 + 独立服务。
 
 use std::any::TypeId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 use futures_lite::future::block_on;
 
 use crate::event::next;
+use crate::plugin::{Adapter, ApplyError, ErasedPlugin};
 use crate::{
-    BailKey, Ctx, EventKey, Fiber, FiberInfo, FiberState, Listener, Plugin, PluginError,
-    ServiceDep, ServiceError, ServiceHost, ServiceParam, WaterfallKey, async_trait,
+    BailKey, Ctx, EffectGuard, EventKey, Events, FiberInfo, FiberState, Listener, Mounts, Plugin,
+    PluginError, ServiceDep, ServiceError, ServiceHost, ServiceParam, Services, WaterfallKey,
+    async_trait,
 };
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -27,6 +29,37 @@ fn named(host: &ServiceHost, name: &str) -> FiberInfo {
         .into_iter()
         .find(|info| info.name == name)
         .unwrap()
+}
+
+struct TestGuard {
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl TestGuard {
+    fn new(cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    fn run(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+#[async_trait]
+impl EffectGuard for TestGuard {
+    async fn close(&mut self) {
+        self.run();
+    }
+}
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        self.run();
+    }
 }
 
 struct Hello {
@@ -70,12 +103,15 @@ impl Plugin for SlowApply {
 
     async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        ctx.effect(move || {
+        ctx.effect(async move {
             (
                 (),
-                Box::new(move || log.lock().unwrap().push("cancelled-apply-cleanup".into())),
+                TestGuard::new(move || {
+                    log.lock().unwrap().push("cancelled-apply-cleanup".into());
+                }),
             )
-        });
+        })
+        .await;
         futures_lite::future::pending::<()>().await;
         Ok(())
     }
@@ -97,6 +133,45 @@ fn cancelling_apply_restores_pending_and_unwinds_effects() {
         assert_eq!(host.fiber(fiber).unwrap().state, FiberState::Pending);
         assert!(host.unmount(fiber).await);
         assert_eq!(host.fiber(fiber).unwrap().state, FiberState::Disposed);
+        host.shutdown().await;
+    });
+}
+
+struct SlowParent {
+    log: Log,
+}
+
+#[async_trait]
+impl Plugin for SlowParent {
+    type Deps = Arc<Mounts>;
+
+    fn name(&self) -> &str {
+        "slow-parent"
+    }
+
+    async fn apply(&mut self, ctx: &Ctx<'_>, mounts: Arc<Mounts>) -> Result<(), PluginError> {
+        mounts
+            .mount(
+                ctx,
+                Child {
+                    log: Arc::clone(&self.log),
+                },
+            )
+            .await;
+        futures_lite::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+#[test]
+fn cancelling_parent_disposes_mounted_child() {
+    block_on(async {
+        let host = ServiceHost::new();
+        let outcome =
+            futures_lite::future::poll_once(Box::pin(host.mount(SlowParent { log: log() }))).await;
+        assert!(outcome.is_none());
+        assert_eq!(named(&host, "slow-parent").state, FiberState::Pending);
+        assert_eq!(named(&host, "child").state, FiberState::Disposed);
         host.shutdown().await;
     });
 }
@@ -143,15 +218,17 @@ impl Plugin for Effects {
     async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
         for label in ["first", "second"] {
             let log = Arc::clone(&self.log);
-            ctx.effect(move || {
+            ctx.effect(async move {
                 log.lock().unwrap().push(label.to_string());
+                let cleanup = Arc::clone(&log);
                 (
                     (),
-                    Box::new(move || {
-                        log.lock().unwrap().push(format!("{label}-cleanup"));
+                    TestGuard::new(move || {
+                        cleanup.lock().unwrap().push(format!("{label}-cleanup"));
                     }),
                 )
-            });
+            })
+            .await;
         }
         Ok(())
     }
@@ -213,14 +290,15 @@ impl Plugin for Child {
     async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
         self.log.lock().unwrap().push("child".into());
         let log = Arc::clone(&self.log);
-        ctx.effect(move || {
+        ctx.effect(async move {
             (
                 (),
-                Box::new(move || {
+                TestGuard::new(move || {
                     log.lock().unwrap().push("child-cleanup".into());
                 }),
             )
-        });
+        })
+        .await;
         Ok(())
     }
 }
@@ -231,27 +309,32 @@ struct Parent {
 
 #[async_trait]
 impl Plugin for Parent {
-    type Deps = ();
+    type Deps = Arc<Mounts>;
 
     fn name(&self) -> &str {
         "parent"
     }
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, mounts: Arc<Mounts>) -> Result<(), PluginError> {
         self.log.lock().unwrap().push("parent".into());
-        ctx.mount(Child {
-            log: Arc::clone(&self.log),
-        })
-        .await;
+        mounts
+            .mount(
+                ctx,
+                Child {
+                    log: Arc::clone(&self.log),
+                },
+            )
+            .await;
         let log = Arc::clone(&self.log);
-        ctx.effect(move || {
+        ctx.effect(async move {
             (
                 (),
-                Box::new(move || {
+                TestGuard::new(move || {
                     log.lock().unwrap().push("parent-cleanup".into());
                 }),
             )
-        });
+        })
+        .await;
         Ok(())
     }
 }
@@ -304,12 +387,12 @@ struct ProvideKeys;
 
 #[async_trait]
 impl Plugin for ProvideKeys {
-    type Deps = ();
+    type Deps = Arc<Services>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, services: Arc<Services>) -> Result<(), PluginError> {
         let english = Arc::new(English);
-        ctx.provide(Arc::clone(&english)).await?;
-        ctx.provide::<dyn Greeter>(english).await?;
+        services.provide(ctx, Arc::clone(&english)).await?;
+        services.provide::<dyn Greeter>(ctx, english).await?;
         Ok(())
     }
 }
@@ -320,8 +403,8 @@ fn services_are_keyed_by_type_id() {
         let host = ServiceHost::new();
         host.mount(ProvideKeys).await;
 
-        assert_eq!(host.ctx().get::<English>().unwrap().greet(), "hello");
-        assert_eq!(host.ctx().get::<dyn Greeter>().unwrap().greet(), "hello");
+        assert_eq!(host.resolve::<English>().unwrap().greet(), "hello");
+        assert_eq!(host.resolve::<dyn Greeter>().unwrap().greet(), "hello");
 
         let names: Vec<&str> = host
             .services()
@@ -338,10 +421,11 @@ struct Provider;
 
 #[async_trait]
 impl Plugin for Provider {
-    type Deps = ();
+    type Deps = Arc<Services>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
-        ctx.provide(Arc::new(GreeterService { greeting: "hello" }))
+    async fn apply(&mut self, ctx: &Ctx<'_>, services: Arc<Services>) -> Result<(), PluginError> {
+        services
+            .provide(ctx, Arc::new(GreeterService { greeting: "hello" }))
             .await?;
         Ok(())
     }
@@ -362,6 +446,7 @@ fn duplicate_service_fails() {
                 .and_then(|error| error.downcast_ref::<ServiceError>()),
             Some(ServiceError::ServiceTaken { .. })
         ));
+        assert!(host.resolve::<GreeterService>().is_some());
         host.shutdown().await;
     });
 }
@@ -459,13 +544,179 @@ fn provider_loss_pends_and_reapplies_same_instance() {
         assert!(host.unmount(provider).await);
         assert_eq!(host.fiber(consumer).unwrap().state, FiberState::Pending);
         assert_eq!(applies.load(Ordering::SeqCst), 1);
-        assert!(host.services().is_empty());
+        assert!(
+            !host
+                .services()
+                .iter()
+                .any(|service| service.type_name.contains("GreeterService"))
+        );
 
         host.mount(Provider).await;
         assert_eq!(host.fiber(consumer).unwrap().state, FiberState::Active);
         assert_eq!(applies.load(Ordering::SeqCst), 2);
         assert_eq!(entries(&log), ["hello", "hello"]);
         host.shutdown().await;
+    });
+}
+
+struct ShutdownPlugin {
+    applies: Arc<AtomicUsize>,
+    shutdowns: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for ShutdownPlugin {
+    type Deps = ();
+
+    async fn apply(&mut self, _ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+        self.applies.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), PluginError> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn shutdown_is_awaited_on_unmount() {
+    block_on(async {
+        let applies = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let host = ServiceHost::new();
+        let fiber = host
+            .mount(ShutdownPlugin {
+                applies: Arc::clone(&applies),
+                shutdowns: Arc::clone(&shutdowns),
+            })
+            .await;
+
+        assert_eq!(applies.load(Ordering::SeqCst), 1);
+        assert!(host.unmount(fiber).await);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+
+        host.shutdown().await;
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    });
+}
+
+struct FailingWithShutdown {
+    shutdowns: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for FailingWithShutdown {
+    type Deps = ();
+
+    async fn apply(&mut self, _ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+        Err("boom".into())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), PluginError> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn shutdown_is_awaited_on_apply_failure() {
+    block_on(async {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let host = ServiceHost::new();
+        let fiber = host
+            .mount(FailingWithShutdown {
+                shutdowns: Arc::clone(&shutdowns),
+            })
+            .await;
+
+        assert_eq!(host.fiber(fiber).unwrap().state, FiberState::Failed);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        host.shutdown().await;
+    });
+}
+
+struct ShutdownConsumer {
+    applies: Arc<AtomicUsize>,
+    shutdowns: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for ShutdownConsumer {
+    type Deps = Arc<GreeterService>;
+
+    async fn apply(
+        &mut self,
+        _ctx: &Ctx<'_>,
+        _service: Arc<GreeterService>,
+    ) -> Result<(), PluginError> {
+        self.applies.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), PluginError> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn dependency_loss_shuts_down_and_reapplies_same_instance() {
+    block_on(async {
+        let applies = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let host = ServiceHost::new();
+        let consumer = host
+            .mount(ShutdownConsumer {
+                applies: Arc::clone(&applies),
+                shutdowns: Arc::clone(&shutdowns),
+            })
+            .await;
+        assert_eq!(host.fiber(consumer).unwrap().state, FiberState::Pending);
+
+        let provider = host.mount(Provider).await;
+        assert_eq!(host.fiber(consumer).unwrap().state, FiberState::Active);
+        assert_eq!(applies.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+
+        assert!(host.unmount(provider).await);
+        assert_eq!(host.fiber(consumer).unwrap().state, FiberState::Pending);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+
+        host.mount(Provider).await;
+        assert_eq!(host.fiber(consumer).unwrap().state, FiberState::Active);
+        assert_eq!(applies.load(Ordering::SeqCst), 2);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+
+        assert!(host.unmount(consumer).await);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 2);
+        host.shutdown().await;
+    });
+}
+
+struct NeedsMissing;
+
+#[async_trait]
+impl Plugin for NeedsMissing {
+    type Deps = Arc<GreeterService>;
+
+    async fn apply(
+        &mut self,
+        _ctx: &Ctx<'_>,
+        _service: Arc<GreeterService>,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn missing_dependency_resolve_reports_missing_not_plugin_error() {
+    block_on(async {
+        let host = ServiceHost::new();
+        let ctx = host.ctx();
+        let mut adapter = Adapter::new(NeedsMissing);
+        let result = ErasedPlugin::apply(&mut adapter, &ctx).await;
+        assert!(matches!(result, Err(ApplyError::MissingDeps)));
     });
 }
 
@@ -509,12 +760,13 @@ struct ProvideBoth;
 
 #[async_trait]
 impl Plugin for ProvideBoth {
-    type Deps = ();
+    type Deps = Arc<Services>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
-        ctx.provide(Arc::new(GreeterService { greeting: "hello" }))
+    async fn apply(&mut self, ctx: &Ctx<'_>, services: Arc<Services>) -> Result<(), PluginError> {
+        services
+            .provide(ctx, Arc::new(GreeterService { greeting: "hello" }))
             .await?;
-        ctx.provide(Arc::new(English)).await?;
+        services.provide(ctx, Arc::new(English)).await?;
         Ok(())
     }
 }
@@ -573,17 +825,21 @@ struct Emitter {
 
 #[async_trait]
 impl Plugin for Emitter {
-    type Deps = ();
+    type Deps = Arc<Events>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, events: Arc<Events>) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        ctx.on(PING, move |_ctx: &Ctx<'_>, value: &u32| {
-            log.lock().unwrap().push(format!("a:{value}"));
-        });
+        events
+            .on(ctx, PING, move |value: &u32| {
+                log.lock().unwrap().push(format!("a:{value}"));
+            })
+            .await;
         let log = Arc::clone(&self.log);
-        ctx.on(PING, move |_ctx: &Ctx<'_>, value: &u32| {
-            log.lock().unwrap().push(format!("b:{value}"));
-        });
+        events
+            .on(ctx, PING, move |value: &u32| {
+                log.lock().unwrap().push(format!("b:{value}"));
+            })
+            .await;
         Ok(())
     }
 }
@@ -598,12 +854,13 @@ fn emit_observes_in_registration_order() {
                 log: Arc::clone(&log),
             })
             .await;
+        let events = host.resolve::<Events>().unwrap();
 
-        host.ctx().emit(PING, &7);
+        events.emit(PING, &7);
         assert_eq!(entries(&log), ["a:7", "b:7"]);
 
         assert!(host.unmount(fiber).await);
-        host.ctx().emit(PING, &8);
+        events.emit(PING, &8);
         assert_eq!(entries(&log), ["a:7", "b:7"]);
         host.shutdown().await;
     });
@@ -615,13 +872,15 @@ struct Prepender {
 
 #[async_trait]
 impl Plugin for Prepender {
-    type Deps = ();
+    type Deps = Arc<Events>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, events: Arc<Events>) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        ctx.prepend(PING, move |_ctx: &Ctx<'_>, value: &u32| {
-            log.lock().unwrap().push(format!("pre:{value}"));
-        });
+        events
+            .prepend(ctx, PING, move |value: &u32| {
+                log.lock().unwrap().push(format!("pre:{value}"));
+            })
+            .await;
         Ok(())
     }
 }
@@ -639,8 +898,9 @@ fn prepend_runs_before_existing_listeners() {
             log: Arc::clone(&log),
         })
         .await;
+        let events = host.resolve::<Events>().unwrap();
 
-        host.ctx().emit(PING, &1);
+        events.emit(PING, &1);
         assert_eq!(entries(&log), ["pre:1", "a:1", "b:1"]);
         host.shutdown().await;
     });
@@ -653,13 +913,15 @@ struct Removable {
 
 #[async_trait]
 impl Plugin for Removable {
-    type Deps = ();
+    type Deps = Arc<Events>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, events: Arc<Events>) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        let token = ctx.on(PING, move |_ctx: &Ctx<'_>, value: &u32| {
-            log.lock().unwrap().push(format!("removable:{value}"));
-        });
+        let token = events
+            .on(ctx, PING, move |value: &u32| {
+                log.lock().unwrap().push(format!("removable:{value}"));
+            })
+            .await;
         *self.token.lock().unwrap() = Some(token);
         Ok(())
     }
@@ -676,11 +938,12 @@ fn off_removes_a_listener() {
             log: Arc::clone(&log),
         })
         .await;
+        let events = host.resolve::<Events>().unwrap();
 
-        host.ctx().emit(PING, &1);
+        events.emit(PING, &1);
         let listener = token.lock().unwrap().unwrap();
-        assert!(host.ctx().off(listener));
-        host.ctx().emit(PING, &2);
+        assert!(events.off(listener));
+        events.emit(PING, &2);
         assert_eq!(entries(&log), ["removable:1"]);
         host.shutdown().await;
     });
@@ -694,24 +957,30 @@ struct Decider {
 
 #[async_trait]
 impl Plugin for Decider {
-    type Deps = ();
+    type Deps = Arc<Events>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, events: Arc<Events>) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        ctx.on_bail(DECIDE, move |_ctx: &Ctx<'_>, value: &i32| {
-            log.lock().unwrap().push(format!("first:{value}"));
-            None
-        });
+        events
+            .on_bail(ctx, DECIDE, move |value: &i32| {
+                log.lock().unwrap().push(format!("first:{value}"));
+                None
+            })
+            .await;
         let log = Arc::clone(&self.log);
-        ctx.on_bail(DECIDE, move |_ctx: &Ctx<'_>, value: &i32| {
-            log.lock().unwrap().push(format!("second:{value}"));
-            Some("second")
-        });
+        events
+            .on_bail(ctx, DECIDE, move |value: &i32| {
+                log.lock().unwrap().push(format!("second:{value}"));
+                Some("second")
+            })
+            .await;
         let log = Arc::clone(&self.log);
-        ctx.on_bail(DECIDE, move |_ctx: &Ctx<'_>, value: &i32| {
-            log.lock().unwrap().push(format!("third:{value}"));
-            Some("third")
-        });
+        events
+            .on_bail(ctx, DECIDE, move |value: &i32| {
+                log.lock().unwrap().push(format!("third:{value}"));
+                Some("third")
+            })
+            .await;
         Ok(())
     }
 }
@@ -725,8 +994,9 @@ fn bail_first_answer_wins() {
             log: Arc::clone(&log),
         })
         .await;
+        let events = host.resolve::<Events>().unwrap();
 
-        assert_eq!(host.ctx().bail(DECIDE, &1), Some("second"));
+        assert_eq!(events.bail(DECIDE, &1), Some("second"));
         assert_eq!(entries(&log), ["first:1", "second:1"]);
         host.shutdown().await;
     });
@@ -738,24 +1008,25 @@ struct Wrapper;
 
 #[async_trait]
 impl Plugin for Wrapper {
-    type Deps = ();
+    type Deps = Arc<Events>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
-        ctx.on_waterfall(
-            TRANSFORM,
-            |_ctx: &Ctx<'_>, _input: &String, continuation| {
+    async fn apply(&mut self, ctx: &Ctx<'_>, events: Arc<Events>) -> Result<(), PluginError> {
+        events
+            .on_waterfall(ctx, TRANSFORM, |_input: &String, continuation| {
                 next(async move { continuation.await.to_uppercase() })
-            },
-        );
-        ctx.on_waterfall(TRANSFORM, |_ctx: &Ctx<'_>, input: &String, continuation| {
-            next(async move {
-                if input.contains("blocked") {
-                    "** blocked **".to_string()
-                } else {
-                    continuation.await
-                }
             })
-        });
+            .await;
+        events
+            .on_waterfall(ctx, TRANSFORM, |input: &String, continuation| {
+                next(async move {
+                    if input.contains("blocked") {
+                        "** blocked **".to_string()
+                    } else {
+                        continuation.await
+                    }
+                })
+            })
+            .await;
         Ok(())
     }
 }
@@ -765,10 +1036,11 @@ fn waterfall_wraps_and_short_circuits() {
     block_on(async {
         let host = ServiceHost::new();
         host.mount(Wrapper).await;
+        let events = host.resolve::<Events>().unwrap();
 
         let hello = "hello".to_string();
         assert_eq!(
-            host.ctx()
+            events
                 .waterfall(TRANSFORM, &hello, || "hello".to_string())
                 .await,
             "HELLO"
@@ -776,7 +1048,7 @@ fn waterfall_wraps_and_short_circuits() {
 
         let blocked = "blocked words".to_string();
         assert_eq!(
-            host.ctx()
+            events
                 .waterfall(TRANSFORM, &blocked, || "blocked words".to_string())
                 .await,
             "** BLOCKED **"
@@ -793,25 +1065,28 @@ struct Reentrant {
 
 #[async_trait]
 impl Plugin for Reentrant {
-    type Deps = ();
+    type Deps = Arc<Events>;
 
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
+    async fn apply(&mut self, ctx: &Ctx<'_>, events: Arc<Events>) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        ctx.on(INNER, move |_ctx: &Ctx<'_>, value: &u32| {
-            log.lock().unwrap().push(format!("inner:{value}"));
-        });
+        events
+            .on(ctx, INNER, move |value: &u32| {
+                log.lock().unwrap().push(format!("inner:{value}"));
+            })
+            .await;
         let log = Arc::clone(&self.log);
-        ctx.on_waterfall(
-            TRANSFORM,
-            move |ctx: &Ctx<'_>, _input: &String, continuation| {
+        let inner = Arc::clone(&events);
+        events
+            .on_waterfall(ctx, TRANSFORM, move |_input: &String, continuation| {
                 let log = Arc::clone(&log);
+                let events = Arc::clone(&inner);
                 next(async move {
-                    ctx.emit(INNER, &9);
+                    events.emit(INNER, &9);
                     log.lock().unwrap().push("outer".into());
                     continuation.await
                 })
-            },
-        );
+            })
+            .await;
         Ok(())
     }
 }
@@ -825,64 +1100,16 @@ fn waterfall_listener_can_emit_reentrantly() {
             log: Arc::clone(&log),
         })
         .await;
+        let events = host.resolve::<Events>().unwrap();
 
         let value = "x".to_string();
         assert_eq!(
-            host.ctx()
+            events
                 .waterfall(TRANSFORM, &value, || "x".to_string())
                 .await,
             "x"
         );
         assert_eq!(entries(&log), ["inner:9", "outer"]);
-        host.shutdown().await;
-    });
-}
-
-struct ListenerEffect {
-    log: Log,
-    fiber: Arc<Mutex<Option<Fiber>>>,
-}
-
-#[async_trait]
-impl Plugin for ListenerEffect {
-    type Deps = ();
-
-    async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
-        *self.fiber.lock().unwrap() = Some(ctx.fiber());
-        let log = Arc::clone(&self.log);
-        let fiber = Arc::clone(&self.fiber);
-        ctx.on(PING, move |ctx: &Ctx<'_>, _value: &u32| {
-            assert_eq!(ctx.fiber(), fiber.lock().unwrap().unwrap());
-            let log = Arc::clone(&log);
-            ctx.effect(move || {
-                (
-                    (),
-                    Box::new(move || {
-                        log.lock().unwrap().push("listener-cleanup".into());
-                    }),
-                )
-            });
-        });
-        Ok(())
-    }
-}
-
-#[test]
-fn listeners_run_in_their_owners_context() {
-    block_on(async {
-        let log = log();
-        let fiber = Arc::new(Mutex::new(None));
-        let host = ServiceHost::new();
-        let mounted = host
-            .mount(ListenerEffect {
-                log: Arc::clone(&log),
-                fiber: Arc::clone(&fiber),
-            })
-            .await;
-
-        host.ctx().emit(PING, &1);
-        assert!(host.unmount(mounted).await);
-        assert_eq!(entries(&log), ["listener-cleanup"]);
         host.shutdown().await;
     });
 }
@@ -927,14 +1154,15 @@ impl Plugin for FailAfterEffect {
 
     async fn apply(&mut self, ctx: &Ctx<'_>, _deps: ()) -> Result<(), PluginError> {
         let log = Arc::clone(&self.log);
-        ctx.effect(move || {
+        ctx.effect(async move {
             (
                 (),
-                Box::new(move || {
+                TestGuard::new(move || {
                     log.lock().unwrap().push("cleanup".into());
                 }),
             )
-        });
+        })
+        .await;
         Err("boom".into())
     }
 }

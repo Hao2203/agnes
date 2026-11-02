@@ -1,20 +1,24 @@
-//! 类型化事件：`emit`、`bail` 与异步 `waterfall`。
+//! 类型化事件服务：`emit`、`bail` 与异步 `waterfall`。
 //!
-//! 监听器在分发时拿到属于自己 fiber 的 `&Ctx`，因此可以安全地注册/查找
-//! 服务；分发只持有注册表的快照，不持锁调用用户代码。
+//! `Events` 是独立的 root service，不依赖 `ServiceHost`；监听器由注册方通过
+//! `Ctx::effect` 登记清理 guard，插件卸载时自动移除。
 
 use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use async_trait::async_trait;
 
 use crate::ctx::Ctx;
-use crate::effect::Effect;
-use crate::host::{Inner, ServiceHost};
-use crate::plugin::Fiber;
+use crate::effect::EffectGuard;
+
+static NEXT_EVENTS_STAMP: AtomicU64 = AtomicU64::new(1);
 
 /// `waterfall` 的 continuation：`await` 它把控制权交给下游与默认实现。
 pub type Next<'a, R> = Pin<Box<dyn Future<Output = R> + Send + 'a>>;
@@ -24,10 +28,9 @@ pub(crate) fn next<'a, R>(future: impl Future<Output = R> + Send + 'a) -> Next<'
     Box::pin(future)
 }
 
-pub type EmitListener<E> = dyn for<'a, 'b, 'h> Fn(&'a Ctx<'h>, &'b E) + Send + Sync;
-pub type BailListener<E, R> = dyn for<'a, 'b, 'h> Fn(&'a Ctx<'h>, &'b E) -> Option<R> + Send + Sync;
-pub type WaterfallListener<E, R> =
-    dyn for<'a, 'h> Fn(&'a Ctx<'h>, &'a E, Next<'a, R>) -> Next<'a, R> + Send + Sync;
+pub type EmitListener<E> = dyn Fn(&E) + Send + Sync;
+pub type BailListener<E, R> = dyn Fn(&E) -> Option<R> + Send + Sync;
+pub type WaterfallListener<E, R> = dyn for<'a> Fn(&'a E, Next<'a, R>) -> Next<'a, R> + Send + Sync;
 
 struct EmitMarker<E>(PhantomData<E>);
 struct BailMarker<E, R>(PhantomData<(E, R)>);
@@ -165,10 +168,10 @@ impl<E: 'static, R: 'static> WaterfallKey<E, R> {
 
 pub(crate) type RemoveListenerFn = fn(&mut Box<dyn Any + Send + Sync>, usize) -> bool;
 
-/// 一次监听器注册的句柄；可以用 [`Ctx::off`] 提前撤销。
+/// 一次监听器注册的句柄；可以用 [`Events::off`] 提前撤销。
 #[derive(Clone, Copy)]
 pub struct Listener {
-    pub(crate) host: u64,
+    pub(crate) events: u64,
     pub(crate) set: ListenerSetId,
     pub(crate) id: usize,
     pub(crate) remove: RemoveListenerFn,
@@ -177,7 +180,7 @@ pub struct Listener {
 impl fmt::Debug for Listener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Listener")
-            .field("host", &self.host)
+            .field("events", &self.events)
             .field("id", &self.id)
             .finish()
     }
@@ -185,7 +188,7 @@ impl fmt::Debug for Listener {
 
 impl PartialEq for Listener {
     fn eq(&self, other: &Self) -> bool {
-        self.host == other.host && self.id == other.id
+        self.events == other.events && self.id == other.id
     }
 }
 
@@ -193,14 +196,13 @@ impl Eq for Listener {}
 
 impl Hash for Listener {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.host.hash(state);
+        self.events.hash(state);
         self.id.hash(state);
     }
 }
 
 pub(crate) struct Slot<F: ?Sized> {
     pub(crate) id: usize,
-    pub(crate) owner: Fiber,
     pub(crate) callback: Arc<F>,
 }
 
@@ -208,7 +210,6 @@ impl<F: ?Sized> Clone for Slot<F> {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
-            owner: self.owner,
             callback: Arc::clone(&self.callback),
         }
     }
@@ -259,165 +260,266 @@ fn remove_from_set<F: ?Sized + Send + Sync + 'static>(
     }
 }
 
-pub(crate) fn remove_listener(inner: &mut Inner, listener: Listener) -> bool {
-    if listener.host != inner.stamp {
-        return false;
+#[derive(Default)]
+struct EventInner {
+    listeners: HashMap<ListenerSetId, Box<dyn Any + Send + Sync>>,
+    next_listener: usize,
+}
+
+impl EventInner {
+    fn listener_set_mut<F: ?Sized + Send + Sync + 'static>(
+        &mut self,
+        id: ListenerSetId,
+    ) -> &mut ListenerSet<F> {
+        let boxed = self
+            .listeners
+            .entry(id)
+            .or_insert_with(|| Box::new(ListenerSet::<F>::default()));
+        let any: &mut dyn Any = &mut **boxed;
+        any.downcast_mut::<ListenerSet<F>>()
+            .expect("listener set type mismatch")
     }
-    let Some(boxed) = inner.listeners.get_mut(&listener.set) else {
-        return false;
-    };
-    (listener.remove)(boxed, listener.id)
-}
 
-fn register<F: ?Sized + Send + Sync + 'static>(
-    inner: &mut Inner,
-    set_id: ListenerSetId,
-    owner: Fiber,
-    callback: Arc<F>,
-    prepend: bool,
-    remove: RemoveListenerFn,
-) -> Listener {
-    let id = inner.next_listener;
-    inner.next_listener += 1;
-    let slot = Slot {
-        id,
-        owner,
-        callback,
-    };
-    let set = inner.listener_set_mut::<F>(set_id);
-    if prepend {
-        set.prepend(slot);
-    } else {
-        set.push(slot);
-    }
-    let token = Listener {
-        host: inner.stamp,
-        set: set_id,
-        id,
-        remove,
-    };
-    inner
-        .effects
-        .entry(owner)
-        .or_default()
-        .push(Effect::RemoveListener(token));
-    token
-}
-
-pub(crate) fn on<E: 'static>(
-    host: &ServiceHost,
-    owner: Fiber,
-    key: EventKey<E>,
-    listener: impl for<'a, 'b, 'h> Fn(&'a Ctx<'h>, &'b E) + Send + Sync + 'static,
-    prepend: bool,
-) -> Listener {
-    let mut inner = host.lock();
-    let callback: Arc<EmitListener<E>> = Arc::new(listener);
-    register(
-        &mut inner,
-        key.set_id(),
-        owner,
-        callback,
-        prepend,
-        remove_from_set::<EmitListener<E>>,
-    )
-}
-
-pub(crate) fn on_bail<E: 'static, R: 'static>(
-    host: &ServiceHost,
-    owner: Fiber,
-    key: BailKey<E, R>,
-    listener: impl for<'a, 'b, 'h> Fn(&'a Ctx<'h>, &'b E) -> Option<R> + Send + Sync + 'static,
-    prepend: bool,
-) -> Listener {
-    let mut inner = host.lock();
-    let callback: Arc<BailListener<E, R>> = Arc::new(listener);
-    register(
-        &mut inner,
-        key.set_id(),
-        owner,
-        callback,
-        prepend,
-        remove_from_set::<BailListener<E, R>>,
-    )
-}
-
-pub(crate) fn on_waterfall<E: Send + Sync + 'static, R: 'static>(
-    host: &ServiceHost,
-    owner: Fiber,
-    key: WaterfallKey<E, R>,
-    listener: impl for<'a, 'h> Fn(&'a Ctx<'h>, &'a E, Next<'a, R>) -> Next<'a, R>
-    + Send
-    + Sync
-    + 'static,
-    prepend: bool,
-) -> Listener {
-    let mut inner = host.lock();
-    let callback: Arc<WaterfallListener<E, R>> = Arc::new(listener);
-    register(
-        &mut inner,
-        key.set_id(),
-        owner,
-        callback,
-        prepend,
-        remove_from_set::<WaterfallListener<E, R>>,
-    )
-}
-
-pub(crate) fn emit<E: 'static>(host: &ServiceHost, key: EventKey<E>, event: &E) {
-    let slots = {
-        let inner = host.lock();
-        inner
-            .listener_set::<EmitListener<E>>(key.set_id())
-            .map(|set| set.snapshot())
-            .unwrap_or_default()
-    };
-    for slot in slots {
-        let ctx = Ctx::new(host, slot.owner);
-        (slot.callback)(&ctx, event);
+    fn listener_set<F: ?Sized + Send + Sync + 'static>(
+        &self,
+        id: ListenerSetId,
+    ) -> Option<&ListenerSet<F>> {
+        let any: &dyn Any = &**self.listeners.get(&id)?;
+        any.downcast_ref::<ListenerSet<F>>()
     }
 }
 
-pub(crate) fn bail<E: 'static, R: 'static>(
-    host: &ServiceHost,
-    key: BailKey<E, R>,
-    event: &E,
-) -> Option<R> {
-    let slots = {
-        let inner = host.lock();
-        inner
-            .listener_set::<BailListener<E, R>>(key.set_id())
-            .map(|set| set.snapshot())
-            .unwrap_or_default()
-    };
-    for slot in slots {
-        let ctx = Ctx::new(host, slot.owner);
-        if let Some(value) = (slot.callback)(&ctx, event) {
-            return Some(value);
+/// 独立的事件服务；根服务，插件通过 `Deps` 注入。
+pub struct Events {
+    stamp: u64,
+    inner: Mutex<EventInner>,
+}
+
+impl Default for Events {
+    fn default() -> Self {
+        Self {
+            stamp: NEXT_EVENTS_STAMP.fetch_add(1, Ordering::Relaxed),
+            inner: Mutex::new(EventInner::default()),
         }
     }
-    None
 }
 
-pub(crate) async fn waterfall<E: Send + Sync + 'static, R: 'static>(
-    host: &ServiceHost,
-    key: WaterfallKey<E, R>,
-    event: &E,
-    default: impl FnOnce() -> R + Send,
-) -> R {
-    let slots = {
-        let inner = host.lock();
-        inner
-            .listener_set::<WaterfallListener<E, R>>(key.set_id())
+impl Events {
+    fn lock(&self) -> MutexGuard<'_, EventInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 注册广播监听器，追加在末尾；插件卸载时通过 effect guard 自动移除。
+    pub async fn on<E: 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        key: EventKey<E>,
+        listener: impl Fn(&E) + Send + Sync + 'static,
+    ) -> Listener {
+        let callback: Arc<EmitListener<E>> = Arc::new(listener);
+        self.register_effect(
+            ctx,
+            key.set_id(),
+            callback,
+            false,
+            remove_from_set::<EmitListener<E>>,
+        )
+        .await
+    }
+
+    /// 注册广播监听器，插到最前面。
+    pub async fn prepend<E: 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        key: EventKey<E>,
+        listener: impl Fn(&E) + Send + Sync + 'static,
+    ) -> Listener {
+        let callback: Arc<EmitListener<E>> = Arc::new(listener);
+        self.register_effect(
+            ctx,
+            key.set_id(),
+            callback,
+            true,
+            remove_from_set::<EmitListener<E>>,
+        )
+        .await
+    }
+
+    /// 注册决策监听器，追加在末尾。
+    pub async fn on_bail<E: 'static, R: 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        key: BailKey<E, R>,
+        listener: impl Fn(&E) -> Option<R> + Send + Sync + 'static,
+    ) -> Listener {
+        let callback: Arc<BailListener<E, R>> = Arc::new(listener);
+        self.register_effect(
+            ctx,
+            key.set_id(),
+            callback,
+            false,
+            remove_from_set::<BailListener<E, R>>,
+        )
+        .await
+    }
+
+    /// 注册决策监听器，插到最前面。
+    pub async fn prepend_bail<E: 'static, R: 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        key: BailKey<E, R>,
+        listener: impl Fn(&E) -> Option<R> + Send + Sync + 'static,
+    ) -> Listener {
+        let callback: Arc<BailListener<E, R>> = Arc::new(listener);
+        self.register_effect(
+            ctx,
+            key.set_id(),
+            callback,
+            true,
+            remove_from_set::<BailListener<E, R>>,
+        )
+        .await
+    }
+
+    /// 注册 waterfall 监听器，追加在末尾。
+    pub async fn on_waterfall<E: Send + Sync + 'static, R: 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        key: WaterfallKey<E, R>,
+        listener: impl for<'a> Fn(&'a E, Next<'a, R>) -> Next<'a, R> + Send + Sync + 'static,
+    ) -> Listener {
+        let callback: Arc<WaterfallListener<E, R>> = Arc::new(listener);
+        self.register_effect(
+            ctx,
+            key.set_id(),
+            callback,
+            false,
+            remove_from_set::<WaterfallListener<E, R>>,
+        )
+        .await
+    }
+
+    /// 注册 waterfall 监听器，插到最前面。
+    pub async fn prepend_waterfall<E: Send + Sync + 'static, R: 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        key: WaterfallKey<E, R>,
+        listener: impl for<'a> Fn(&'a E, Next<'a, R>) -> Next<'a, R> + Send + Sync + 'static,
+    ) -> Listener {
+        let callback: Arc<WaterfallListener<E, R>> = Arc::new(listener);
+        self.register_effect(
+            ctx,
+            key.set_id(),
+            callback,
+            true,
+            remove_from_set::<WaterfallListener<E, R>>,
+        )
+        .await
+    }
+
+    async fn register_effect<F: ?Sized + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        ctx: &Ctx<'_>,
+        set_id: ListenerSetId,
+        callback: Arc<F>,
+        prepend: bool,
+        remove: RemoveListenerFn,
+    ) -> Listener {
+        let events = Arc::clone(self);
+        ctx.effect(async move {
+            let listener = events.register(set_id, callback, prepend, remove);
+            let guard = ListenerGuard {
+                events: Arc::clone(&events),
+                listener,
+            };
+            (listener, guard)
+        })
+        .await
+    }
+
+    fn register<F: ?Sized + Send + Sync + 'static>(
+        &self,
+        set_id: ListenerSetId,
+        callback: Arc<F>,
+        prepend: bool,
+        remove: RemoveListenerFn,
+    ) -> Listener {
+        let mut inner = self.lock();
+        let id = inner.next_listener;
+        inner.next_listener += 1;
+        let slot = Slot { id, callback };
+        let set = inner.listener_set_mut::<F>(set_id);
+        if prepend {
+            set.prepend(slot);
+        } else {
+            set.push(slot);
+        }
+        Listener {
+            events: self.stamp,
+            set: set_id,
+            id,
+            remove,
+        }
+    }
+
+    fn remove(&self, listener: Listener) -> bool {
+        if listener.events != self.stamp {
+            return false;
+        }
+        let mut inner = self.lock();
+        let Some(boxed) = inner.listeners.get_mut(&listener.set) else {
+            return false;
+        };
+        (listener.remove)(boxed, listener.id)
+    }
+
+    /// 提前撤销一个监听器；已撤销或不属于本服务时返回 `false`。
+    pub fn off(&self, listener: Listener) -> bool {
+        self.remove(listener)
+    }
+
+    /// 同步广播；返回值被忽略。
+    pub fn emit<E: 'static>(&self, key: EventKey<E>, event: &E) {
+        let slots = self.snapshot::<EmitListener<E>>(key.set_id());
+        for slot in slots {
+            (slot.callback)(event);
+        }
+    }
+
+    /// 决策：第一个返回 `Some` 的监听器胜出。
+    pub fn bail<E: 'static, R: 'static>(&self, key: BailKey<E, R>, event: &E) -> Option<R> {
+        let slots = self.snapshot::<BailListener<E, R>>(key.set_id());
+        for slot in slots {
+            if let Some(value) = (slot.callback)(event) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// 环绕中间件；监听器按注册顺序由外向内包装。
+    pub async fn waterfall<E: Send + Sync + 'static, R: 'static>(
+        &self,
+        key: WaterfallKey<E, R>,
+        event: &E,
+        default: impl FnOnce() -> R + Send,
+    ) -> R {
+        let slots = self.snapshot::<WaterfallListener<E, R>>(key.set_id());
+        run_waterfall(&slots, event, 0, next(async move { default() })).await
+    }
+
+    fn snapshot<F: ?Sized + Send + Sync + 'static>(&self, set_id: ListenerSetId) -> Vec<Slot<F>> {
+        self.lock()
+            .listener_set::<F>(set_id)
             .map(|set| set.snapshot())
             .unwrap_or_default()
-    };
-    run_waterfall(&slots, host, event, 0, next(async move { default() })).await
+    }
 }
 
 fn run_waterfall<'e, E: Send + Sync + 'static, R: 'static>(
     slots: &'e [Slot<WaterfallListener<E, R>>],
-    host: &'e ServiceHost,
     event: &'e E,
     index: usize,
     default: Next<'e, R>,
@@ -427,8 +529,25 @@ fn run_waterfall<'e, E: Send + Sync + 'static, R: 'static>(
             return default.await;
         };
         let slot = slot.clone();
-        let continuation: Next<'e, R> = run_waterfall(slots, host, event, index + 1, default);
-        let ctx = Ctx::new(host, slot.owner);
-        (slot.callback)(&ctx, event, continuation).await
+        let continuation: Next<'e, R> = run_waterfall(slots, event, index + 1, default);
+        (slot.callback)(event, continuation).await
     })
+}
+
+struct ListenerGuard {
+    events: Arc<Events>,
+    listener: Listener,
+}
+
+#[async_trait]
+impl EffectGuard for ListenerGuard {
+    async fn close(&mut self) {
+        self.events.remove(self.listener);
+    }
+}
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        self.events.remove(self.listener);
+    }
 }

@@ -1,23 +1,24 @@
 //! 服务宿主：服务表、fiber 生命周期、effect 回卷与诊断。
 //!
-//! 所有用户代码（插件的 `apply` / `shutdown`、事件监听器、自定义 disposer）
-//! 都在锁外执行；锁只保护注册表本身，绝不跨 `.await` 持有。
+//! 所有用户代码（插件的 `apply` / `shutdown`、effect guard 的 `close` /
+//! `Drop`）都在锁外执行；锁只保护注册表本身，绝不跨 `.await` 持有。
 
-use std::any::{Any, TypeId};
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use log::{error, info, warn};
 
 use crate::ctx::Ctx;
-use crate::effect::Effect;
+use crate::effect::Effects;
 use crate::error::PluginError;
-use crate::event::{self, ListenerSet, ListenerSetId};
+use crate::event::Events;
+use crate::mounts::Mounts;
 use crate::plugin::{Adapter, ApplyError, ErasedPlugin, Fiber, FiberInfo, FiberState, Plugin};
-use crate::service::{ServiceDep, ServiceInfo, ServiceParam, ServiceTable};
+use crate::service::{ServiceDep, ServiceInfo, ServiceParam, ServiceTable, Services};
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
 const TRANSITION_BUDGET: usize = 1024;
@@ -33,7 +34,7 @@ pub struct ServiceHost {
     shared: Arc<Shared>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     inner: Mutex<Inner>,
 }
 
@@ -41,10 +42,8 @@ pub(crate) struct Inner {
     pub(crate) stamp: u64,
     pub(crate) services: ServiceTable,
     fibers: Vec<FiberSlot>,
-    pub(crate) listeners: HashMap<ListenerSetId, Box<dyn Any + Send + Sync>>,
-    pub(crate) effects: HashMap<Fiber, Vec<Effect>>,
+    pub(crate) effects: HashMap<Fiber, Effects>,
     next_fiber: usize,
-    pub(crate) next_listener: usize,
     settling: bool,
     shutdown: bool,
 }
@@ -68,8 +67,17 @@ enum Disposition {
 enum StepOutcome {
     Active(String),
     Pending(String),
-    Failed { name: String, error: Arc<PluginError> },
+    Failed {
+        name: String,
+        error: Arc<PluginError>,
+    },
     Retired,
+}
+
+fn install_root<T: ?Sized + Send + Sync + 'static>(inner: &mut Inner, root: Fiber, value: Arc<T>) {
+    if let Err(error) = inner.services.provide::<T>(root, value) {
+        unreachable!("fresh service table rejected a root service: {error}");
+    }
 }
 
 impl Default for ServiceHost {
@@ -81,12 +89,41 @@ impl Default for ServiceHost {
 impl ServiceHost {
     pub fn new() -> Self {
         let stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
-        Self {
+        let host = Self {
             stamp,
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner::new(stamp)),
             }),
+        };
+        let root = Fiber::new(stamp, ROOT_INDEX);
+        {
+            let mut inner = host.lock();
+            install_root(&mut inner, root, Arc::new(Services));
+            install_root(&mut inner, root, Arc::new(Mounts));
+            install_root(&mut inner, root, Arc::new(Events::default()));
         }
+        host
+    }
+
+    pub(crate) fn downgrade(&self) -> Weak<Shared> {
+        Arc::downgrade(&self.shared)
+    }
+
+    pub(crate) fn from_shared(shared: Arc<Shared>) -> Self {
+        let stamp = shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stamp;
+        Self { stamp, shared }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve<T>(&self) -> Option<Arc<T>>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.lock().services.get::<T>()
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -134,13 +171,6 @@ impl ServiceHost {
         }
 
         let missing = inner.missing_deps(&deps);
-        if !parent.is_root() {
-            inner
-                .effects
-                .entry(parent)
-                .or_default()
-                .push(Effect::DisposeChild(fiber));
-        }
         inner.fibers.push(FiberSlot {
             name: name.clone(),
             deps,
@@ -174,7 +204,7 @@ impl ServiceHost {
         changed
     }
 
-    fn unmount_inner(&self, target: Fiber) -> BoxFuture<'_, bool> {
+    pub(crate) fn unmount_inner(&self, target: Fiber) -> BoxFuture<'_, bool> {
         Box::pin(async move {
             if target.host() != self.stamp {
                 return false;
@@ -196,7 +226,7 @@ impl ServiceHost {
             }
 
             for (fiber, disposition) in self.compute_victims(target) {
-                let (mut plugin, effects, name) = {
+                let (mut plugin, mut effects, name) = {
                     let mut inner = self.lock();
                     let slot = &mut inner.fibers[fiber.id()];
                     if slot.state == FiberState::Disposed {
@@ -231,7 +261,7 @@ impl ServiceHost {
                     }
                 }
 
-                self.run_effects(effects).await;
+                effects.close().await;
             }
             true
         })
@@ -305,56 +335,9 @@ impl ServiceHost {
         ordered
     }
 
-    fn run_effects(&self, mut effects: Vec<Effect>) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            while let Some(effect) = effects.pop() {
-                match effect {
-                    Effect::RemoveService { id, provider } => {
-                        self.lock().services.remove(id, provider);
-                    }
-                    Effect::RemoveListener(listener) => {
-                        let mut inner = self.lock();
-                        event::remove_listener(&mut inner, listener);
-                    }
-                    Effect::DisposeChild(child) => {
-                        self.unmount_inner(child).await;
-                    }
-                    Effect::Custom(disposer) => disposer(),
-                }
-            }
-        })
-    }
-
-    /// 同步回卷一个 fiber 的 effect；用于 future 被取消或 `Drop` 路径。
-    fn unwind_fiber_sync(&self, fiber: Fiber) {
-        loop {
-            let effect = {
-                let mut inner = self.lock();
-                inner
-                    .effects
-                    .get_mut(&fiber)
-                    .and_then(|effects| effects.pop())
-            };
-            let Some(effect) = effect else {
-                break;
-            };
-            match effect {
-                Effect::RemoveService { id, provider } => {
-                    self.lock().services.remove(id, provider);
-                }
-                Effect::RemoveListener(listener) => {
-                    let mut inner = self.lock();
-                    event::remove_listener(&mut inner, listener);
-                }
-                Effect::DisposeChild(child) => self.dispose_fiber_sync(child),
-                Effect::Custom(disposer) => disposer(),
-            }
-        }
-    }
-
     /// 同步销毁一个 fiber；异步 `shutdown` 无法在取消路径里 await，会被跳过。
-    fn dispose_fiber_sync(&self, fiber: Fiber) {
-        let (plugin, name) = {
+    pub(crate) fn dispose_fiber_sync(&self, fiber: Fiber) {
+        let (plugin, effects, name) = {
             let mut inner = self.lock();
             let Some(slot) = inner.fibers.get_mut(fiber.id()) else {
                 return;
@@ -363,13 +346,16 @@ impl ServiceHost {
                 return;
             }
             slot.state = FiberState::Disposed;
-            (slot.plugin.take(), slot.name.clone())
+            let name = slot.name.clone();
+            let plugin = slot.plugin.take();
+            let effects = inner.effects.remove(&fiber);
+            (plugin, effects, name)
         };
         if plugin.is_some() {
             warn!("plugin `{name}` was disposed synchronously; async shutdown was skipped");
         }
         drop(plugin);
-        self.unwind_fiber_sync(fiber);
+        drop(effects);
     }
 
     /// 把所有可激活的 `Pending` fiber 推进到 `Active`。
@@ -437,24 +423,24 @@ impl ServiceHost {
                     Ok(()) if slot.dispose_requested => {
                         slot.dispose_requested = false;
                         slot.state = FiberState::Disposed;
-                        let effects = inner.effects.remove(&fiber).unwrap_or_default();
+                        let effects = inner.effects.remove(&fiber);
                         (StepOutcome::Retired, effects, true)
                     }
                     Ok(()) => {
                         slot.plugin = instance.take();
                         slot.state = FiberState::Active;
-                        (StepOutcome::Active(name), Vec::new(), false)
+                        (StepOutcome::Active(name), None, false)
                     }
                     Err(ApplyError::MissingDeps) => {
                         if slot.dispose_requested {
                             slot.dispose_requested = false;
                             slot.state = FiberState::Disposed;
-                            let effects = inner.effects.remove(&fiber).unwrap_or_default();
+                            let effects = inner.effects.remove(&fiber);
                             (StepOutcome::Retired, effects, false)
                         } else {
                             slot.plugin = instance.take();
                             slot.state = FiberState::Pending;
-                            let effects = inner.effects.remove(&fiber).unwrap_or_default();
+                            let effects = inner.effects.remove(&fiber);
                             (StepOutcome::Pending(name), effects, false)
                         }
                     }
@@ -462,7 +448,7 @@ impl ServiceHost {
                         let error = Arc::new(error);
                         slot.error = Some(Arc::clone(&error));
                         slot.state = FiberState::Failed;
-                        let effects = inner.effects.remove(&fiber).unwrap_or_default();
+                        let effects = inner.effects.remove(&fiber);
                         (StepOutcome::Failed { name, error }, effects, true)
                     }
                 }
@@ -486,7 +472,9 @@ impl ServiceHost {
                 warn!("plugin shutdown after failure failed: {error}");
             }
 
-            self.run_effects(effects).await;
+            if let Some(mut effects) = effects {
+                effects.close().await;
+            }
         }
     }
 
@@ -546,8 +534,10 @@ impl ServiceHost {
         }
 
         let root = Fiber::new(self.stamp, ROOT_INDEX);
-        let effects = self.lock().effects.remove(&root).unwrap_or_default();
-        self.run_effects(effects).await;
+        let effects = self.lock().effects.remove(&root);
+        if let Some(mut effects) = effects {
+            effects.close().await;
+        }
         info!("service host shut down");
     }
 }
@@ -566,24 +556,9 @@ impl Drop for Shared {
         indexes.sort_unstable_by(|a, b| b.cmp(a));
         for index in indexes {
             let fiber = Fiber::new(stamp, index);
-            let effects = inner.effects.remove(&fiber).unwrap_or_default();
-            drop_effects(inner, effects);
+            let effects = inner.effects.remove(&fiber);
+            drop(effects);
             inner.fibers[index].plugin = None;
-        }
-    }
-}
-
-fn drop_effects(inner: &mut Inner, mut effects: Vec<Effect>) {
-    while let Some(effect) = effects.pop() {
-        match effect {
-            Effect::RemoveService { id, provider } => {
-                inner.services.remove(id, provider);
-            }
-            Effect::RemoveListener(listener) => {
-                event::remove_listener(inner, listener);
-            }
-            Effect::DisposeChild(_) => {}
-            Effect::Custom(disposer) => disposer(),
         }
     }
 }
@@ -652,7 +627,8 @@ impl Drop for ApplyGuard<'_> {
         if dispose {
             self.host.dispose_fiber_sync(self.fiber);
         } else {
-            self.host.unwind_fiber_sync(self.fiber);
+            let effects = self.host.lock().effects.remove(&self.fiber);
+            drop(effects);
         }
     }
 }
@@ -671,10 +647,8 @@ impl Inner {
                 error: None,
                 dispose_requested: false,
             }],
-            listeners: HashMap::new(),
             effects: HashMap::new(),
             next_fiber: 1,
-            next_listener: 0,
             settling: false,
             shutdown: false,
         }
@@ -736,27 +710,6 @@ impl Inner {
         let index = selected?;
         self.fibers[index].state = FiberState::Loading;
         Some(Fiber::new(self.stamp, index))
-    }
-
-    pub(crate) fn listener_set_mut<F: ?Sized + Send + Sync + 'static>(
-        &mut self,
-        id: ListenerSetId,
-    ) -> &mut ListenerSet<F> {
-        let boxed = self
-            .listeners
-            .entry(id)
-            .or_insert_with(|| Box::new(ListenerSet::<F>::default()));
-        let any: &mut dyn Any = &mut **boxed;
-        any.downcast_mut::<ListenerSet<F>>()
-            .expect("listener set type mismatch")
-    }
-
-    pub(crate) fn listener_set<F: ?Sized + Send + Sync + 'static>(
-        &self,
-        id: ListenerSetId,
-    ) -> Option<&ListenerSet<F>> {
-        let any: &dyn Any = &**self.listeners.get(&id)?;
-        any.downcast_ref::<ListenerSet<F>>()
     }
 
     fn depends_on(&self, dependent: Fiber, provider: Fiber) -> bool {

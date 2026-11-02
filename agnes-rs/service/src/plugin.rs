@@ -25,6 +25,10 @@ pub trait Plugin: Send + 'static {
 
     /// 注册服务、监听器与 effect。
     ///
+    /// `ctx` 只负责 `effect`；服务/事件/子挂载通过 `deps` 里的
+    /// [`Services`](crate::Services)、[`Events`](crate::Events)、
+    /// [`Mounts`](crate::Mounts) 完成。
+    ///
     /// 依赖恢复后会再次调用；实现应把本次传入的 `deps` 作为唯一有效句柄，
     /// 不要在字段里缓存上一次的值。
     ///
@@ -127,8 +131,7 @@ impl<P: Plugin> Adapter<P> {
 #[async_trait]
 impl<P: Plugin> ErasedPlugin for Adapter<P> {
     async fn apply(&mut self, ctx: &Ctx<'_>) -> Result<(), ApplyError> {
-        let deps =
-            <P::Deps as ServiceParam>::resolve(ctx).ok_or(ApplyError::MissingDeps)?;
+        let deps = <P::Deps as ServiceParam>::resolve(ctx).ok_or(ApplyError::MissingDeps)?;
         self.0.apply(ctx, deps).await.map_err(ApplyError::Plugin)
     }
 
