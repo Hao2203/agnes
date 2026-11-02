@@ -12,16 +12,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use log::{error, info, warn};
 
-use crate::effect::{Disposer, Effect};
-use crate::error::{PluginError, ServiceError};
-use crate::event::{
-    self, BailKey, EventKey, Listener, ListenerSet, ListenerSetId, Next, WaterfallKey,
-};
+use crate::ctx::Ctx;
+use crate::effect::Effect;
+use crate::error::PluginError;
+use crate::event::{self, ListenerSet, ListenerSetId};
 use crate::plugin::{Adapter, ApplyError, ErasedPlugin, Fiber, FiberInfo, FiberState, Plugin};
 use crate::service::{ServiceDep, ServiceInfo, ServiceParam, ServiceTable};
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
 const TRANSITION_BUDGET: usize = 1024;
+const ROOT_INDEX: usize = 0;
+const FIRST_CHILD: usize = ROOT_INDEX + 1;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -38,7 +39,7 @@ struct Shared {
 
 pub(crate) struct Inner {
     pub(crate) stamp: u64,
-    services: ServiceTable,
+    pub(crate) services: ServiceTable,
     fibers: Vec<FiberSlot>,
     pub(crate) listeners: HashMap<ListenerSetId, Box<dyn Any + Send + Sync>>,
     pub(crate) effects: HashMap<Fiber, Vec<Effect>>,
@@ -56,6 +57,12 @@ struct FiberSlot {
     plugin: Option<Box<dyn ErasedPlugin>>,
     error: Option<Arc<PluginError>>,
     dispose_requested: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Dispose,
+    Pend,
 }
 
 enum StepOutcome {
@@ -91,20 +98,17 @@ impl ServiceHost {
 
     /// 根上下文；在这里注册的服务对所有插件可见。
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx {
-            host: self,
-            fiber: Fiber::new(self.stamp, 0),
-        }
+        Ctx::new(self, Fiber::new(self.stamp, ROOT_INDEX))
     }
 
     /// 挂载一个插件实例。缺依赖时返回的 fiber 处于 `Pending`，不会报错。
     pub async fn mount<P: Plugin>(&self, plugin: P) -> Fiber {
-        let fiber = self.mount_child(Fiber::new(self.stamp, 0), plugin);
+        let fiber = self.mount_child(Fiber::new(self.stamp, ROOT_INDEX), plugin);
         self.settle_if_idle().await;
         fiber
     }
 
-    fn mount_child<P: Plugin>(&self, parent: Fiber, plugin: P) -> Fiber {
+    pub(crate) fn mount_child<P: Plugin>(&self, parent: Fiber, plugin: P) -> Fiber {
         let name = plugin.name().to_owned();
         let deps = <P::Deps as ServiceParam>::deps();
         let erased: Box<dyn ErasedPlugin> = Box::new(Adapter::new(plugin));
@@ -130,7 +134,7 @@ impl ServiceHost {
         }
 
         let missing = inner.missing_deps(&deps);
-        if parent.id() != 0 {
+        if !parent.is_root() {
             inner
                 .effects
                 .entry(parent)
@@ -181,7 +185,7 @@ impl ServiceHost {
                 let Some(slot) = inner.fibers.get(index) else {
                     return false;
                 };
-                if index == 0 || slot.state == FiberState::Disposed {
+                if target.is_root() || slot.state == FiberState::Disposed {
                     return false;
                 }
                 slot.state == FiberState::Loading
@@ -191,17 +195,16 @@ impl ServiceHost {
                 return true;
             }
 
-            for (fiber, dispose) in self.compute_victims(target) {
+            for (fiber, disposition) in self.compute_victims(target) {
                 let (mut plugin, effects, name) = {
                     let mut inner = self.lock();
                     let slot = &mut inner.fibers[fiber.id()];
                     if slot.state == FiberState::Disposed {
                         continue;
                     }
-                    slot.state = if dispose {
-                        FiberState::Disposed
-                    } else {
-                        FiberState::Pending
+                    slot.state = match disposition {
+                        Disposition::Dispose => FiberState::Disposed,
+                        Disposition::Pend => FiberState::Pending,
                     };
                     let name = slot.name.clone();
                     let plugin = slot.plugin.take();
@@ -209,7 +212,7 @@ impl ServiceHost {
                     (plugin, effects, name)
                 };
 
-                if !dispose {
+                if matches!(disposition, Disposition::Pend) {
                     warn!("plugin `{name}` is pending: a required service was removed");
                 }
 
@@ -219,7 +222,7 @@ impl ServiceHost {
                     warn!("plugin `{name}` shutdown failed: {error}");
                 }
 
-                if dispose {
+                if matches!(disposition, Disposition::Dispose) {
                     drop(plugin);
                 } else {
                     let mut inner = self.lock();
@@ -234,7 +237,7 @@ impl ServiceHost {
         })
     }
 
-    fn compute_victims(&self, target: Fiber) -> Vec<(Fiber, bool)> {
+    fn compute_victims(&self, target: Fiber) -> Vec<(Fiber, Disposition)> {
         let inner = self.lock();
         let mut dispose = Vec::new();
         let mut stack = vec![target];
@@ -259,10 +262,10 @@ impl ServiceHost {
                 .collect();
             let mut added = false;
             for (index, slot) in inner.fibers.iter().enumerate() {
-                if index == 0 {
+                let fiber = Fiber::new(inner.stamp, index);
+                if fiber.is_root() {
                     continue;
                 }
-                let fiber = Fiber::new(inner.stamp, index);
                 if victims.contains(&fiber) || slot.state != FiberState::Active {
                     continue;
                 }
@@ -276,9 +279,16 @@ impl ServiceHost {
             }
         }
 
-        let mut remaining: Vec<(Fiber, bool)> = victims
+        let mut remaining: Vec<(Fiber, Disposition)> = victims
             .iter()
-            .map(|fiber| (*fiber, dispose.contains(fiber)))
+            .map(|fiber| {
+                let disposition = if dispose.contains(fiber) {
+                    Disposition::Dispose
+                } else {
+                    Disposition::Pend
+                };
+                (*fiber, disposition)
+            })
             .collect();
         let mut ordered = Vec::with_capacity(remaining.len());
         while !remaining.is_empty() {
@@ -367,7 +377,7 @@ impl ServiceHost {
         self.settle_inner().await;
     }
 
-    async fn settle_if_idle(&self) {
+    pub(crate) async fn settle_if_idle(&self) {
         if self.lock().settling {
             return;
         }
@@ -494,7 +504,7 @@ impl ServiceHost {
     /// 所有非根 fiber 的诊断快照，按挂载顺序。
     pub fn fibers(&self) -> Vec<FiberInfo> {
         let inner = self.lock();
-        (1..inner.fibers.len())
+        (FIRST_CHILD..inner.fibers.len())
             .map(|index| inner.fiber_info(Fiber::new(inner.stamp, index)))
             .collect()
     }
@@ -526,7 +536,7 @@ impl ServiceHost {
 
         let fibers: Vec<Fiber> = {
             let inner = self.lock();
-            (1..inner.fibers.len())
+            (FIRST_CHILD..inner.fibers.len())
                 .rev()
                 .map(|index| Fiber::new(inner.stamp, index))
                 .collect()
@@ -535,7 +545,7 @@ impl ServiceHost {
             self.unmount_inner(fiber).await;
         }
 
-        let root = Fiber::new(self.stamp, 0);
+        let root = Fiber::new(self.stamp, ROOT_INDEX);
         let effects = self.lock().effects.remove(&root).unwrap_or_default();
         self.run_effects(effects).await;
         info!("service host shut down");
@@ -704,7 +714,7 @@ impl Inner {
 
     fn next_activatable(&mut self) -> Option<Fiber> {
         let mut selected = None;
-        for (index, slot) in self.fibers.iter().enumerate().skip(1) {
+        for (index, slot) in self.fibers.iter().enumerate().skip(FIRST_CHILD) {
             if slot.state != FiberState::Pending {
                 continue;
             }
@@ -757,178 +767,5 @@ impl Inner {
             .deps
             .iter()
             .any(|dep| self.services.provider(dep.id()) == Some(provider))
-    }
-}
-
-/// 插件作用域内的上下文。借用宿主，不能跨 `apply` 保存。
-#[derive(Clone, Copy)]
-pub struct Ctx<'h> {
-    host: &'h ServiceHost,
-    fiber: Fiber,
-}
-
-impl<'h> Ctx<'h> {
-    pub(crate) fn new(host: &'h ServiceHost, fiber: Fiber) -> Self {
-        Self { host, fiber }
-    }
-
-    pub fn fiber(&self) -> Fiber {
-        self.fiber
-    }
-
-    pub fn host(&self) -> &'h ServiceHost {
-        self.host
-    }
-
-    /// 以当前 `TypeId` 注册服务。
-    ///
-    /// # Errors
-    ///
-    /// 同一类型已经有提供者时返回 [`ServiceError::ServiceTaken`]。
-    pub async fn provide<T>(&self, service: Arc<T>) -> Result<(), ServiceError>
-    where
-        T: ?Sized + Send + Sync + 'static,
-    {
-        let id = TypeId::of::<T>();
-        let owner = self.fiber;
-        {
-            let mut inner = self.host.lock();
-            inner.services.provide::<T>(owner, service)?;
-            inner
-                .effects
-                .entry(owner)
-                .or_default()
-                .push(Effect::RemoveService {
-                    id,
-                    provider: owner,
-                });
-        }
-        self.host.settle_if_idle().await;
-        Ok(())
-    }
-
-    /// 查找服务；不存在时返回 `None`。可选依赖用这个。
-    pub fn get<T>(&self) -> Option<Arc<T>>
-    where
-        T: ?Sized + Send + Sync + 'static,
-    {
-        self.host.lock().services.get::<T>()
-    }
-
-    /// 查找服务；不存在时报错。
-    ///
-    /// # Errors
-    ///
-    /// 服务不存在时返回 [`ServiceError::MissingService`]。
-    pub fn require<T>(&self) -> Result<Arc<T>, ServiceError>
-    where
-        T: ?Sized + Send + Sync + 'static,
-    {
-        self.get::<T>().ok_or(ServiceError::MissingService {
-            type_name: std::any::type_name::<T>(),
-        })
-    }
-
-    /// 登记一个自定义资源；返回 setup 产出的值，卸载时逆序执行 disposer。
-    pub fn effect<T>(&self, setup: impl FnOnce() -> (T, Disposer)) -> T {
-        let (value, disposer) = setup();
-        {
-            let mut inner = self.host.lock();
-            inner
-                .effects
-                .entry(self.fiber)
-                .or_default()
-                .push(Effect::Custom(disposer));
-        }
-        value
-    }
-
-    /// 在当前 fiber 下挂载子插件；父 fiber 卸载时子插件一并卸载。
-    pub async fn mount<P: Plugin>(&self, plugin: P) -> Fiber {
-        let fiber = self.host.mount_child(self.fiber, plugin);
-        self.host.settle_if_idle().await;
-        fiber
-    }
-
-    /// 同步广播；返回值被忽略。
-    pub fn emit<E: 'static>(&self, key: EventKey<E>, event: &E) {
-        event::emit(self.host, key, event);
-    }
-
-    /// 注册广播监听器，追加在末尾。
-    pub fn on<E: 'static>(
-        &self,
-        key: EventKey<E>,
-        listener: impl for<'a, 'b, 'c> Fn(&'a Ctx<'c>, &'b E) + Send + Sync + 'static,
-    ) -> Listener {
-        event::on(self.host, self.fiber, key, listener, false)
-    }
-
-    /// 注册广播监听器，插到最前面。
-    pub fn prepend<E: 'static>(
-        &self,
-        key: EventKey<E>,
-        listener: impl for<'a, 'b, 'c> Fn(&'a Ctx<'c>, &'b E) + Send + Sync + 'static,
-    ) -> Listener {
-        event::on(self.host, self.fiber, key, listener, true)
-    }
-
-    /// 广播决策：第一个返回 `Some` 的监听器胜出。
-    pub fn bail<E: 'static, R: 'static>(&self, key: BailKey<E, R>, event: &E) -> Option<R> {
-        event::bail(self.host, key, event)
-    }
-
-    pub fn on_bail<E: 'static, R: 'static>(
-        &self,
-        key: BailKey<E, R>,
-        listener: impl for<'a, 'b, 'c> Fn(&'a Ctx<'c>, &'b E) -> Option<R> + Send + Sync + 'static,
-    ) -> Listener {
-        event::on_bail(self.host, self.fiber, key, listener, false)
-    }
-
-    pub fn prepend_bail<E: 'static, R: 'static>(
-        &self,
-        key: BailKey<E, R>,
-        listener: impl for<'a, 'b, 'c> Fn(&'a Ctx<'c>, &'b E) -> Option<R> + Send + Sync + 'static,
-    ) -> Listener {
-        event::on_bail(self.host, self.fiber, key, listener, true)
-    }
-
-    /// 环绕中间件；监听器按注册顺序由外向内包装。
-    pub async fn waterfall<E: Send + Sync + 'static, R: 'static>(
-        &self,
-        key: WaterfallKey<E, R>,
-        event: &E,
-        default: impl FnOnce() -> R + Send,
-    ) -> R {
-        event::waterfall(self.host, key, event, default).await
-    }
-
-    pub fn on_waterfall<E: Send + Sync + 'static, R: 'static>(
-        &self,
-        key: WaterfallKey<E, R>,
-        listener: impl for<'a, 'c> Fn(&'a Ctx<'c>, &'a E, Next<'a, R>) -> Next<'a, R>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Listener {
-        event::on_waterfall(self.host, self.fiber, key, listener, false)
-    }
-
-    pub fn prepend_waterfall<E: Send + Sync + 'static, R: 'static>(
-        &self,
-        key: WaterfallKey<E, R>,
-        listener: impl for<'a, 'c> Fn(&'a Ctx<'c>, &'a E, Next<'a, R>) -> Next<'a, R>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Listener {
-        event::on_waterfall(self.host, self.fiber, key, listener, true)
-    }
-
-    /// 提前撤销一个监听器；已撤销或不属于本宿主时返回 `false`。
-    pub fn off(&self, listener: Listener) -> bool {
-        let mut inner = self.host.lock();
-        event::remove_listener(&mut inner, listener)
     }
 }

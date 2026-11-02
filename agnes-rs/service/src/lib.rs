@@ -38,6 +38,7 @@
 //! });
 //! ```
 
+mod ctx;
 mod effect;
 mod error;
 mod event;
@@ -46,12 +47,13 @@ mod plugin;
 mod service;
 
 pub use async_trait::async_trait;
+pub use ctx::Ctx;
 pub use effect::Disposer;
 pub use error::{PluginError, ServiceError};
 pub use event::{
     BailKey, BailListener, EmitListener, EventKey, Listener, Next, WaterfallKey, WaterfallListener,
 };
-pub use host::{Ctx, ServiceHost};
+pub use host::ServiceHost;
 pub use plugin::{Fiber, FiberInfo, FiberState, Plugin};
 pub use service::{ServiceDep, ServiceInfo, ServiceParam};
 

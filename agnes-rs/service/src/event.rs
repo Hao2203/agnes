@@ -11,8 +11,9 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::ctx::Ctx;
 use crate::effect::Effect;
-use crate::host::{Ctx, Inner, ServiceHost};
+use crate::host::{Inner, ServiceHost};
 use crate::plugin::Fiber;
 
 /// `waterfall` 的 continuation：`await` 它把控制权交给下游与默认实现。
@@ -268,24 +269,22 @@ pub(crate) fn remove_listener(inner: &mut Inner, listener: Listener) -> bool {
     (listener.remove)(boxed, listener.id)
 }
 
-pub(crate) fn on<E: 'static>(
-    host: &ServiceHost,
+fn register<F: ?Sized + Send + Sync + 'static>(
+    inner: &mut Inner,
+    set_id: ListenerSetId,
     owner: Fiber,
-    key: EventKey<E>,
-    listener: impl for<'a, 'b, 'h> Fn(&'a Ctx<'h>, &'b E) + Send + Sync + 'static,
+    callback: Arc<F>,
     prepend: bool,
+    remove: RemoveListenerFn,
 ) -> Listener {
-    let mut inner = host.lock();
-    let set_id = key.set_id();
     let id = inner.next_listener;
     inner.next_listener += 1;
-    let callback: Arc<EmitListener<E>> = Arc::new(listener);
     let slot = Slot {
         id,
         owner,
         callback,
     };
-    let set = inner.listener_set_mut::<EmitListener<E>>(set_id);
+    let set = inner.listener_set_mut::<F>(set_id);
     if prepend {
         set.prepend(slot);
     } else {
@@ -295,7 +294,7 @@ pub(crate) fn on<E: 'static>(
         host: inner.stamp,
         set: set_id,
         id,
-        remove: remove_from_set::<EmitListener<E>>,
+        remove,
     };
     inner
         .effects
@@ -303,6 +302,25 @@ pub(crate) fn on<E: 'static>(
         .or_default()
         .push(Effect::RemoveListener(token));
     token
+}
+
+pub(crate) fn on<E: 'static>(
+    host: &ServiceHost,
+    owner: Fiber,
+    key: EventKey<E>,
+    listener: impl for<'a, 'b, 'h> Fn(&'a Ctx<'h>, &'b E) + Send + Sync + 'static,
+    prepend: bool,
+) -> Listener {
+    let mut inner = host.lock();
+    let callback: Arc<EmitListener<E>> = Arc::new(listener);
+    register(
+        &mut inner,
+        key.set_id(),
+        owner,
+        callback,
+        prepend,
+        remove_from_set::<EmitListener<E>>,
+    )
 }
 
 pub(crate) fn on_bail<E: 'static, R: 'static>(
@@ -313,33 +331,15 @@ pub(crate) fn on_bail<E: 'static, R: 'static>(
     prepend: bool,
 ) -> Listener {
     let mut inner = host.lock();
-    let set_id = key.set_id();
-    let id = inner.next_listener;
-    inner.next_listener += 1;
     let callback: Arc<BailListener<E, R>> = Arc::new(listener);
-    let slot = Slot {
-        id,
+    register(
+        &mut inner,
+        key.set_id(),
         owner,
         callback,
-    };
-    let set = inner.listener_set_mut::<BailListener<E, R>>(set_id);
-    if prepend {
-        set.prepend(slot);
-    } else {
-        set.push(slot);
-    }
-    let token = Listener {
-        host: inner.stamp,
-        set: set_id,
-        id,
-        remove: remove_from_set::<BailListener<E, R>>,
-    };
-    inner
-        .effects
-        .entry(owner)
-        .or_default()
-        .push(Effect::RemoveListener(token));
-    token
+        prepend,
+        remove_from_set::<BailListener<E, R>>,
+    )
 }
 
 pub(crate) fn on_waterfall<E: Send + Sync + 'static, R: 'static>(
@@ -353,33 +353,15 @@ pub(crate) fn on_waterfall<E: Send + Sync + 'static, R: 'static>(
     prepend: bool,
 ) -> Listener {
     let mut inner = host.lock();
-    let set_id = key.set_id();
-    let id = inner.next_listener;
-    inner.next_listener += 1;
     let callback: Arc<WaterfallListener<E, R>> = Arc::new(listener);
-    let slot = Slot {
-        id,
+    register(
+        &mut inner,
+        key.set_id(),
         owner,
         callback,
-    };
-    let set = inner.listener_set_mut::<WaterfallListener<E, R>>(set_id);
-    if prepend {
-        set.prepend(slot);
-    } else {
-        set.push(slot);
-    }
-    let token = Listener {
-        host: inner.stamp,
-        set: set_id,
-        id,
-        remove: remove_from_set::<WaterfallListener<E, R>>,
-    };
-    inner
-        .effects
-        .entry(owner)
-        .or_default()
-        .push(Effect::RemoveListener(token));
-    token
+        prepend,
+        remove_from_set::<WaterfallListener<E, R>>,
+    )
 }
 
 pub(crate) fn emit<E: 'static>(host: &ServiceHost, key: EventKey<E>, event: &E) {

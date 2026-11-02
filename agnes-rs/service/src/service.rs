@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::ctx::Ctx;
 use crate::error::ServiceError;
-use crate::host::Ctx;
 use crate::plugin::Fiber;
 
 /// 一个服务依赖。`id` 是身份，`name` 只进日志与诊断。

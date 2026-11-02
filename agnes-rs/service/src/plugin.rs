@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::ctx::Ctx;
 use crate::error::PluginError;
-use crate::host::Ctx;
 use crate::service::{ServiceDep, ServiceParam};
 
 /// 一个可挂载的插件。
@@ -69,6 +69,10 @@ impl Fiber {
 
     pub(crate) fn host(self) -> u64 {
         self.host
+    }
+
+    pub(crate) fn is_root(self) -> bool {
+        self.id == 0
     }
 }
 
