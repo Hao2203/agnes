@@ -409,24 +409,10 @@ pub enum Advanced {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{StepBudget, SystemPrompt};
-    use crate::header::{Environment, Header};
     use crate::message::{TokenUsage, ToolArguments, ToolOutput};
+    use crate::test_support::{budget, content, header, user};
     use crate::tool::{JsonSchema, ToolName};
-    use std::num::NonZeroU32 as TestNonZeroU32;
     use std::str::FromStr;
-
-    fn content(text: &str) -> Content {
-        Content::try_from(text).unwrap()
-    }
-
-    fn header() -> Header {
-        Header::new(SystemPrompt::new("be brief"), Environment::default())
-    }
-
-    fn budget(steps: u32) -> StepBudget {
-        StepBudget::new(TestNonZeroU32::new(steps).unwrap())
-    }
 
     fn new_turn(steps: u32) -> Turn {
         Turn::new(header(), budget(steps))
@@ -465,12 +451,6 @@ mod tests {
 
     fn output() -> ToolOutput {
         ToolOutput::success("done")
-    }
-
-    fn user(text: &str) -> Message {
-        Message::User {
-            content: content(text),
-        }
     }
 
     fn tool_results(turn: &Turn) -> Vec<String> {

@@ -22,3 +22,6 @@ pub mod llm;
 pub mod message;
 pub mod tool;
 pub mod turn;
+
+#[cfg(test)]
+mod test_support;

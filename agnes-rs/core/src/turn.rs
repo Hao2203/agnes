@@ -204,18 +204,9 @@ pub struct TurnResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SystemPrompt;
-    use crate::content::Content;
+    use crate::test_support::{budget, header, user};
     use crate::tool::JsonSchema;
     use std::str::FromStr;
-
-    fn header() -> Header {
-        Header::new(SystemPrompt::new("be brief"), Environment::default())
-    }
-
-    fn budget(steps: u32) -> StepBudget {
-        StepBudget::new(NonZeroU32::new(steps).unwrap())
-    }
 
     fn spec(name: &str) -> ToolSpec {
         ToolSpec::new(
@@ -223,12 +214,6 @@ mod tests {
             "",
             JsonSchema::try_from(serde_json::json!({"type": "object"})).unwrap(),
         )
-    }
-
-    fn user(text: &str) -> Message {
-        Message::User {
-            content: Content::try_from(text).unwrap(),
-        }
     }
 
     #[test]
