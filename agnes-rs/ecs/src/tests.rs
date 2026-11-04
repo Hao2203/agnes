@@ -591,6 +591,135 @@ fn a_cancelled_token_resolves() {
     });
 }
 
+#[derive(Debug)]
+struct Boom(&'static str);
+
+impl std::fmt::Display for Boom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Boom {}
+
+fn failing_system(_config: Res<Config>) -> Result<(), Boom> {
+    Err(Boom("boom"))
+}
+
+#[test]
+fn a_fallible_system_propagates_its_error() {
+    let mut world = World::new();
+    world.insert_resource(Config { value: 1 });
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(failing_system)
+        .expect("fallible systems are supported");
+    let error = schedule.run(&mut world).expect_err("the system fails");
+
+    let SystemError::Failed { system, source } = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(system.ends_with("failing_system"));
+    let boom = source
+        .downcast_ref::<Boom>()
+        .expect("the original error is preserved");
+    assert_eq!(boom.0, "boom");
+}
+
+fn fallible_ok(_config: Res<Config>) -> Result<(), Boom> {
+    Ok(())
+}
+
+#[test]
+fn a_fallible_system_that_succeeds_runs_following_systems() {
+    let mut world = World::new();
+    world.insert_resource(Config { value: 1 });
+    world.insert_resource(State::default());
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(fallible_ok)
+        .expect("fallible systems are supported");
+    schedule
+        .add_system(copy_config)
+        .expect("copy_config has no conflicts");
+    schedule.run(&mut world).expect("the schedule succeeds");
+
+    assert_eq!(world.resource::<State>().expect("state exists").value, 1);
+}
+
+fn mark_first(mut state: ResMut<State>) -> Result<(), Boom> {
+    state.value += 1;
+    Ok(())
+}
+
+fn fail_middle(_state: Res<State>) -> Result<(), Boom> {
+    Err(Boom("middle"))
+}
+
+fn mark_third(mut state: ResMut<State>) {
+    state.value += 10;
+}
+
+#[test]
+fn a_failing_system_stops_the_schedule() {
+    let mut world = World::new();
+    world.insert_resource(State::default());
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(mark_first)
+        .expect("mark_first is valid");
+    schedule
+        .add_system(fail_middle)
+        .expect("fail_middle is valid");
+    schedule
+        .add_system(mark_third)
+        .expect("mark_third is valid");
+    let error = schedule
+        .run(&mut world)
+        .expect_err("the middle system fails");
+
+    assert!(matches!(error, SystemError::Failed { .. }));
+    assert_eq!(world.resource::<State>().expect("state exists").value, 1);
+}
+
+fn spawn_then_fail(mut commands: Commands) -> Result<(), Boom> {
+    commands.spawn_empty();
+    Err(Boom("after spawn"))
+}
+
+#[test]
+fn a_failing_systems_commands_are_still_applied() {
+    let mut world = World::new();
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(spawn_then_fail)
+        .expect("spawn_then_fail is valid");
+    let error = schedule.run(&mut world).expect_err("the system fails");
+
+    assert!(matches!(error, SystemError::Failed { .. }));
+    assert_eq!(world.alive_len(), 1);
+}
+
+fn failing_app_system() -> Result<(), Boom> {
+    Err(Boom("app"))
+}
+
+#[test]
+fn an_app_update_propagates_a_system_error() {
+    let mut app = App::new();
+    app.add_systems(Update, failing_app_system);
+    let error = app.update().expect_err("the system fails");
+
+    assert!(matches!(
+        error,
+        SystemError::Failed { system, .. } if system.ends_with("failing_app_system")
+    ));
+}
+
 #[test]
 fn cancelling_wakes_a_registered_waiter() {
     let token = CancelToken::new();

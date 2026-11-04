@@ -22,6 +22,20 @@
 //! The runtime initializes per-system state, extracts parameters from the
 //! [`World`], checks access conflicts, and applies deferred [`Commands`].
 //!
+//! A system can also return a [`Result`](std::result::Result) to report
+//! failure to the host:
+//!
+//! ```ignore
+//! fn validate_turn(state: Res<TurnState>) -> Result<(), ModelError> {
+//!     // ...
+//!     Ok(())
+//! }
+//! ```
+//!
+//! An `Err` short-circuits the schedule: systems that already ran keep
+//! their effects, later systems are skipped, and the error surfaces from
+//! [`Schedule::run`], [`App::update`], and [`Runner::run`].
+//!
 //! # Safety and borrows
 //!
 //! Everything is built on safe `RefCell` borrowing. Query items are
@@ -90,6 +104,8 @@ pub use runner::{
     TaskSpawner,
 };
 pub use schedule::{Schedule, ScheduleError};
-pub use system::{FunctionSystem, IntoSystem, System, SystemError, SystemParamFunction};
+pub use system::{
+    BoxError, FunctionSystem, IntoSystem, System, SystemError, SystemOut, SystemParamFunction,
+};
 pub use system_param::{ParamError, SystemParam};
 pub use world::World;

@@ -89,8 +89,9 @@ impl Schedule {
     ///
     /// # Errors
     ///
-    /// Returns the first [`SystemError`] encountered. Systems that already
-    /// ran keep their effects; later systems are skipped.
+    /// Returns the first [`SystemError`] encountered, including an error
+    /// returned by a system itself. Systems that already ran keep their
+    /// effects; later systems are skipped.
     pub fn run(&mut self, world: &mut World) -> Result<(), SystemError> {
         for system in &mut self.systems {
             system.initialize(world);
