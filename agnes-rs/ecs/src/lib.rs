@@ -97,7 +97,7 @@ pub use component::Component;
 pub use entity::Entity;
 pub use message::{Message, MessageReader, MessageWriter, ReaderId};
 pub use plugin::Plugin;
-pub use query::{Query, QueryData, QueryFilter, QueryIter, With, Without};
+pub use query::{Query, QueryData, QueryFilter, QueryIter, QuerySingleError, With, Without};
 pub use resource::{Res, ResMut, Resource};
 pub use runner::{
     AsyncExecutor, CancelToken, Runner, RunnerError, RuntimeSendError, RuntimeSender, SpawnError,
@@ -108,4 +108,4 @@ pub use system::{
     BoxError, FunctionSystem, IntoSystem, System, SystemError, SystemOut, SystemParamFunction,
 };
 pub use system_param::{ParamError, SystemParam};
-pub use world::World;
+pub use world::{Bundle, World};

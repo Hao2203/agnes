@@ -4,7 +4,7 @@ use std::fmt;
 ///
 /// The index is reused after a despawn, while the generation is bumped so a
 /// stale handle can never observe components belonging to the new entity.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Entity {
     index: u32,
     generation: u32,
@@ -127,14 +127,19 @@ impl EntityAllocator {
         slot.state == SlotState::Alive && slot.generation == entity.generation
     }
 
+    pub(crate) fn iter_alive(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            if slot.state != SlotState::Alive {
+                return None;
+            }
+            let index = u32::try_from(index).expect("entity slot index fits in u32");
+            Some(Entity::new(index, slot.generation))
+        })
+    }
+
     pub(crate) fn alive_entities(&self) -> Vec<Entity> {
         let mut entities = Vec::with_capacity(self.slots.len());
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot.state == SlotState::Alive {
-                let index = u32::try_from(index).expect("entity slot index fits in u32");
-                entities.push(Entity::new(index, slot.generation));
-            }
-        }
+        entities.extend(self.iter_alive());
         entities
     }
 

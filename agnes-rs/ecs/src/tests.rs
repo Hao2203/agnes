@@ -363,6 +363,99 @@ fn commands_can_chain_insert_and_remove() {
     assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
 }
 
+#[test]
+fn spawn_bundle_attaches_all_components() {
+    let mut world = World::new();
+    let entity = world.spawn_bundle((Health(1), Ping(2)));
+
+    assert_eq!(world.get::<Health>(entity).expect("health exists").0, 1);
+    assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
+}
+
+#[test]
+fn spawn_bundle_empty_matches_spawn_empty() {
+    let mut world = World::new();
+    let entity = world.spawn_bundle(());
+
+    assert!(world.is_alive(entity));
+    assert!(world.get::<Health>(entity).is_none());
+}
+
+fn spawn_bundle_with_commands(mut commands: Commands, query: Query<&Health>) {
+    let entity = commands.spawn_bundle((Health(1), Ping(2)));
+    assert!(query.get(entity).is_none());
+}
+
+#[test]
+fn commands_spawn_bundle_applies_all_components() {
+    let mut world = World::new();
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(spawn_bundle_with_commands)
+        .expect("commands are valid");
+    schedule.run(&mut world).expect("run succeeds");
+
+    let entity = world.alive_entities()[0];
+    assert_eq!(world.get::<Health>(entity).expect("health exists").0, 1);
+    assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
+}
+
+fn insert_bundle_with_commands(mut commands: Commands) {
+    let entity = commands.spawn_empty();
+    commands.entity(entity).insert_bundle((Health(1), Ping(2)));
+}
+
+#[test]
+fn entity_commands_insert_bundle_applies_all_components() {
+    let mut world = World::new();
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(insert_bundle_with_commands)
+        .expect("commands are valid");
+    schedule.run(&mut world).expect("run succeeds");
+
+    let entity = world.alive_entities()[0];
+    assert_eq!(world.get::<Health>(entity).expect("health exists").0, 1);
+    assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
+}
+
+#[test]
+fn inserting_twice_replaces_the_component() {
+    let mut world = World::new();
+    let entity = world.spawn(Health(1));
+    world.insert(entity, Health(9));
+
+    assert_eq!(world.get::<Health>(entity).expect("health exists").0, 9);
+}
+
+#[test]
+fn removing_one_entity_keeps_others_intact() {
+    let mut world = World::new();
+    let first = world.spawn(Health(1));
+    let second = world.spawn(Health(2));
+    let third = world.spawn(Health(3));
+
+    assert_eq!(world.remove::<Health>(second), Some(Health(2)));
+
+    assert_eq!(world.get::<Health>(first).expect("first survives").0, 1);
+    assert_eq!(world.get::<Health>(third).expect("third survives").0, 3);
+    assert!(world.get::<Health>(second).is_none());
+}
+
+#[test]
+fn a_respawned_slot_hides_the_old_generation() {
+    let mut world = World::new();
+    let first = world.spawn(Health(1));
+    world.despawn(first);
+    let second = world.spawn(Health(2));
+
+    assert_eq!(first.index(), second.index());
+    assert!(world.get::<Health>(first).is_none());
+    assert_eq!(world.get::<Health>(second).expect("new health exists").0, 2);
+}
+
 fn stale_command(mut commands: Commands) {
     commands
         .entity(Entity::PLACEHOLDER)

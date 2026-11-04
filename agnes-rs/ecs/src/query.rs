@@ -11,10 +11,10 @@ pub trait QueryData {
     /// The item yielded for one entity.
     type Item<'w>;
 
-    /// Whether the entity has all required components.
-    fn matches(world: &World, entity: Entity) -> bool;
-
     /// Fetches the item for one entity.
+    ///
+    /// Returns `None` when the entity does not carry every required
+    /// component.
     fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>>;
 
     /// The component accesses required by this data.
@@ -23,10 +23,6 @@ pub trait QueryData {
 
 impl<T: Component> QueryData for &T {
     type Item<'w> = Ref<'w, T>;
-
-    fn matches(world: &World, entity: Entity) -> bool {
-        world.contains::<T>(entity)
-    }
 
     fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
         world.get::<T>(entity)
@@ -42,10 +38,6 @@ impl<T: Component> QueryData for &T {
 impl<T: Component> QueryData for &mut T {
     type Item<'w> = RefMut<'w, T>;
 
-    fn matches(world: &World, entity: Entity) -> bool {
-        world.contains::<T>(entity)
-    }
-
     fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
         world.get_mut::<T>(entity)
     }
@@ -60,10 +52,6 @@ impl<T: Component> QueryData for &mut T {
 impl QueryData for Entity {
     type Item<'w> = Entity;
 
-    fn matches(_world: &World, _entity: Entity) -> bool {
-        true
-    }
-
     fn fetch<'w>(_world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
         Some(entity)
     }
@@ -77,10 +65,6 @@ macro_rules! impl_query_data_tuple {
     ($($name:ident),+) => {
         impl<$($name: QueryData),+> QueryData for ($($name,)+) {
             type Item<'w> = ($($name::Item<'w>,)+);
-
-            fn matches(world: &World, entity: Entity) -> bool {
-                true $(&& $name::matches(world, entity))+
-            }
 
             fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
                 Some(($($name::fetch(world, entity)?,)+))
@@ -166,21 +150,17 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
 
     /// Iterates all matching entities.
     ///
+    /// The iterator filters lazily: each entity costs one component-storage
+    /// lookup, and no snapshot of matching entities is built up front.
+    ///
     /// # Panics
     ///
     /// Iterating a mutable query can panic if two mutable borrows of the same
     /// component value on the same entity are alive at once.
     pub fn iter(&self) -> QueryIter<'w, D, F> {
-        let entities = self.world.alive_entities();
-        let mut matched = Vec::with_capacity(entities.len());
-        for entity in entities {
-            if D::matches(self.world, entity) && F::matches(self.world, entity) {
-                matched.push(entity);
-            }
-        }
         QueryIter {
             world: self.world,
-            entities: matched.into_iter(),
+            entities: self.world.alive_entities().into_iter(),
             marker: PhantomData,
         }
     }
@@ -197,7 +177,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
 
     /// Fetches the item for one entity.
     pub fn get(&self, entity: Entity) -> Option<D::Item<'w>> {
-        if !D::matches(self.world, entity) || !F::matches(self.world, entity) {
+        if !F::matches(self.world, entity) {
             return None;
         }
         D::fetch(self.world, entity)
@@ -212,14 +192,37 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         self.get(entity)
     }
 
+    /// The single matching entity, or an error when zero or several match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuerySingleError::NoEntity`] when nothing matches and
+    /// [`QuerySingleError::MultipleEntities`] when more than one does.
+    pub fn single(&self) -> Result<D::Item<'w>, QuerySingleError> {
+        let mut iter = self.iter();
+        match (iter.next(), iter.next()) {
+            (Some(item), None) => Ok(item),
+            (None, _) => Err(QuerySingleError::NoEntity),
+            (Some(_), Some(_)) => Err(QuerySingleError::MultipleEntities),
+        }
+    }
+
     /// The number of matching entities.
+    ///
+    /// Walks the entity allocator directly, so this never allocates.
     pub fn count(&self) -> usize {
-        self.iter().count()
+        self.world
+            .count_alive(|entity| filtered_fetch::<D, F>(self.world, entity).is_some())
     }
 
     /// Whether no entity matches.
+    ///
+    /// Walks the entity allocator directly and stops at the first match, so
+    /// this never allocates.
     pub fn is_empty(&self) -> bool {
-        self.count() == 0
+        !self
+            .world
+            .any_alive(|entity| filtered_fetch::<D, F>(self.world, entity).is_some())
     }
 }
 
@@ -235,7 +238,7 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
 
     fn next(&mut self) -> Option<Self::Item> {
         for entity in self.entities.by_ref() {
-            if let Some(item) = D::fetch(self.world, entity) {
+            if let Some(item) = filtered_fetch::<D, F>(self.world, entity) {
                 return Some(item);
             }
         }
@@ -245,6 +248,33 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.entities.size_hint()
     }
+}
+
+/// Fetches the item for one entity, honoring the query's filter.
+///
+/// The shared match test behind [`QueryIter::next`], [`Query::count`], and
+/// [`Query::is_empty`]: one filter check plus one component fetch per entity.
+fn filtered_fetch<'w, D: QueryData, F: QueryFilter>(
+    world: &'w World,
+    entity: Entity,
+) -> Option<D::Item<'w>> {
+    if F::matches(world, entity) {
+        D::fetch(world, entity)
+    } else {
+        None
+    }
+}
+
+/// Why [`Query::single`] did not return exactly one match.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum QuerySingleError {
+    /// No entity matched the query.
+    #[error("no entity matches the query")]
+    NoEntity,
+    /// More than one entity matched the query.
+    #[error("multiple entities match the query")]
+    MultipleEntities,
 }
 
 #[cfg(test)]
@@ -318,5 +348,59 @@ mod tests {
         let query = Query::<(crate::Entity, &'static Name)>::new(&world);
         let matches: Vec<_> = query.iter().map(|(found, name)| (found, name.0)).collect();
         assert_eq!(matches, [(entity, "a")]);
+    }
+
+    #[test]
+    fn single_returns_the_only_match() {
+        let mut world = World::new();
+        world.spawn(Name("only"));
+
+        let query = Query::<&'static Name>::new(&world);
+        assert_eq!(query.single().expect("one match").0, "only");
+    }
+
+    #[test]
+    fn single_reports_no_entity() {
+        let world = World::new();
+        let query = Query::<&'static Name>::new(&world);
+        assert!(matches!(
+            query.single(),
+            Err(crate::QuerySingleError::NoEntity)
+        ));
+    }
+
+    #[test]
+    fn single_reports_multiple_entities() {
+        let mut world = World::new();
+        world.spawn(Name("a"));
+        world.spawn(Name("b"));
+
+        let query = Query::<&'static Name>::new(&world);
+        assert!(matches!(
+            query.single(),
+            Err(crate::QuerySingleError::MultipleEntities)
+        ));
+    }
+
+    #[test]
+    fn count_and_is_empty_match_iteration() {
+        let mut world = World::new();
+        world.spawn(Name("a"));
+        world.spawn(Active(true));
+        world.spawn(Name("b"));
+        world.spawn(Running);
+
+        let names = Query::<&'static Name>::new(&world);
+        let running = Query::<&'static Name, With<Running>>::new(&world);
+        let idle = Query::<&'static Name, Without<Running>>::new(&world);
+        let none = Query::<&'static Running, Without<Name>>::new(&world);
+
+        assert_eq!(names.count(), 2);
+        assert_eq!(names.iter().count(), 2);
+        assert!(!names.is_empty());
+        assert_eq!(running.count(), 0);
+        assert_eq!(idle.count(), 2);
+        assert_eq!(none.count(), 1);
+        assert!(!none.is_empty());
     }
 }

@@ -88,12 +88,17 @@ impl<T: Message> MessageQueue<T> {
         let Some(cursor) = inner.readers.get_mut(&reader) else {
             return Vec::new();
         };
-        let messages: Vec<Arc<T>> = inner
-            .published
-            .iter()
-            .filter(|(seq, _)| seq >= cursor)
-            .map(|(_, message)| Arc::clone(message))
-            .collect();
+        // Sequences grow monotonically, so binary search to the reader's
+        // position instead of scanning every published message.
+        let start = inner.published.partition_point(|(seq, _)| *seq < *cursor);
+        let mut messages = Vec::with_capacity(inner.published.len() - start);
+        messages.extend(
+            inner
+                .published
+                .iter()
+                .skip(start)
+                .map(|(_, message)| Arc::clone(message)),
+        );
         if let Some((last, _)) = inner.published.back() {
             let next = last
                 .checked_add(1)

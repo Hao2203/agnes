@@ -1,6 +1,6 @@
 use crate::component::Component;
 use crate::entity::Entity;
-use crate::world::World;
+use crate::world::{Bundle, World};
 
 type QueuedCommand = Box<dyn FnOnce(&mut World) + Send + 'static>;
 
@@ -59,6 +59,24 @@ impl<'w, 's> Commands<'w, 's> {
         entity
     }
 
+    /// Reserves an entity and queues every component of a [`Bundle`].
+    ///
+    /// The returned entity is not visible to queries until commands are
+    /// applied.
+    pub fn spawn_bundle<B: Bundle + Send + 'static>(&mut self, bundle: B) -> Entity {
+        let entity = self.world.reserve_entity();
+        self.queue.push(Box::new(move |world| {
+            if !world.confirm_entity(entity) {
+                log::warn!("skipping spawn of stale entity {entity:?}");
+                return;
+            }
+            if !world.insert_bundle(entity, bundle) {
+                log::warn!("spawned entity {entity:?} disappeared before insertion");
+            }
+        }));
+        entity
+    }
+
     /// Reserves an entity without components.
     pub fn spawn_empty(&mut self) -> Entity {
         let entity = self.world.reserve_entity();
@@ -100,6 +118,17 @@ impl<'s> EntityCommands<'s> {
                 return;
             }
             world.insert(entity, component);
+        }));
+        self
+    }
+
+    /// Queues the insertion of every component in a [`Bundle`].
+    pub fn insert_bundle<B: Bundle + Send + 'static>(self, bundle: B) -> Self {
+        let entity = self.entity;
+        self.queue.push(Box::new(move |world| {
+            if !world.insert_bundle(entity, bundle) {
+                log::warn!("skipping insertion for stale entity {entity:?}");
+            }
         }));
         self
     }

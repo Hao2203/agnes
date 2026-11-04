@@ -35,7 +35,19 @@ impl World {
     /// Spawns an entity with one component.
     pub fn spawn<T: Component>(&mut self, component: T) -> Entity {
         let entity = self.entities.get_mut().spawn();
-        self.insert(entity, component);
+        self.insert_confirmed(entity, component);
+        entity
+    }
+
+    /// Spawns an entity carrying every component of a [`Bundle`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal storage entry has a mismatched `TypeId`, which
+    /// indicates a bug in the world itself.
+    pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Entity {
+        let entity = self.entities.get_mut().spawn();
+        bundle.insert_into(self, entity);
         entity
     }
 
@@ -86,6 +98,28 @@ impl World {
         if !self.is_alive(entity) {
             return false;
         }
+        self.insert_confirmed(entity, component);
+        true
+    }
+
+    /// Inserts every component of a [`Bundle`] onto a live entity.
+    ///
+    /// Returns `false` when the entity is not alive, in which case nothing is
+    /// inserted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal storage entry has a mismatched `TypeId`, which
+    /// indicates a bug in the world itself.
+    pub fn insert_bundle<B: Bundle>(&mut self, entity: Entity, bundle: B) -> bool {
+        bundle.insert_into(self, entity)
+    }
+
+    /// Inserts a component without checking that the entity is alive.
+    ///
+    /// Callers must verify liveness first so no storage entry is created for
+    /// a dead entity.
+    pub(crate) fn insert_confirmed<T: Component>(&mut self, entity: Entity, component: T) {
         let type_id = TypeId::of::<T>();
         let storage = self
             .components
@@ -96,7 +130,6 @@ impl World {
             .downcast_mut::<Storage<T>>()
             .expect("component storage matches its TypeId");
         storage.insert(entity, component);
-        true
     }
 
     /// Removes a component from an entity.
@@ -204,6 +237,26 @@ impl World {
         self.entities.borrow().alive_entities()
     }
 
+    /// Whether any live entity satisfies `predicate`.
+    ///
+    /// Short-circuits on the first match. The allocator borrow is held only
+    /// for this call, so `predicate` must not reenter `&mut World` methods.
+    pub(crate) fn any_alive(&self, predicate: impl FnMut(Entity) -> bool) -> bool {
+        self.entities.borrow().iter_alive().any(predicate)
+    }
+
+    /// The number of live entities satisfying `predicate`.
+    ///
+    /// The allocator borrow is held only for this call, so `predicate` must
+    /// not reenter `&mut World` methods.
+    pub(crate) fn count_alive(&self, mut predicate: impl FnMut(Entity) -> bool) -> usize {
+        self.entities
+            .borrow()
+            .iter_alive()
+            .filter(|entity| predicate(*entity))
+            .count()
+    }
+
     pub(crate) fn alive_len(&self) -> usize {
         self.entities.borrow().alive_len()
     }
@@ -279,6 +332,51 @@ impl World {
             .downcast_ref::<ResourceCell<T>>()
     }
 }
+
+/// A set of components inserted together in one call.
+///
+/// Implemented for tuples of [`Component`]s up to eight members (plus the
+/// empty tuple), so `spawn_bundle((A, B))` attaches both components while
+/// reserving a single entity. Single components go through
+/// [`World::spawn`] directly.
+pub trait Bundle {
+    /// Inserts every component in the set onto `entity`.
+    ///
+    /// Returns `false` when the entity is not alive, in which case nothing is
+    /// inserted.
+    fn insert_into(self, world: &mut World, entity: Entity) -> bool;
+}
+
+impl Bundle for () {
+    fn insert_into(self, world: &mut World, entity: Entity) -> bool {
+        world.is_alive(entity)
+    }
+}
+
+macro_rules! impl_bundle_tuple {
+    ($($name:ident),+) => {
+        impl<$($name: Component),+> Bundle for ($($name,)+) {
+            fn insert_into(self, world: &mut World, entity: Entity) -> bool {
+                if !world.is_alive(entity) {
+                    return false;
+                }
+                #[allow(non_snake_case)]
+                let ($($name,)+) = self;
+                $(world.insert_confirmed(entity, $name);)+
+                true
+            }
+        }
+    };
+}
+
+impl_bundle_tuple!(A);
+impl_bundle_tuple!(A, B);
+impl_bundle_tuple!(A, B, C);
+impl_bundle_tuple!(A, B, C, D);
+impl_bundle_tuple!(A, B, C, D, E);
+impl_bundle_tuple!(A, B, C, D, E, F);
+impl_bundle_tuple!(A, B, C, D, E, F, G);
+impl_bundle_tuple!(A, B, C, D, E, F, G, H);
 
 impl Default for World {
     fn default() -> Self {
