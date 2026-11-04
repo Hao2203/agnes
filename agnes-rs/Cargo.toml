@@ -10,6 +10,7 @@ members = [
     "session-file",
     "agent",
     "cli",
+    "ecs",
 ]
 
 [workspace.package]
@@ -27,8 +28,13 @@ agnes-transport-reqwest = { path = "transport-reqwest" }
 agnes-llm-openai = { path = "llm-openai" }
 agnes-session-file = { path = "session-file" }
 agnes-agent = { path = "agent" }
+agnes-ecs = { path = "ecs" }
+async-channel = "2"
+async-executor = "1"
 async-trait = "0.1"
+event-listener = "5"
 log = "0.4"
+ureq = "2"
 futures-lite = "2"
 cold-string = "0.5"
 secrecy = "0.10"

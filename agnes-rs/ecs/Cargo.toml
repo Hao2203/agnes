@@ -1,0 +1,36 @@
+[package]
+name = "agnes-ecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+async-trait.workspace = true
+event-listener.workspace = true
+futures-lite.workspace = true
+log.workspace = true
+thiserror.workspace = true
+async-executor = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "net", "sync", "time"] }
+
+[features]
+default = []
+tokio = ["dep:tokio"]
+async-executor = ["dep:async-executor"]
+
+[dev-dependencies]
+async-executor.workspace = true
+ureq.workspace = true
+
+[[example]]
+name = "agent_runtime_tokio"
+required-features = ["tokio"]
+
+[[example]]
+name = "agent_runtime_executor"
+required-features = ["async-executor"]
+
+[lints]
+workspace = true
