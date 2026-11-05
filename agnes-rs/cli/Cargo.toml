@@ -11,13 +11,18 @@ path = "src/main.rs"
 
 [dependencies]
 agnes-core.workspace = true
+agnes-ecs.workspace = true
 agnes-io.workspace = true
-agnes-transport-reqwest.workspace = true
-agnes-llm-openai.workspace = true
+agnes-plugin-http.workspace = true
+agnes-plugin-async = { workspace = true, features = ["tokio"] }
+agnes-plugin-openai.workspace = true
+agnes-plugin-session.workspace = true
+agnes-plugin-session-file.workspace = true
+agnes-record.workspace = true
 agnes-session-file.workspace = true
+agnes-transport-reqwest.workspace = true
 agnes-agent.workspace = true
 anyhow.workspace = true
-async-trait.workspace = true
 clap.workspace = true
 jiff.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync"] }

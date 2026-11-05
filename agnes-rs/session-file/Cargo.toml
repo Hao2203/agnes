@@ -6,15 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-agnes-agent.workspace = true
 agnes-core.workspace = true
+agnes-record.workspace = true
 agnes-util.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 
 [dev-dependencies]
 tempfile.workspace = true

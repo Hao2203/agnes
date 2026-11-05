@@ -1,23 +1,27 @@
-//! Interactive input: a background stdin reader, the shared queue the chat
-//! loop and the agent driver both consume, and Ctrl-C handling.
+//! Interactive input: a background stdin reader that classifies lines and
+//! injects them as ECS messages, answer mode for approval questions, and
+//! Ctrl-C handling.
+//!
+//! The reader never blocks the ECS: everything it does is sending messages
+//! on the [`RuntimeSender`] or cancelling the [`CancelToken`].
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agnes_core::content::Content;
-use agnes_io::input::Input;
-use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
+
+use crate::app::HostChannels;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One classified line the user typed.
-pub enum Line {
+pub(crate) enum Line {
     /// A task/message to run.
     Task(Content),
     /// `/new` — drop the session's prior turns.
@@ -26,36 +30,35 @@ pub enum Line {
     Exit,
 }
 
-/// The queue between the stdin reader task, the signal handler, the chat
-/// loop and — mid-run — the agent driver.
+/// Shared input state: answer mode for approval questions plus the run flag
+/// the signal handler and the stdin reader watch.
 pub struct UserInput {
-    queue: Mutex<VecDeque<Line>>,
-    wake: Notify,
     /// 审批问询期间：读到的行不分类，原样进答覆队列。
     answering: AtomicBool,
     answers: Mutex<VecDeque<String>>,
     answer_wake: Notify,
-    stop: watch::Sender<bool>,
-    running: AtomicBool,
+    running: watch::Sender<bool>,
 }
 
 impl UserInput {
     pub fn new() -> Arc<Self> {
-        let (stop, _) = watch::channel(false);
+        let (running, _) = watch::channel(false);
         Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            wake: Notify::new(),
             answering: AtomicBool::new(false),
             answers: Mutex::new(VecDeque::new()),
             answer_wake: Notify::new(),
-            stop,
-            running: AtomicBool::new(false),
+            running,
         })
     }
 
-    pub fn push(&self, line: Line) {
-        lock(&self.queue).push_back(line);
-        self.wake.notify_one();
+    /// Whether a turn is in flight; the stdin reader routes Task lines by it.
+    pub fn running_handle(&self) -> watch::Receiver<bool> {
+        self.running.subscribe()
+    }
+
+    /// Marks a turn as in flight (or finished); called by the host systems.
+    pub fn set_running(&self, running: bool) {
+        let _ = self.running.send_replace(running);
     }
 
     /// Enters answer mode **before** the question is printed, closing the
@@ -86,38 +89,6 @@ impl UserInput {
         lock(&self.answers).push_back(line);
         self.answer_wake.notify_one();
     }
-
-    /// Next line for the chat loop; waits until one is available.
-    pub async fn next(&self) -> Line {
-        loop {
-            {
-                let mut queue = lock(&self.queue);
-                if let Some(line) = queue.pop_front() {
-                    return line;
-                }
-            }
-            self.wake.notified().await;
-        }
-    }
-
-    /// Marks a run as in flight and clears a stop left over from a previous
-    /// run, so one Ctrl-C never leaks into the next task.
-    pub fn begin_run(&self) {
-        self.stop.send_replace(false);
-        self.running.store(true, Ordering::Release);
-    }
-
-    pub fn end_run(&self) {
-        self.running.store(false, Ordering::Release);
-    }
-
-    fn request_stop(&self) {
-        self.stop.send_replace(true);
-    }
-
-    fn is_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
-    }
 }
 
 /// Answer mode guard: dropping it (including on cancellation) restores normal
@@ -132,72 +103,87 @@ impl Drop for AnswerMode<'_> {
     }
 }
 
-#[async_trait]
-impl Input for UserInput {
-    fn drain(&self) -> Vec<Content> {
-        // Only messages ahead of any command line are injected; a command is
-        // a barrier, so `/new` and whatever follows it stay queued for the
-        // loop to handle in order.
-        let mut queue = lock(&self.queue);
-        let mut messages = Vec::new();
-        while matches!(queue.front(), Some(Line::Task(_))) {
-            if let Some(Line::Task(content)) = queue.pop_front() {
-                messages.push(content);
-            }
-        }
-        messages
-    }
-
-    async fn interrupted(&self) {
-        let mut stop = self.stop.subscribe();
-        while !*stop.borrow_and_update() {
-            if stop.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-/// Reads stdin line by line in the background, classifying every line, until
-/// EOF — which queues `Line::Exit` like `exit`/`quit` do.
-pub fn spawn_stdin_reader(input: &Arc<UserInput>) -> JoinHandle<()> {
-    let input = Arc::clone(input);
+/// Reads stdin line by line in the background, turning every line into an
+/// ECS message, until EOF — which shuts the runtime down like `exit` does.
+pub fn spawn_stdin_reader(input: Arc<UserInput>, channels: Arc<HostChannels>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut running = input.running_handle();
+        let mut pending_reset = false;
         let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
         loop {
-            match read_line_lossy(&mut reader).await {
-                Ok(Some(line)) => {
-                    if input.is_answering() {
-                        input.push_answer(line);
-                    } else if let Some(line) = classify(&line) {
-                        input.push(line);
+            tokio::select! {
+                biased;
+                // 运行结束后补发推迟的 `/new`。
+                _ = running.changed(), if pending_reset => {
+                    if !*running.borrow_and_update() {
+                        pending_reset = false;
+                        let _ = channels.sender.send_message(agnes_plugin_session::RotateSession);
                     }
                 }
-                Ok(None) | Err(_) => {
-                    // EOF 也要给挂起的审批一个答覆，否则问询会一直悬着。
-                    if input.is_answering() {
-                        input.push_answer(String::new());
+                line = read_line_lossy(&mut reader) => {
+                    match line {
+                        Ok(Some(raw)) => {
+                            if input.is_answering() {
+                                input.push_answer(raw);
+                                continue;
+                            }
+                            match classify(&raw) {
+                                None => {}
+                                Some(Line::Exit) => {
+                                    // EOF 也要给挂起的审批一个答覆，否则问询会一直悬着。
+                                    if input.is_answering() {
+                                        input.push_answer(String::new());
+                                    }
+                                    channels.shutdown.cancel();
+                                    return;
+                                }
+                                Some(Line::Reset) => {
+                                    if *running.borrow_and_update() {
+                                        // 命令是屏障：等当前 turn 收场后再轮转。
+                                        pending_reset = true;
+                                    } else {
+                                        let _ = channels
+                                            .sender
+                                            .send_message(agnes_plugin_session::RotateSession);
+                                    }
+                                }
+                                Some(Line::Task(content)) => {
+                                    let _ = channels.sender.send_message(TaskLine { content });
+                                }
+                            }
+                        }
+                        Ok(None) | Err(_) => {
+                            if input.is_answering() {
+                                input.push_answer(String::new());
+                            }
+                            channels.shutdown.cancel();
+                            return;
+                        }
                     }
-                    input.push(Line::Exit);
-                    return;
                 }
             }
         }
     })
 }
 
-/// Ctrl-C: interrupts a run in flight; at the prompt it leaves the session.
-pub fn spawn_ctrl_c(input: &Arc<UserInput>) -> JoinHandle<()> {
-    let input = Arc::clone(input);
+/// Ctrl-C: interrupts a turn in flight; at the prompt it shuts the runtime
+/// down.
+pub fn spawn_ctrl_c(input: Arc<UserInput>, channels: Arc<HostChannels>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut running = input.running_handle();
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
             }
-            if input.is_running() {
-                input.request_stop();
+            if *running.borrow_and_update() {
+                let _ = channels
+                    .sender
+                    .send_message(agnes_agent::runtime::InterruptTurn);
             } else {
-                input.push(Line::Exit);
+                if input.is_answering() {
+                    input.push_answer(String::new());
+                }
+                channels.shutdown.cancel();
                 return;
             }
         }
@@ -213,6 +199,13 @@ fn classify(line: &str) -> Option<Line> {
         "/new" => Some(Line::Reset),
         _ => Content::try_from(trimmed).ok().map(Line::Task),
     }
+}
+
+/// A task line from the host: routed to a new turn or, while a turn is
+/// running, to the injection pipeline.
+#[derive(Debug)]
+pub struct TaskLine {
+    pub content: Content,
 }
 
 /// Reads one line as raw bytes and decodes lossily. Input methods and
@@ -241,39 +234,15 @@ where
 mod tests {
     use super::*;
 
-    fn content(text: &str) -> Content {
-        Content::try_from(text).unwrap()
-    }
-
-    #[test]
-    fn drain_takes_leading_messages_and_stops_at_a_command() {
-        let input = UserInput::new();
-        input.push(Line::Task(content("first")));
-        input.push(Line::Task(content("second")));
-        input.push(Line::Reset);
-        input.push(Line::Task(content("after reset")));
-
-        let drained = input.drain();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].as_str(), "first");
-        assert_eq!(drained[1].as_str(), "second");
-
-        // the command barrier and whatever follows it stay queued
-        assert!(input.drain().is_empty());
-    }
-
     #[tokio::test]
     async fn answering_mode_takes_raw_lines_and_restores_on_drop() {
         let input = UserInput::new();
         let mode = input.begin_answer();
-        assert!(input.is_answering());
         input.push_answer("y".into());
         assert_eq!(input.answer().await, "y");
         drop(mode);
+        // 答覆模式已退出
         assert!(!input.is_answering());
-        // 答覆模式已退出：后续行照常分类
-        input.push(Line::Reset);
-        assert!(matches!(input.next().await, Line::Reset));
     }
 
     #[test]
@@ -283,5 +252,14 @@ mod tests {
         assert!(matches!(classify("quit"), Some(Line::Exit)));
         assert!(matches!(classify("/new"), Some(Line::Reset)));
         assert!(matches!(classify("do the thing"), Some(Line::Task(_))));
+    }
+
+    #[test]
+    fn the_running_flag_starts_false_and_is_settable() {
+        let input = UserInput::new();
+        let mut handle = input.running_handle();
+        assert!(!*handle.borrow_and_update());
+        input.set_running(true);
+        assert!(*handle.borrow_and_update());
     }
 }

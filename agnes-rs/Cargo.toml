@@ -1,16 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
-    "service",
     "core",
     "util",
     "io",
+    "record",
     "transport-reqwest",
     "llm-openai",
     "session-file",
     "agent",
     "cli",
     "ecs",
+    "plugin-http",
+    "plugin-openai",
+    "plugin-async",
+    "plugin-session",
+    "plugin-session-file",
 ]
 
 [workspace.package]
@@ -20,15 +25,20 @@ rust-version = "1.89"
 license = "MIT"
 
 [workspace.dependencies]
-agnes-service = { path = "service" }
 agnes-core = { path = "core" }
 agnes-util = { path = "util" }
 agnes-io = { path = "io" }
+agnes-record = { path = "record" }
 agnes-transport-reqwest = { path = "transport-reqwest" }
 agnes-llm-openai = { path = "llm-openai" }
 agnes-session-file = { path = "session-file" }
 agnes-agent = { path = "agent" }
 agnes-ecs = { path = "ecs" }
+agnes-plugin-http = { path = "plugin-http" }
+agnes-plugin-openai = { path = "plugin-openai" }
+agnes-plugin-async = { path = "plugin-async" }
+agnes-plugin-session = { path = "plugin-session" }
+agnes-plugin-session-file = { path = "plugin-session-file" }
 async-channel = "2"
 async-executor = "1"
 async-trait = "0.1"

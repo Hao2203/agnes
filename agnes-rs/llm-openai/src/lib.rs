@@ -1,32 +1,40 @@
-//! OpenAI-format adapter for the async [`agnes_io::llm::Llm`] seam.
+//! OpenAI-format codec: request encoding and response decoding for the
+//! `chat/completions` wire format.
 //!
-//! Generic over [`HttpTransport`]: pair it with `agnes-transport-reqwest`
-//! (tokio) today or any other async transport tomorrow.
+//! Pure data in, pure data out — no I/O, no transport. The ECS bridge in
+//! `agnes-plugin-openai` pairs it with the HTTP capability: `LlmCall` →
+//! [`OpenAiCodec::build_request`] → `HttpRequest` → `HttpResponse` →
+//! [`OpenAiCodec::parse_response`] → `LlmReply`.
 mod wire;
 
 use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_core::llm::{LlmRequest, LlmResponse};
-use agnes_io::http::{HttpTransport, TransportError};
-use agnes_io::llm::{ApiBody, Llm, LlmError};
-use async_trait::async_trait;
+use agnes_io::http::TransportError;
+use agnes_io::llm::{ApiBody, LlmError};
 
-/// Client for any OpenAI-compatible chat-completions API.
-pub struct OpenAiClient<T> {
-    transport: T,
+/// Encodes the runtime's requests and decodes the provider's responses.
+pub struct OpenAiCodec {
     base_url: BaseUrl,
     api_key: ApiKey,
 }
 
-impl<T: HttpTransport> OpenAiClient<T> {
-    pub fn new(transport: T, base_url: BaseUrl, api_key: ApiKey) -> Self {
-        Self {
-            transport,
-            base_url,
-            api_key,
-        }
+impl OpenAiCodec {
+    pub fn new(base_url: BaseUrl, api_key: ApiKey) -> Self {
+        Self { base_url, api_key }
     }
 
-    fn build_request(&self, request: &LlmRequest) -> Result<http::Request<String>, LlmError> {
+    /// Encodes one model request as an HTTP request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Config`] when the endpoint cannot be joined and
+    /// [`LlmError::Transport`] when the `http` crate rejects the request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request body cannot be serialized (it is built from
+    /// owned domain values, so this cannot happen in practice).
+    pub fn build_request(&self, request: &LlmRequest) -> Result<http::Request<String>, LlmError> {
         let body = serde_json::to_string(&wire::ChatCompletionRequest::from_core(request))
             .expect("request serialization cannot fail");
         let endpoint = self.base_url.join("chat/completions")?;
@@ -42,7 +50,14 @@ impl<T: HttpTransport> OpenAiClient<T> {
             .map_err(|e| LlmError::Transport(TransportError::Request(e)))
     }
 
-    fn parse_response(status: http::StatusCode, body: &str) -> Result<LlmResponse, LlmError> {
+    /// Decodes the provider's HTTP response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Api`] for non-success statuses, [`LlmError::Decode`]
+    /// for malformed JSON, and [`LlmError::Protocol`] for a completion that
+    /// parses but is not a legal response.
+    pub fn parse_response(status: http::StatusCode, body: &str) -> Result<LlmResponse, LlmError> {
         if !status.is_success() {
             let detail = wire::extract_error_body(body);
             return Err(LlmError::Api {
@@ -56,64 +71,18 @@ impl<T: HttpTransport> OpenAiClient<T> {
     }
 }
 
-#[async_trait]
-impl<T: HttpTransport> Llm for OpenAiClient<T> {
-    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let http_request = self.build_request(request)?;
-        let http_response = self.transport.send(http_request).await?;
-        Self::parse_response(http_response.status(), http_response.body())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::content::Content;
-    use agnes_core::llm::Prompt;
+    use agnes_core::llm::{Prompt, StopReason};
     use agnes_core::message::Message;
     use std::num::NonZeroU32;
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
 
-    /// Records the last request and replies with a canned response.
-    struct FakeTransport {
-        status: Mutex<http::StatusCode>,
-        body: Mutex<String>,
-    }
-
-    impl FakeTransport {
-        fn new(status: u16, body: &str) -> Self {
-            Self {
-                status: Mutex::new(http::StatusCode::from_u16(status).unwrap()),
-                body: Mutex::new(body.to_owned()),
-            }
-        }
-    }
-
-    fn response(status: http::StatusCode, body: &str) -> http::Response<String> {
-        http::Response::builder()
-            .status(status)
-            .body(body.to_owned())
-            .unwrap()
-    }
-
-    #[async_trait]
-    impl HttpTransport for FakeTransport {
-        async fn send(
-            &self,
-            _request: http::Request<String>,
-        ) -> Result<http::Response<String>, TransportError> {
-            Ok(response(
-                *self.status.lock().unwrap(),
-                &self.body.lock().unwrap(),
-            ))
-        }
-    }
-
-    fn client(transport: FakeTransport) -> OpenAiClient<FakeTransport> {
-        OpenAiClient::new(
-            transport,
+    fn codec() -> OpenAiCodec {
+        OpenAiCodec::new(
             BaseUrl::from_str("https://api.example.com/v1").unwrap(),
             ApiKey::try_from("sk-test").unwrap(),
         )
@@ -136,34 +105,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn sends_bearer_and_json_headers() {
-        let captured: Arc<Mutex<Option<http::Request<String>>>> = Arc::new(Mutex::new(None));
-        let sink = Arc::clone(&captured);
+    fn decode(status: u16, body: &str) -> Result<LlmResponse, LlmError> {
+        OpenAiCodec::parse_response(http::StatusCode::from_u16(status).unwrap(), body)
+    }
 
-        struct Capture(Arc<Mutex<Option<http::Request<String>>>>);
-        #[async_trait]
-        impl HttpTransport for Capture {
-            async fn send(
-                &self,
-                request: http::Request<String>,
-            ) -> Result<http::Response<String>, TransportError> {
-                *self.0.lock().unwrap() = Some(request);
-                Ok(response(
-                    http::StatusCode::OK,
-                    r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
-                ))
-            }
-        }
-
-        let openai = OpenAiClient::new(
-            Capture(Arc::clone(&sink)),
-            BaseUrl::from_str("https://api.example.com/v1/").unwrap(),
-            ApiKey::try_from("sk-test").unwrap(),
-        );
-        Llm::complete(&openai, &sample_request()).await.unwrap();
-
-        let request = captured.lock().unwrap().take().unwrap();
+    #[test]
+    fn sends_bearer_and_json_headers() {
+        let request = codec().build_request(&sample_request()).unwrap();
         assert_eq!(
             request.uri().to_string(),
             "https://api.example.com/v1/chat/completions"
@@ -176,30 +124,28 @@ mod tests {
             request.headers().get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+        let body: serde_json::Value = serde_json::from_str(request.body()).unwrap();
+        assert_eq!(body["model"], "gpt-test");
     }
 
-    #[tokio::test]
-    async fn success_maps_to_llm_response() {
-        let openai = client(FakeTransport::new(
+    #[test]
+    fn success_maps_to_llm_response() {
+        let response = decode(
             200,
             r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],
                "usage":{"prompt_tokens":3,"completion_tokens":2}}"#,
-        ));
-        let response = Llm::complete(&openai, &sample_request()).await.unwrap();
-        let agnes_core::llm::StopReason::Completed { content } = &response.stop_reason else {
+        )
+        .unwrap();
+        let StopReason::Completed { content } = &response.stop_reason else {
             panic!("expected Completed");
         };
         assert_eq!(content.as_str(), "hello");
         assert_eq!(response.usage.input, 3);
     }
 
-    #[tokio::test]
-    async fn api_error_surfaces_status_and_detail() {
-        let openai = client(FakeTransport::new(
-            401,
-            r#"{"error":{"message":"invalid api key"}}"#,
-        ));
-        let err = Llm::complete(&openai, &sample_request()).await.unwrap_err();
+    #[test]
+    fn api_error_surfaces_status_and_detail() {
+        let err = decode(401, r#"{"error":{"message":"invalid api key"}}"#).unwrap_err();
         let LlmError::Api { status, body } = &err else {
             panic!("expected Api error");
         };
@@ -209,63 +155,18 @@ mod tests {
         assert!(err.to_string().contains("invalid api key"));
     }
 
-    #[tokio::test]
-    async fn garbage_json_is_malformed() {
-        let openai = client(FakeTransport::new(200, "not json at all"));
+    #[test]
+    fn garbage_json_is_malformed() {
         assert!(matches!(
-            Llm::complete(&openai, &sample_request()).await.unwrap_err(),
+            decode(200, "not json at all").unwrap_err(),
             LlmError::Decode(_)
         ));
     }
 
-    /// Drives the full state machine through the OpenAI client with a
-    /// scripted transport that returns a tool call, then a final answer.
-    #[tokio::test]
-    async fn scripted_two_turn_conversation() {
-        struct Queued {
-            turns: Mutex<std::vec::IntoIter<(u16, String)>>,
-        }
-        #[async_trait]
-        impl HttpTransport for Queued {
-            async fn send(
-                &self,
-                _request: http::Request<String>,
-            ) -> Result<http::Response<String>, TransportError> {
-                let (status, body) = self
-                    .turns
-                    .lock()
-                    .unwrap()
-                    .next()
-                    .expect("scripted transport ran dry");
-                Ok(response(http::StatusCode::from_u16(status).unwrap(), &body))
-            }
-        }
-
-        let turns: Vec<(u16, String)> = vec![
-            (
-                200,
-                r#"{"choices":[{"message":{"content":null,"tool_calls":[
-                    {"id":"call_1","type":"function",
-                     "function":{"name":"flag","arguments":"{}"}}
-                ]},"finish_reason":"tool_calls"}]}"#
-                    .to_owned(),
-            ),
-            (
-                200,
-                r#"{"choices":[{"message":{"content":"flipped it"},"finish_reason":"stop"}],
-                   "usage":{"prompt_tokens":9,"completion_tokens":4}}"#
-                    .to_owned(),
-            ),
-        ];
-
-        let openai = OpenAiClient::new(
-            Queued {
-                turns: Mutex::new(turns.into_iter()),
-            },
-            BaseUrl::from_str("https://api.example.com/v1").unwrap(),
-            ApiKey::try_from("sk-test").unwrap(),
-        );
-
+    /// Drives the full state machine through the codec with scripted
+    /// responses that return a tool call, then a final answer.
+    #[test]
+    fn scripted_two_turn_conversation() {
         let turn = agnes_core::turn::Turn::new(
             agnes_core::header::Header::new(
                 SystemPrompt::new("sys"),
@@ -281,8 +182,19 @@ mod tests {
             model: model.clone(),
             prompt: agent.prompt(),
         };
+        codec()
+            .build_request(&request)
+            .expect("the tool-round request encodes");
+
         let agent = agent.call();
-        let response = Llm::complete(&openai, &request).await.unwrap();
+        let response = decode(
+            200,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"call_1","type":"function",
+                 "function":{"name":"flag","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
         let agnes_core::agent::Replied::Tools(agent) = agent.respond(response) else {
             panic!("expected Tools");
         };
@@ -302,8 +214,17 @@ mod tests {
             model: model.clone(),
             prompt: agent.prompt(),
         };
+        codec()
+            .build_request(&request)
+            .expect("the final request encodes");
+
         let agent = agent.call();
-        let response = Llm::complete(&openai, &request).await.unwrap();
+        let response = decode(
+            200,
+            r#"{"choices":[{"message":{"content":"flipped it"},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":9,"completion_tokens":4}}"#,
+        )
+        .unwrap();
         let agnes_core::agent::Replied::Closed(agent) = agent.respond(response) else {
             panic!("expected Closed");
         };

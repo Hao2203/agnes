@@ -11,15 +11,16 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
-  `turn_end`）由驱动按序铸造并记入 `Log`；core 只持有领域状态（`Turn`），
-  消息、系统提示与工具环境都可从日志复原，一次请求也能从日志单独推导
-- 宿主扩展内核：插件只处理事件、返回指令，系统在检查点执行；拒绝单调
-  （插件无法把拒绝变回放行），注入进队列，可在运行期增删工具与中止，
-  注册可回收，装载期校验配置
+  `turn_end`）由系统管线按序铸造并记入 `Log`；core 只持有领域状态
+  （`Turn`），消息、系统提示与工具环境都可从日志复原，一次请求也能从
+  日志单独推导
+- 插件即装配单元：HTTP 传输、模型 provider、会话持久化、工具、权限与
+  审批都是 ecs `Plugin`，注册顺序即每 tick 的系统执行顺序；拒绝单调
+  （规则无法把拒绝变回放行），运行中输入排队，在 step 边界生效
 - 工具调用可走审批流：`allowed-once | rejected | cancelled | unavailable`，
   没接审批口即拒绝（fail-closed）
 - 会话日志可落盘：JSONL、单写者、崩溃后补写收尾（绝不重写已有记录）；
-  审批决定、插件中止与失败原因作为宿主审计记录与事件共享同一顺序
+  审批决定与失败原因作为宿主审计记录，与事件共享同一顺序
 - 端口与适配器分离：`core` 无 I/O、无异步，替换运行时只需更换适配器
 - 边界处一次性解析：模型名、URL、API key、工具名等都是强类型
 - 秘密保护：API key 由 `secrecy` 承载，调试输出不泄露明文
@@ -137,41 +138,40 @@ agnes chat --session ./notes/session.jsonl
 ## 架构
 
 工作区位于 `agnes-rs/`，按依赖方向分层：`core` 是纯计算，`io` 定义
-端口，其余 crate 是适配器与宿主。
-
-依赖方向（箭头指向被依赖的 crate）：
-
-```text
-util ← core ← io ← agent ← cli
-                      ↖ session-file
-
-service（独立，无 agnes 依赖，暂未被其他 crate 依赖）
-```
-
-`agnes-service` 是后续服务装配的基础：服务键是 `TypeId`，插件用
-`type Deps = Arc<…>` 自动推导依赖；缺依赖时停在 `Pending` 并写 `log`
-日志。提供者卸载后依赖者回到 `Pending`，重新提供时复用同一实例再次
-`apply`。生命周期是异步的（`mount`/`unmount`/`shutdown`、
-`Plugin::apply`/`shutdown`、`waterfall`），但 crate 不绑定运行时。服务
-查询/提供、事件、子挂载分别是 `Services`/`Events`/`Mounts` root service，
-`Ctx` 只提供 `effect`；effect 是每个 fiber 的 LIFO guard 容器，正常卸载时
-`close().await`，取消或宿主 Drop 时靠 guard 的 `Drop` 兜底。
-
-`agnes-transport-reqwest` 与 `agnes-llm-openai` 是挂在 `io` 之上的适配器；
-`agnes-session-file` 挂在 `agnes-agent` 之上，因为持久化事件词汇归宿主。
-只有 `agnes-cli` 负责把具体实现组装成可运行的程序。
+端口，`ecs` 提供系统编排，其余 crate 是适配器、插件与宿主。
 
 | crate | 职责 |
 | --- | --- |
-| `agnes-service` | 独立服务编排：`TypeId` 服务表、类型级依赖（`type Deps`）、异步生命周期、异步 LIFO effect guard、独立 `Services`/`Events`/`Mounts` root service、同步 `emit`/`bail` + 异步 `waterfall`、`log` 日志；暂未被其他 crate 依赖 |
 | `agnes-util` | 零依赖基础类型：`NonEmpty<T>`、`EmptyError` |
 | `agnes-core` | 纯领域模型与类型状态机（`Agent` + `Turn`），无 I/O、无异步、不含序列化、不产出事件 |
-| `agnes-io` | 异步端口 trait：`Llm`、`Tool`、`HttpTransport`、`Input` |
-| `agnes-llm-openai` | OpenAI Chat Completions 协议适配，泛型于传输层 |
+| `agnes-ecs` | 独立的轻量系统编排运行时：资源、实体、消息总线、事件循环（`App` + `Plugin`），不含具体异步运行时 |
+| `agnes-record` | 记录词汇与会话状态：`Event` / `HostEvent` / `RunEvent`、`Log`、`Durability`，以及 `SessionLog` / `SessionStore` 端口（零 ecs 依赖） |
+| `agnes-io` | 异步端口 trait（`Tool`、`HttpTransport`）与模型调用词汇（`LlmCall` / `LlmReply` / `LlmCancel` / `LlmProvider`） |
+| `agnes-llm-openai` | OpenAI Chat Completions 纯编解码器（`OpenAiCodec`：请求编码、响应解码，无 I/O） |
 | `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器 |
-| `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写；依赖 `agnes-agent` 的记录词汇，线格式（wire）定义在此 |
-| `agnes-agent` | 宿主装配（`Host`）、驱动状态机、持久化事件词汇 `record`、`SessionLog` 端口、会话日志 `Log`、扩展内核与内置工具 |
-| `agnes-cli` | 二进制 `agnes`：参数解析、REPL、审批与独立写线程的终端渲染 |
+| `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写；线格式（wire）定义在此 |
+| `agnes-plugin-async` | 异步任务执行：`TokioPlugin` / `ExecutorPlugin` 两个插件各自装 `AsyncExecutor`，任务直接交给具体运行时 |
+| `agnes-plugin-http` | ECS 原生 HTTP 能力：`HttpRequest` / `HttpResponse` / `HttpCancel` 消息、发号器 `HttpClient`、在飞表与取消、关停时统一取消 |
+| `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成 `HttpRequest`，`HttpResponse` 解码回 `LlmReply`；装 `LlmProvider` 标记 |
+| `agnes-plugin-session` | 会话状态与策略：`Log`、`Durability`、序号、`RunEvent` 转发、flush 确认、轮转；不碰文件 |
+| `agnes-plugin-session-file` | 会话持久化：把打开的 `SessionFile` 装成 `SessionStoreResource`，拥有文件句柄、兄弟文件名与重开 |
+| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate；工具注册、权限规则与审批通道 |
+| `agnes-cli` | 二进制 `agnes`：装配 `App`、stdin/审批/Ctrl-C 宿主任务、独立写线程的终端渲染 |
+
+`agnes-transport-reqwest`、`agnes-llm-openai` 与 `agnes-session-file` 是纯
+适配器；`plugin-async` / `plugin-http` / `plugin-openai` / `plugin-session` /
+`plugin-session-file` 把能力装进 ecs 世界，`record` 持有词汇、`agent`
+持有管线，互不知晓对方。只有 `agnes-cli` 负责把具体插件组装成可运行的
+程序；插件注册顺序即行为：`HttpPlugin` 必须先于 `OpenAiPlugin`（provider
+桥 build 时检查 `HttpClient`），`SessionPlugin` 先于 `AgentPlugin`
+（落盘确认要在同一 tick 内先于耐久门禁与收场报告可见）；`TokioPlugin`
+只需在 `run_async` 之前加入（资源在每 tick 解析）。
+
+模型调用是一条纯消息链：运行时写 `LlmCall` → provider 桥编码成
+`HttpRequest` → HTTP 能力执行并回 `HttpResponse` → 桥解码成 `LlmReply` →
+运行时推进状态机。每跳一条消息即一个 tick；`drain` 会连续推进相邻 tick，
+所以可感延迟趋近于零，而运行时与网络彻底解耦（打断经 `LlmCancel` /
+`HttpCancel` 取消请求，取消总会闭环成一条 `LlmReply`）。
 
 ### 关键设计
 
@@ -182,50 +182,56 @@ service（独立，无 agnes 依赖，暂未被其他 crate 依赖）
   `Turn`），也可以不带 goal 直接基于已有历史启动；只有待调用阶段可以
   注入消息，`call` 才冻结请求、开启 step 并进入等响应阶段。`Agent` 持有
   一个 `Turn`（系统提示与工具环境、会话消息、用量、step 记账）；core
-  不持有日志、不产出事件，驱动读取 `Turn` 并自行铸造、记录事件。
-- **宿主扩展内核**：`Plugin` 只有一个处理入口 `on_event`；它看不到派发/
-  执行/审批阶段，只返回 `Command`（拒绝 / 审批 / 替换结果 / 注入 / 中止 /
-  增删工具）。`Extensions` 把指令收进 outbox，驱动在明确检查点取用：门禁
-  前取拒绝与审批、结果入账前取替换、每次模型调用前取工具变更并记录
-  新 header、注入队列在待调用阶段立即并入会话。指令里没有 `Allow`，拒绝单调；
-  长期注册拿 `Registration`，临时注册用 `Scope`（离开作用域逆序撤销）。
-  失败 run 里已产生的工具变更对下一 turn 生效；无法执行的定向指令与注入
-  丢弃。
-- **装载期校验**：`Bundle::install` 在装配时检查规则能否命中已注册工具、
-  配了 ask 是否真的接了审批口；配置错误在启动时失败，而不是第一次调用。
-  规则可以指向运行期才注入的工具（`PolicyBundle::allow_unresolved`），
-  默认仍拒绝永不命中的规则。
-- **端口与适配器**：`Llm`、`Tool`、`HttpTransport`、`Input` 是 `io` 的
-  `async_trait` 端口；`SessionLog` 随记录词汇归 `agnes-agent`。
-  `OpenAiClient<T: HttpTransport>` 不绑定具体传输。
+  不持有日志、不产出事件，`agnes-agent` 的系统管线读取 `Turn` 并铸造、
+  记录事件。
+- **插件与权限**：每个能力是一个 ecs `Plugin`，注册顺序即每 tick 的系统
+  执行顺序；插件之间只通过资源（`HttpClient`、`HttpTransportResource`、
+  `SessionStoreResource`、`AsyncExecutor`、`ToolRegistry`、
+  `PermissionRules`、`ApprovalChannel`、`Durability`、`LlmProvider`）与
+  消息协作。权限规则 deny > ask > 不表态，拒绝单调（规则无法把拒绝变回
+  放行，批准后还会做第二次门禁）；ask 命中而没接审批口时按 fail-closed
+  拒绝，`--yes` 自动批准但审计照记。
+- **启动即校验**：`ask` 规则命中却无从应答（管道输入、无 TTY 又没给
+  `--yes`）时启动即报错，而不是挂起等待；配置错误不等到第一次调用。
+- **端口与适配器**：`Tool`、`HttpTransport` 是 `io` 的 `async_trait`
+  端口；`SessionLog` / `SessionStore` 随记录词汇归 `agnes-record`。
+  `OpenAiCodec` 是纯编解码，不绑定任何传输。
 - **非法状态不可表示**：`StopReason::ToolUse` 携带非空的
   `NonEmpty<ToolCall>`，`Content` 保证非空，`ApiKey` 由 `secrecy`
   承载，`ApprovalOutcome` 只有 `AllowedOnce` 会放行。
 - **工具失败即输出**：工具错误以 `ToolOutput` 形式回传给模型（拒绝、
   挡回、超时同样如此）；只有模型或传输错误会中止运行。
-- **日志即账本**：`Log` 类型位于宿主侧（`agnes-agent`），由驱动持有，是唯一
+- **日志即账本**：`Log` 类型位于 `agnes-record`，由系统管线持有，是唯一
   的持久化状态；core 只持有领域状态 `Turn`，不产出事件。系统提示与工具
-  环境是 `Turn` 的 header 字段；驱动在每个 turn 开局记录一条
+  环境是 `Turn` 的 header 字段；系统管线在每个 turn 开局记录一条
   `record::Event::Header`，工具环境运行中变化时再记一条。消息也是事件
-  （`record::Event::Message`），用户输入与插件注入都是带角色的消息事件。
+  （`record::Event::Message`），用户输入与注入都是带角色的消息事件。
   `Turn::prompt()` 把 header、消息与工具表投影成模型输入，因此一次请求
-  完全可以从日志复原；`RunSummary.log` 可直接传回下一次运行。
-  工具集变化（含插件运行期注入/移除）在下一个模型调用前记一条新 header，
+  完全可以从日志复原；带 `--session` 时，恢复出的事件直接重建 `Log`，
+  下一轮从日志继续。
+  工具集变化在下一个模型调用前记一条新 header，
   同一 turn 内生效；在飞调用不受影响。
-- **日志耐久**：每个上报事件先追加到会话文件、再上报宿主；每个模型请求
-  前与收场时 `flush`（fsync）。格式 v6：首行版本标记，之后是 `record`
-  事件行与 `host` 审计行（审批问询/决定、插件中止、失败原因），共享一个
+- **日志耐久**：每个上报事件先入内存日志、再作为 `RunEvent` 镜像发出；
+  `agnes-plugin-session` 把会话相关的事件按序转发给常驻 writer 任务（经
+  `SessionStore` 端口；`agnes-plugin-session-file` 提供文件实现，无 store
+  时为内存模式、序号随日志同步前移）
+  （每批 append 后 `flush` + fsync，经 `SessionFlushed` 消息回执），并
+  维护 `Durability { sent_seq, flushed_seq }`。**耐久门禁**是提交边界：
+  `flushed_seq >= sent_seq` 之前不发出模型请求 —— 请求离开前，已记录的
+  日志必然已经落盘。格式 v6：首行版本标记，之后是 `record`
+  事件行与 `host` 审计行（审批问询/决定、失败原因），共享一个
   连续 `seq`；恢复时校验连续性并**补写**未收尾的 step/turn（与
   `Agent::interrupted` 同形），从不重写已有记录；旧格式（含 v5）与重名
   工具环境拒载。`seq` 只在实际写成功后提交，写失败会 poison 会话句柄，
-  避免半行之后继续追加。v6 里 `MessageEnd` 只记无载荷的 `StopKind`，
+  避免半行之后继续追加；会话写失败是 fail-closed 的 —— 活跃 turn 以
+  失败收场，不再发起新调用。v6 里 `MessageEnd` 只记无载荷的 `StopKind`，
   `StepOutcome`/`Outcome` 不再复制答复文本。
-- **审计与可追溯**：`MessageEnd` 记录产生该消息的模型（驱动用自己构造的
-  `LlmRequest.model` 记录），切换模型后日志仍能归因；审批落定、插件中止
-  与 run 失败原因不扩 core 词汇，作为 `HostEvent` 与事件一起落盘。
-- **转换者由宿主决定**：`core` 不组装提示词；驱动器在每次模型调用前用
+- **审计与可追溯**：`MessageEnd` 记录产生该消息的模型（从系统自己构造的
+  `LlmRequest.model` 回带），切换模型后日志仍能归因；审批落定、会话失败
+  原因不扩 core 词汇，作为 `HostEvent` 与事件一起落盘。
+- **转换者由宿主决定**：core 不组装提示词；系统管线在每次模型调用前用
   宿主侧的 `RequestBuilder`（`agnes-agent`）把 `Turn` 转成 `LlmRequest`。
-- **格式由上层定义**：core 与 agent 的领域词汇（`Turn`、`record::Event`、
+- **格式由上层定义**：core 与 record 的领域词汇（`Turn`、`Event`、
   `HostEvent`）不实现序列化 —— 会话的 JSONL 形状由 `agnes-session-file` 的
   `wire` 层定义（同 `agnes-llm-openai` 的 `wire.rs`），校验与拒载规则跟着
   格式走，领域词汇保持格式无关。

@@ -4,6 +4,7 @@
 //! another stack tomorrow.
 
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -18,6 +19,11 @@ pub enum TransportError {
     /// The request exceeded its configured deadline.
     #[error("request timed out")]
     Timeout,
+    /// The request was cancelled before it completed (host shutdown or an
+    /// explicit cancellation). Callers treat it as an interruption, not a
+    /// failure.
+    #[error("request was cancelled")]
+    Cancelled,
     /// The response body was not valid UTF-8. The transport never replaces
     /// invalid sequences silently.
     #[error("response body is not valid UTF-8")]
@@ -41,6 +47,46 @@ pub trait HttpTransport: Send + Sync {
         &self,
         request: http::Request<String>,
     ) -> Result<http::Response<String>, TransportError>;
+}
+
+#[async_trait]
+impl<T: HttpTransport + ?Sized> HttpTransport for Arc<T> {
+    async fn send(
+        &self,
+        request: http::Request<String>,
+    ) -> Result<http::Response<String>, TransportError> {
+        (**self).send(request).await
+    }
+}
+
+#[async_trait]
+impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
+    async fn send(
+        &self,
+        request: http::Request<String>,
+    ) -> Result<http::Response<String>, TransportError> {
+        (**self).send(request).await
+    }
+}
+
+/// The installed HTTP transport as a shareable handle.
+///
+/// Plugins mount one implementation into the world under this type;
+/// provider plugins read it at build time to wire their clients. The type
+/// is plain data — it becomes a resource only where an ECS installs it.
+#[derive(Clone)]
+pub struct HttpTransportResource(Arc<dyn HttpTransport>);
+
+impl HttpTransportResource {
+    /// Wraps a transport implementation.
+    pub fn new(transport: Arc<dyn HttpTransport>) -> Self {
+        Self(transport)
+    }
+
+    /// The installed transport.
+    pub fn transport(&self) -> &Arc<dyn HttpTransport> {
+        &self.0
+    }
 }
 
 /// Wrapper for logging a request without leaking credentials: only

@@ -1,54 +1,31 @@
 //! 审批服务：宿主自有的问询基础设施。
 //!
-//! 插件的门禁只需表达「要审批」
-//! （[`crate::ext::Command::RequireApproval`]）；驱动按
-//! 本服务发问询（每次问询自带一条 oneshot 答覆通道）、挂起等待（可选
-//! 超时）、按答覆落定 —— 审批的 IO 与等待全部在宿主侧，core 与插件都
-//! 不需要知道「等审批」的细节。
-//!
-//! 落定词汇是 fail-closed 的：[`ApprovalOutcome`] 只有 `AllowedOnce`
-//! 放行；通道被关闭、`reply` 被丢弃、超时、运行被打断，都按拒绝落定。
+//! 门禁（运行时系统）只需表达「要审批」；问询按
+//! [`ApprovalChannel`] 递给审批界面。答覆经 `RuntimeSender` 以
+//! `agnes_agent::runtime::ApprovalDecided` 消息回注；落定词汇
+//! ([`agnes_record::ApprovalOutcome`]) 是 fail-closed 的 —— 通道关闭、
+//! 答覆被丢弃、超时、运行被打断，都按拒绝落定。
 
 use agnes_core::message::{ToolArguments, ToolCallId};
 use agnes_core::tool::ToolName;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-/// 审批结果。词汇是 fail-closed 的：只有 [`ApprovalOutcome::AllowedOnce`]
-/// 放行；通道被关闭、`reply` 被丢弃、超时、运行被打断，都按拒绝落定。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalOutcome {
-    /// Explicitly approved once.
-    AllowedOnce,
-    /// Explicitly refused.
-    Rejected,
-    /// The wait was cancelled (the run was interrupted).
-    Cancelled,
-    /// No answerer: not wired, channel closed, reply dropped, or timed out.
-    Unavailable,
-}
-
-impl ApprovalOutcome {
-    /// The one value that allows the call.
-    pub fn allows(self) -> bool {
-        matches!(self, Self::AllowedOnce)
-    }
-}
-
-/// 递给审批界面的一次问询：界面收到后，用 `reply` 送回 true（批准）或
-/// false（拒绝）。`reply` 被丢弃等价于拒绝。
+/// 递给审批界面的一次问询：界面收到后决定批准与否；答覆以 ECS 消息
+/// （`ApprovalDecided`）回注。落定词汇
+/// ([`agnes_record::ApprovalOutcome`]) 是 fail-closed 的 —— 通道关闭、
+/// 答覆被丢弃、超时、运行被打断，都按拒绝落定。
 #[derive(Debug)]
 pub struct ApprovalRequest {
     pub call_id: ToolCallId,
     pub tool_name: ToolName,
     pub arguments: ToolArguments,
-    pub reply: oneshot::Sender<bool>,
 }
 
-/// 问询通道：驱动按它发问询；审批界面持有配对的 [`mpsc::Receiver`]。
+/// 问询通道：门禁按它发问询；审批界面持有配对的 [`mpsc::Receiver`]。
 /// `Clone` 后可全班共享。
 ///
-/// 容量为 1：驱动同一时刻只允许一个 in-flight 问询；队列满或接收端消失
+/// 容量为 1：同一时刻只允许一个 in-flight 问询；队列满或接收端消失
 /// 都按 fail-closed 处理，避免无界缓冲掩盖这一契约。
 #[derive(Debug, Clone)]
 pub struct ApprovalChannel {
@@ -58,13 +35,13 @@ pub struct ApprovalChannel {
 }
 
 impl ApprovalChannel {
-    /// 建一对（驱动发送端，界面接收端）；`timeout` 作用于每次问询。
+    /// 建一对（发送端，界面接收端）；`timeout` 作用于每次问询。
     pub fn channel(timeout: Option<Duration>) -> (Self, mpsc::Receiver<ApprovalRequest>) {
         let (tx, rx) = mpsc::channel(1);
         (Self { tx, timeout }, rx)
     }
 
-    /// 递送一次问询；接口端已消失或已有在飞问询则失败（驱动按
+    /// 递送一次问询；接口端已消失或已有在飞问询则失败（门禁按
     /// fail-closed 落定）。
     ///
     /// # Errors
@@ -80,5 +57,41 @@ impl ApprovalChannel {
     /// 一次问询的等待上限。
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agnes_core::message::ToolArguments;
+    use agnes_core::tool::ToolName;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn a_question_travels_to_the_answerer() {
+        let (channel, mut questions) = ApprovalChannel::channel(Some(Duration::from_secs(3)));
+        let request = ApprovalRequest {
+            call_id: ToolCallId::new("c1"),
+            tool_name: ToolName::from_str("run_shell").unwrap(),
+            arguments: ToolArguments::new("{}"),
+        };
+        channel.send(request).expect("the question fits the queue");
+
+        let question = questions.recv().await.expect("question received");
+        assert_eq!(question.call_id.as_str(), "c1");
+        assert_eq!(channel.timeout(), Some(Duration::from_secs(3)));
+    }
+
+    #[tokio::test]
+    async fn a_second_in_flight_question_is_refused() {
+        let (channel, mut questions) = ApprovalChannel::channel(None);
+        let make = || ApprovalRequest {
+            call_id: ToolCallId::new("c1"),
+            tool_name: ToolName::from_str("run_shell").unwrap(),
+            arguments: ToolArguments::new("{}"),
+        };
+        channel.send(make()).expect("first question fits");
+        assert!(channel.send(make()).is_err(), "capacity is one");
+        questions.close();
     }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "agnes-plugin-async"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async task execution as ECS plugins: TokioPlugin / ExecutorPlugin install the AsyncExecutor resource."
+
+[dependencies]
+agnes-ecs.workspace = true
+thiserror.workspace = true
+async-executor = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+async-executor = ["dep:async-executor"]
+
+[dev-dependencies]
+async-executor.workspace = true
+futures-lite.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

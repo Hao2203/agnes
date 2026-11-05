@@ -1,11 +1,11 @@
-//! Async I/O seam to a chat-completion model.
+//! Model-call vocabulary: ids, bus messages, provider marker, and the
+//! provider-facing error type.
 
 use std::fmt;
 
 use crate::http::TransportError;
 use agnes_core::config::ConfigError;
 use agnes_core::llm::{LlmRequest, LlmResponse};
-use async_trait::async_trait;
 
 /// An API error body: the raw response is kept as data, while `Display`
 /// uses the bounded human-readable detail.
@@ -76,9 +76,53 @@ pub enum LlmError {
     Protocol(#[from] ProtocolError),
 }
 
-/// Async I/O seam to a chat-completion model. Implementations do the async
-/// I/O; the state machine and driver stay runtime-agnostic.
-#[async_trait]
-pub trait Llm: Send + Sync {
-    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
+/// The identity of one model call, chosen by the caller.
+///
+/// The reply carries the same id back; ids only need to be unique among the
+/// calls in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LlmCallId(u64);
+
+impl LlmCallId {
+    /// Wraps a raw number.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The raw number.
+    pub fn value(&self) -> u64 {
+        self.0
+    }
 }
+
+/// One model call submitted through the ECS message bus.
+///
+/// The runtime writes it; a provider plugin encodes it for its API, performs
+/// the round trip (today through `agnes-plugin-http`), and answers with
+/// [`LlmReply`].
+#[derive(Debug)]
+pub struct LlmCall {
+    pub id: LlmCallId,
+    pub request: LlmRequest,
+}
+
+/// The outcome of one model call.
+#[derive(Debug)]
+pub struct LlmReply {
+    pub id: LlmCallId,
+    pub result: Result<LlmResponse, LlmError>,
+}
+
+/// Cancels an in-flight model call (best effort). A cancellation always ends
+/// in an [`LlmReply`] carrying [`TransportError::Cancelled`], so the runtime
+/// never waits forever.
+#[derive(Clone, Copy, Debug)]
+pub struct LlmCancel {
+    pub id: LlmCallId,
+}
+
+/// Marks that a provider plugin is installed.
+///
+/// The runtime refuses to issue model calls without it, so a missing provider
+/// fails loudly instead of letting calls disappear into the message bus.
+pub struct LlmProvider;

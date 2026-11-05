@@ -1,12 +1,9 @@
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use crate::plugin::Plugin;
 use crate::resource::Resource;
-use crate::runner::{
-    AsyncExecutor, CancelToken, Runner, RunnerError, RuntimeEvent, RuntimeSender, TaskSpawner,
-};
+use crate::runner::{CancelToken, Runner, RunnerError, RuntimeEvent, RuntimeSender};
 use crate::schedule::{Schedule, ScheduleError};
 use crate::system::{IntoSystem, SystemError};
 use crate::world::World;
@@ -38,16 +35,17 @@ pub struct App {
 }
 
 impl App {
-    /// Creates an app with an empty world and an installed async executor.
+    /// Creates an app with an empty world.
+    ///
+    /// Async task execution is not installed here: add
+    /// `agnes_plugin_async::TokioPlugin` to give systems an
+    /// `AsyncExecutor` resource.
     pub fn new() -> Self {
         let (tx, rx) = async_channel::unbounded();
         let shutdown = CancelToken::new();
         let sender = RuntimeSender::new(tx);
-        let executor = AsyncExecutor::new(sender.clone(), shutdown.clone());
-        let mut world = World::new();
-        let _ = world.insert_resource(executor);
         Self {
-            world,
+            world: World::new(),
             schedules: HashMap::new(),
             events: Some(rx),
             sender,
@@ -212,28 +210,6 @@ impl App {
     /// A handle for shutting the runner down.
     pub fn shutdown_handle(&self) -> CancelToken {
         self.shutdown.clone()
-    }
-
-    /// Installs the [`TaskSpawner`] used by [`AsyncExecutor::spawn`].
-    ///
-    /// Without a spawner, submitting async work fails with
-    /// [`SpawnError::NoSpawner`](crate::SpawnError::NoSpawner). Ready-made
-    /// implementations live in [`adapters`](crate::adapters) behind the
-    /// `tokio` and `async-executor` features.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `AsyncExecutor` resource is missing, which cannot happen
-    /// for an app created with [`App::new`].
-    pub fn set_spawner<S: TaskSpawner>(&mut self, spawner: S) -> &mut Self {
-        {
-            let mut executor = self
-                .world
-                .resource_mut::<AsyncExecutor>()
-                .expect("App installs an AsyncExecutor resource");
-            executor.set_spawner(Arc::new(spawner));
-        }
-        self
     }
 
     /// Runs the app on the caller's async runtime.

@@ -1,0 +1,22 @@
+[package]
+name = "agnes-plugin-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ECS-native HTTP capability: request/response messages over an installed transport."
+
+[dependencies]
+agnes-ecs.workspace = true
+agnes-io.workspace = true
+agnes-plugin-async = { workspace = true, features = ["tokio"] }
+http.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+futures-lite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -105,99 +103,6 @@ impl CancelToken {
             return;
         }
         listener.await;
-    }
-}
-
-/// Spawns fire-and-forget tasks on the host's executor.
-///
-/// This is the only extension point required to run the crate under an async
-/// runtime. [`adapters`](crate::adapters) provides implementations for Tokio
-/// and `async-executor` behind their features; anything else can implement
-/// this trait directly.
-pub trait TaskSpawner: Send + Sync + 'static {
-    /// Spawns a task and returns immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpawnError`] when the executor cannot accept the task.
-    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send>>) -> Result<(), SpawnError>;
-}
-
-/// A task could not be spawned.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum SpawnError {
-    /// No [`TaskSpawner`] was installed with
-    /// [`App::set_spawner`](crate::App::set_spawner).
-    #[error("no task spawner is installed")]
-    NoSpawner,
-    /// The installed spawner found no active async runtime.
-    #[error("no async runtime is active on the current thread")]
-    NoRuntime,
-    /// The installed spawner rejected the task.
-    #[error("task spawner rejected the task")]
-    Spawner(#[source] Box<dyn std::error::Error + Send + Sync>),
-}
-
-/// A task spawner and message bridge between the ECS and async tasks.
-#[derive(Clone)]
-pub struct AsyncExecutor {
-    sender: RuntimeSender,
-    cancellation: CancelToken,
-    spawner: Option<Arc<dyn TaskSpawner>>,
-}
-
-impl AsyncExecutor {
-    pub(crate) fn new(sender: RuntimeSender, cancellation: CancelToken) -> Self {
-        Self {
-            sender,
-            cancellation,
-            spawner: None,
-        }
-    }
-
-    pub(crate) fn set_spawner(&mut self, spawner: Arc<dyn TaskSpawner>) {
-        self.spawner = Some(spawner);
-    }
-
-    /// The runtime sender used by submitted tasks.
-    pub fn sender(&self) -> RuntimeSender {
-        self.sender.clone()
-    }
-
-    /// Sends a message back into the ECS.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeSendError::Closed`] when the runner is gone.
-    pub fn send<M: Message>(&self, message: M) -> Result<(), RuntimeSendError> {
-        self.sender.send_message(message)
-    }
-
-    /// Submits a fire-and-forget task to the installed [`TaskSpawner`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpawnError::NoSpawner`] when no spawner was installed, and
-    /// whatever the spawner itself reports otherwise.
-    pub fn spawn<F>(&self, future: F) -> Result<(), SpawnError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let Some(spawner) = self.spawner.as_ref() else {
-            return Err(SpawnError::NoSpawner);
-        };
-        spawner.spawn(Box::pin(future))
-    }
-
-    /// The application-wide cancellation token.
-    pub fn cancellation(&self) -> CancelToken {
-        self.cancellation.clone()
-    }
-
-    /// Whether the application is shutting down.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
     }
 }
 

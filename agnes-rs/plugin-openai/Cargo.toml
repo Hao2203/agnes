@@ -1,0 +1,23 @@
+[package]
+name = "agnes-plugin-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OpenAI-compatible provider as an ECS message bridge: LlmCall → HttpRequest → HttpResponse → LlmReply."
+
+[dependencies]
+agnes-core.workspace = true
+agnes-ecs.workspace = true
+agnes-io.workspace = true
+agnes-llm-openai.workspace = true
+agnes-plugin-http.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+agnes-plugin-async = { workspace = true, features = ["tokio"] }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

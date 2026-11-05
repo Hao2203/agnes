@@ -1,281 +1,293 @@
-//! 装配与实际运行：一次 `run` 或交互式 `chat`。
+//! 装配与运行：把各组件的 Plugin 装进一个 ECS App，宿主任务（stdin、
+//! Ctrl-C、审批）只经 `RuntimeSender` 注入消息。
+//!
+//! 每个组件 crate 导出一个 Plugin；本 crate 是唯一知道具体实现的装配点
+//! —— 换 HTTP 栈、换 provider、换持久化 = 换一行 `add_plugin`。
 
-use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-
+use agnes_agent::StandardRequestBuilder;
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
-use agnes_agent::permission::{PermissionRules, PolicyBundle, Rule};
-use agnes_agent::tools::FsBundle;
-use agnes_agent::{Host, Log, RunRequest, RunSummary};
-use agnes_core::config::{ApiKey, ModelName, StepBudget, SystemPrompt};
+use agnes_agent::permission::{PermissionRules, Rule};
+use agnes_agent::runtime::{
+    AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnFinished, TurnRequested, UserMessage,
+};
+use agnes_agent::tools::builtin_tools;
+use agnes_core::config::{ApiKey, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::header::{Environment, Header};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::AgentConfig;
-use agnes_io::input::Input;
+use agnes_ecs::{
+    App, CancelToken, MessageReader, MessageWriter, Query, Res, RuntimeSender, Update,
+};
 use agnes_io::tool::ToolRegistry;
-use agnes_llm_openai::OpenAiClient;
+use agnes_plugin_async::TokioPlugin;
+use agnes_plugin_http::HttpPlugin;
+use agnes_plugin_openai::OpenAiPlugin;
+use agnes_plugin_session::SessionPlugin;
+use agnes_plugin_session_file::SessionFilePlugin;
+use agnes_session_file::{Opened, SessionFile};
 use agnes_transport_reqwest::ReqwestTransport;
+use anyhow::{Context, Result, bail};
+use tokio::task::JoinHandle;
 
 use crate::cli::{Cli, Command};
-use crate::input::{self, Line, UserInput};
-use crate::render::{EventPrinter, Renderer, handle_pending, print_summary};
-use crate::session::{ChatSession, LoadedSession};
+use crate::input::{self, TaskLine, UserInput};
+use crate::render::{Renderer, RendererPlugin};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const SYSTEM_PROMPT: &str = "You are agnes, a terminal coding assistant. Use the provided tools \
      to inspect and modify files in the working directory. Be concise.";
 
-struct Wiring {
-    llm: OpenAiClient<ReqwestTransport>,
-    input: Arc<UserInput>,
+/// 宿主任务共用的运行时句柄。
+pub struct HostChannels {
+    pub sender: RuntimeSender,
+    pub shutdown: CancelToken,
+}
+
+/// 宿主侧的固定配置：step 预算与系统提示。
+struct HostConfig {
+    budget: StepBudget,
+    system_prompt: SystemPrompt,
+}
+
+/// 把用户输入路由进管线：没有活跃 turn 时开新 turn，否则交给注入管线。
+fn dispatch_lines(
+    mut lines: MessageReader<TaskLine>,
+    turns: Query<agnes_ecs::Entity>,
+    registry: Res<ToolRegistry>,
+    config: Res<HostConfig>,
+    mut turn_requests: MessageWriter<TurnRequested>,
+    mut injections: MessageWriter<UserMessage>,
+) {
+    for line in lines.read() {
+        if turns.is_empty() {
+            turn_requests.write(TurnRequested {
+                config: AgentConfig {
+                    header: session_header(&config.system_prompt, &registry),
+                    goal: Some(line.content.clone()),
+                    budget: config.budget,
+                },
+            });
+        } else {
+            injections.write(UserMessage {
+                content: line.content.clone(),
+            });
+        }
+    }
+}
+
+/// turn 在飞时维护输入侧的 running 旗标，Ctrl-C 与 stdin 路由都看它。
+fn track_running(
+    mut requests: MessageReader<TurnRequested>,
+    mut finished: MessageReader<TurnFinished>,
+    input: Res<Arc<UserInput>>,
+) {
+    if !requests.read().is_empty() {
+        input.set_running(true);
+    }
+    if !finished.read().is_empty() {
+        input.set_running(false);
+    }
+}
+
+/// 会话侧装配：状态插件（带系统）+ 可选的持久化插件（不带系统）。
+struct SessionAssembly {
+    state: SessionPlugin,
+    file: Option<SessionFilePlugin>,
+}
+
+impl SessionAssembly {
+    fn new(state: SessionPlugin, file: Option<SessionFilePlugin>) -> Self {
+        Self { state, file }
+    }
+
+    /// 是否有持久化后端（决定 `/new` 的反馈文案）。
+    fn has_store(&self) -> bool {
+        self.file.is_some()
+    }
+}
+
+/// 把各组件的 Plugin 装配成一个 App。
+///
+/// 注册顺序即每 tick 的系统执行顺序；会话系统必须在渲染/agent 系统之前，
+/// 让落盘确认在同一 tick 内先于耐久门禁与收场报告更新。
+fn build_app(
+    cli: &Cli,
     renderer: Renderer,
+    input: Arc<UserInput>,
     rules: PermissionRules,
-    root: PathBuf,
-    model: ModelName,
-    max_steps: StepBudget,
-    allow_shell: bool,
-    yes: bool,
-    session_path: Option<PathBuf>,
+    approvals: Option<ApprovalChannel>,
+    session: SessionAssembly,
+    single_shot: bool,
+) -> Result<App> {
+    let transport = Arc::new(ReqwestTransport::new(REQUEST_TIMEOUT)?);
+    let root = std::env::current_dir().context("cannot determine the working directory")?;
+
+    let mut app = App::new();
+    app.add_plugin(HttpPlugin::new(transport))
+        .add_plugin(OpenAiPlugin::new(
+            cli.base_url.clone(),
+            resolve_api_key(cli.api_key.clone())?,
+        ))
+        .add_plugin(ToolsPlugin::empty().with_tools(builtin_tools(root, cli.allow_shell)))
+        .insert_resource(rules)
+        .insert_resource(HostConfig {
+            budget: cli.max_steps,
+            system_prompt: SystemPrompt::new(SYSTEM_PROMPT),
+        })
+        .insert_resource(RequestBuilderResource::new(Box::new(
+            StandardRequestBuilder::new(cli.model.clone()),
+        )))
+        .insert_resource(Arc::clone(&input))
+        .add_systems(Update, dispatch_lines)
+        .add_systems(Update, track_running);
+    if let Some(approvals) = approvals {
+        app.insert_resource(approvals);
+    }
+    // 会话注册：状态插件带系统，必须排在渲染/agent 之前，让 session_ack
+    // 的落盘确认在同一 tick 内先于耐久门禁与收场报告生效。文件插件不带
+    // 系统，顺序无关。
+    let has_session = session.has_store();
+    if let Some(file) = session.file {
+        app.add_plugin(file);
+    }
+    app.add_plugin(session.state);
+    let sender = app.runtime_sender();
+    app.add_plugin(RendererPlugin::new(
+        cli.model.clone(),
+        renderer,
+        sender,
+        single_shot,
+        has_session,
+    ));
+    app.add_plugin(AgentPlugin);
+    app.add_plugin(TokioPlugin);
+    Ok(app)
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let api_key = resolve_api_key(cli.api_key)?;
-    let llm = OpenAiClient::new(
-        ReqwestTransport::new(REQUEST_TIMEOUT)?,
-        cli.base_url,
-        api_key,
-    );
-    let root = std::env::current_dir().context("cannot determine the working directory")?;
-    let wiring = Wiring {
-        llm,
-        input: UserInput::new(),
-        renderer: Renderer::new().context("starting the renderer")?,
-        rules: PermissionRules {
-            deny: cli.deny,
-            ask: ask_rules(cli.allow_shell),
-        },
-        root,
-        model: cli.model,
-        max_steps: cli.max_steps,
-        allow_shell: cli.allow_shell,
-        yes: cli.yes,
-        session_path: cli.session,
+    let renderer = Renderer::new().context("starting the renderer")?;
+    let rules = PermissionRules {
+        deny: cli.deny.clone(),
+        ask: ask_rules(cli.allow_shell),
     };
-    match cli.command.unwrap_or(Command::Chat) {
-        Command::Run { task } => run_once(&wiring, task).await,
-        Command::Chat => chat(&wiring).await,
-    }
-}
-
-async fn run_staged(
-    wiring: &Wiring,
-    host: &mut Host<'_>,
-    session: Option<&mut ChatSession>,
-    goal: Content,
-) -> Result<RunSummary> {
-    // 每轮从当前注册表重建 header：插件上一轮动态加入/移除的工具
-    // 从这一轮开始对模型可见。
-    let config = AgentConfig {
-        header: session_header(host.tools()),
-        goal: Some(goal),
-        budget: wiring.max_steps,
-    };
-    let log = session
-        .as_ref()
-        .map_or_else(Log::default, |session| session.log().clone());
-    let mut printer = EventPrinter::new(wiring.model.clone(), wiring.renderer.clone());
-    let mut request = RunRequest::new(config, log, &mut printer);
-    if let Some(session) = session {
-        request = request.with_session(session.file_mut());
-    }
-    wiring.input.begin_run();
-    let result = host.run(request).await;
-    wiring.input.end_run();
-    result.map_err(anyhow::Error::new)
-}
-
-async fn run_once(wiring: &Wiring, task: Option<String>) -> Result<()> {
-    let goal = match task {
-        Some(task) => Content::try_from(task.trim())
-            .context("empty task: pass a task argument (`agnes run \"do X\"`)")?,
-        None => read_goal(&wiring.renderer).await?,
-    };
-
-    let needs_approval = !wiring.rules.ask.is_empty() && !wiring.yes;
-    if needs_approval && !std::io::stdin().is_terminal() {
+    let single_shot = matches!(cli.command, Some(Command::Run { .. }));
+    // ask 规则命中就必须有审批口；--yes 时口还在，只是自动批准（审计
+    // 照记）。真正交互式问答案才需要终端。
+    let wires_ask = !rules.ask.is_empty();
+    if wires_ask && !cli.yes && !std::io::stdin().is_terminal() {
         bail!(
             "`--allow-shell` needs a terminal for approval; pass --yes to auto-approve, \
              or `--deny run_shell`"
         );
     }
-    let stdin_task = needs_approval.then(|| input::spawn_stdin_reader(&wiring.input));
-    let ctrl_c = input::spawn_ctrl_c(&wiring.input);
+    let input = UserInput::new();
 
-    let (approvals, approver) = approvals(wiring);
-    let mut host = build_host(wiring, approvals.as_ref())?;
-
-    let mut session = match &wiring.session_path {
-        Some(path) => {
-            let loaded = ChatSession::open(path.clone()).await?;
-            print_session_loaded(&loaded, &wiring.renderer, false);
-            Some(loaded.session)
-        }
-        None => None,
-    };
-    let result = run_staged(wiring, &mut host, session.as_mut(), goal).await;
-
-    if let Some(task) = stdin_task {
-        task.abort();
-    }
-    ctrl_c.abort();
-    if let Some(task) = approver {
-        task.abort();
+    // 会话打开需要 await：在进 App 之前完成，恢复历史交给状态插件。
+    let mut session_plugin = SessionPlugin::new();
+    let mut session_file = None;
+    if let Some(path) = &cli.session {
+        let Opened {
+            session,
+            events,
+            notes,
+            repairs,
+        } = SessionFile::open_or_create(path.clone())
+            .await
+            .with_context(|| format!("opening session `{}`", path.display()))?;
+        print_session_loaded(path, notes.len(), repairs.len(), false, &renderer);
+        session_plugin = SessionPlugin::resumed(events).context("loading the session")?;
+        session_file = Some(SessionFilePlugin::new(session));
     }
 
-    let flush = match session.as_mut() {
-        Some(session) => session.flush().await,
-        None => Ok(()),
-    };
-    let summary = match result {
-        Ok(summary) => {
-            flush?;
-            summary
+    let (approvals, questions) = match wires_ask {
+        true => {
+            let (channel, questions) = ApprovalChannel::channel(None);
+            (Some(channel), Some(questions))
         }
-        Err(err) => {
-            if let Err(flush) = flush {
-                wiring
-                    .renderer
-                    .line(format!("warning: could not flush the session: {flush:#}"));
-            }
-            return Err(err);
-        }
+        false => (None, None),
     };
 
-    print_summary(&summary, &wiring.renderer);
-    handle_pending(summary.pending_messages, &wiring.renderer, |content| {
-        wiring
-            .renderer
-            .line(format!("note: unused queued message: {content}"));
+    let app = build_app(
+        &cli,
+        renderer.clone(),
+        Arc::clone(&input),
+        rules,
+        approvals,
+        SessionAssembly::new(session_plugin, session_file),
+        single_shot,
+    )?;
+
+    let channels = Arc::new(HostChannels {
+        sender: app.runtime_sender(),
+        shutdown: app.shutdown_handle(),
     });
-    for content in wiring.input.drain() {
-        wiring
-            .renderer
-            .line(format!("note: unused queued message: {content}"));
-    }
-    if let Some(session) = session.as_mut() {
-        session.set_log(summary.log);
-    }
-    Ok(())
-}
+    let ctrl_c = input::spawn_ctrl_c(Arc::clone(&input), Arc::clone(&channels));
+    let approver = questions.map(|questions| {
+        spawn_approver(
+            cli.yes,
+            renderer.clone(),
+            Arc::clone(&input),
+            questions,
+            channels.sender.clone(),
+        )
+    });
 
-async fn chat(wiring: &Wiring) -> Result<()> {
-    wiring.renderer.line(
-        "interactive session — each line is a task with full session memory; \
-         /new resets the context, Ctrl-C interrupts a running task, exit leaves",
-    );
-    let stdin_task = input::spawn_stdin_reader(&wiring.input);
-    let ctrl_c = input::spawn_ctrl_c(&wiring.input);
-
-    let (approvals, approver) = approvals(wiring);
-    let mut host = build_host(wiring, approvals.as_ref())?;
-
-    let mut session = match &wiring.session_path {
-        Some(path) => {
-            let loaded = ChatSession::open(path.clone()).await?;
-            print_session_loaded(&loaded, &wiring.renderer, false);
-            Some(loaded.session)
+    // 逐行阅读任务只在有活干时启动：chat 的会话输入，或交互式审批应答。
+    // 单次运行不需要它 —— 管道 EOF 会被它当成退出信号，误杀进行中的
+    // turn；goal 用参数或 read_goal（独占读）获取。
+    let needs_line_reader = !single_shot || (wires_ask && !cli.yes);
+    let goal = match &cli.command {
+        Some(Command::Run { task }) => Some(match task {
+            Some(task) => Content::try_from(task.trim())
+                .context("empty task: pass a task argument (`agnes run \"do X\"`)")?,
+            None => read_goal(&renderer).await?,
+        }),
+        _ => {
+            renderer.prompt("agnes> ");
+            None
         }
-        None => None,
     };
+    let stdin_task = needs_line_reader
+        .then(|| input::spawn_stdin_reader(Arc::clone(&input), Arc::clone(&channels)));
 
-    loop {
-        wiring.renderer.prompt("agnes> ");
-        match wiring.input.next().await {
-            Line::Exit => break,
-            Line::Reset => {
-                let old_path = session.as_ref().map(|session| session.path().to_path_buf());
-                match session.take() {
-                    Some(old) => match old.rotate().await {
-                        Ok(loaded) => {
-                            print_session_loaded(&loaded, &wiring.renderer, true);
-                            session = Some(loaded.session);
-                        }
-                        Err(err) => {
-                            wiring.renderer.line(format!("error: {err:#}"));
-                            if let Some(path) = old_path {
-                                match ChatSession::open(path).await {
-                                    Ok(loaded) => session = Some(loaded.session),
-                                    Err(reopen) => wiring.renderer.line(format!(
-                                        "error: cannot reopen the session: {reopen:#}"
-                                    )),
-                                }
-                            }
-                        }
-                    },
-                    None => wiring.renderer.line("(session cleared)"),
-                }
-            }
-            Line::Task(goal) => {
-                let result = run_staged(wiring, &mut host, session.as_mut(), goal).await;
-                match result {
-                    Ok(summary) => {
-                        print_summary(&summary, &wiring.renderer);
-                        handle_pending(summary.pending_messages, &wiring.renderer, |content| {
-                            wiring.input.push(Line::Task(content))
-                        });
-                        if let Some(session) = session.as_mut() {
-                            session.set_log(summary.log);
-                        }
-                    }
-                    Err(err) => {
-                        wiring.renderer.line(format!("error: {err:#}"));
-                    }
-                }
-            }
-        }
+    if let Some(goal) = goal {
+        channels
+            .sender
+            .send_message(crate::input::TaskLine { content: goal })
+            .context("the runtime is gone")?;
     }
 
-    stdin_task.abort();
+    let run_result = app.run_async().await;
+
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.abort();
+    }
     ctrl_c.abort();
     if let Some(approver) = approver {
         approver.abort();
     }
-    if let Some(mut session) = session {
-        session.flush().await?;
-    }
+
+    run_result.map_err(anyhow::Error::new)?;
     Ok(())
 }
 
-fn approvals(wiring: &Wiring) -> (Option<ApprovalChannel>, Option<JoinHandle<()>>) {
-    if wiring.rules.ask.is_empty() {
-        return (None, None);
-    }
-    let (channel, questions) = ApprovalChannel::channel(None);
-    let task = spawn_approver(
-        wiring.yes,
-        wiring.renderer.clone(),
-        Arc::clone(&wiring.input),
-        questions,
-    );
-    (Some(channel), Some(task))
-}
-
+/// 终端审批：问询经 [`ApprovalChannel`] 进来，答覆经 `RuntimeSender` 回注
+/// 为 [`agnes_agent::runtime::ApprovalDecided`]。
 fn spawn_approver(
     auto_approve: bool,
     renderer: Renderer,
     input: Arc<UserInput>,
-    mut questions: mpsc::Receiver<ApprovalRequest>,
+    mut questions: tokio::sync::mpsc::Receiver<ApprovalRequest>,
+    sender: RuntimeSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        use std::collections::HashSet;
         let mut always: HashSet<ToolName> = HashSet::new();
         while let Some(question) = questions.recv().await {
             let approved = if auto_approve {
@@ -302,29 +314,17 @@ fn spawn_approver(
                     _ => false,
                 }
             };
-            let _ = question.reply.send(approved);
+            // 答覆经 ECS 消息回注；落定与审计由门禁与 session 插件负责。
+            let _ = sender.send_message(agnes_agent::runtime::ApprovalDecided {
+                call_id: question.call_id.clone(),
+                approved,
+            });
         }
     })
 }
 
-fn build_host<'a>(wiring: &'a Wiring, approvals: Option<&'a ApprovalChannel>) -> Result<Host<'a>> {
-    let mut builder = Host::builder(&wiring.llm, &*wiring.input)
-        .model(wiring.model.clone())
-        .bundle(FsBundle::new(&wiring.root, wiring.allow_shell));
-    if let Some(approvals) = approvals {
-        builder = builder.approvals(Some(approvals));
-    }
-    builder
-        .bundle(PolicyBundle::new(wiring.rules.clone()))
-        .build()
-        .context("assembling the host")
-}
-
-fn session_header(registry: &ToolRegistry) -> Header {
-    Header::new(
-        SystemPrompt::new(SYSTEM_PROMPT),
-        Environment::new(registry.specs()),
-    )
+fn session_header(system_prompt: &SystemPrompt, registry: &ToolRegistry) -> Header {
+    Header::new(system_prompt.clone(), Environment::new(registry.specs()))
 }
 
 fn ask_rules(allow_shell: bool) -> Vec<Rule> {
@@ -370,21 +370,25 @@ async fn read_goal(renderer: &Renderer) -> Result<Content> {
         .context("empty task: pass a task argument (`agnes run \"do X\"`) or pipe one in")
 }
 
-fn print_session_loaded(loaded: &LoadedSession, renderer: &Renderer, rotated: bool) {
-    let path = loaded.session.path();
+fn print_session_loaded(
+    path: &std::path::Path,
+    notes: usize,
+    repairs: usize,
+    rotated: bool,
+    renderer: &Renderer,
+) {
     if rotated {
         renderer.line(format!("(session cleared — new file: {})", path.display()));
-    } else if loaded.repairs.is_empty() {
+    } else if repairs == 0 {
         renderer.line(format!("(session: {})", path.display()));
     } else {
         renderer.line(format!(
-            "(resumed {}: repaired {} unfinished event(s))",
-            path.display(),
-            loaded.repairs.len()
+            "(resumed {}: repaired {repairs} unfinished event(s))",
+            path.display()
         ));
     }
-    if !loaded.notes.is_empty() {
-        renderer.line(format!("(recovered {} audit note(s))", loaded.notes.len()));
+    if notes > 0 {
+        renderer.line(format!("(recovered {notes} audit note(s))"));
     }
 }
 

@@ -37,10 +37,9 @@ use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use agnes_agent::record::{Event, HostEvent, StepOutcome};
-use agnes_agent::{SessionError, SessionLog};
 use agnes_core::message::{AssistantMessage, Message, ToolCall, ToolOutput};
 use agnes_core::turn::{Outcome, StepNumber};
+use agnes_record::{Event, HostEvent, SessionError, SessionLog, StepOutcome};
 use async_trait::async_trait;
 use jiff::Timestamp;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -550,13 +549,13 @@ pub fn repairs(events: &[Event]) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_agent::approval::ApprovalOutcome;
     use agnes_core::config::{ModelName, SystemPrompt};
     use agnes_core::content::Content;
     use agnes_core::header::{Environment, Header};
     use agnes_core::llm::StopKind;
     use agnes_core::message::{TokenUsage, ToolArguments, ToolCallId};
     use agnes_core::tool::ToolName;
+    use agnes_record::ApprovalOutcome;
     use agnes_util::NonEmpty;
     use std::num::NonZeroU32;
     use std::str::FromStr;

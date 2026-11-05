@@ -1,4 +1,4 @@
-//! 内置工具与它们的装载单元。
+//! 内置工具：沙箱化的文件工具与可选的 shell。
 
 mod fs;
 mod shell;
@@ -15,9 +15,6 @@ use agnes_core::tool::ToolError;
 use agnes_io::tool::Tool;
 use serde::de::DeserializeOwned;
 
-use crate::ext::Bundle;
-use crate::host::{Host, LoadError};
-
 /// 在工具边界把原始 JSON 参数解析成具体类型。
 ///
 /// # Errors
@@ -29,41 +26,20 @@ pub(crate) fn parse_arguments<T: DeserializeOwned>(
     serde_json::from_str(arguments.as_str()).map_err(|source| ToolError::BadArguments { source })
 }
 
-/// 内置工具包：沙箱化的文件工具，加上可选的 shell。
-pub struct FsBundle {
-    root: PathBuf,
-    shell: bool,
-}
-
-impl FsBundle {
-    /// `root` 是全部文件工具的沙箱边界；`shell` 决定是否提供 `run_shell`。
-    pub fn new(root: impl Into<PathBuf>, shell: bool) -> Self {
-        Self {
-            root: root.into(),
-            shell,
-        }
+/// 文件工具包：以 `root` 为沙箱边界，`shell` 决定是否提供 `run_shell`。
+///
+/// 交给 [`agnes_agent::runtime::ToolsPlugin`] 逐把注册。
+pub fn builtin_tools(root: impl Into<PathBuf>, shell: bool) -> Vec<Arc<dyn Tool>> {
+    let root = root.into();
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ReadFile::new(root.clone())),
+        Arc::new(WriteFile::new(root.clone())),
+        Arc::new(ListDir::new(root.clone())),
+    ];
+    if shell {
+        tools.push(Arc::new(Shell::new(root)));
     }
-}
-
-impl Bundle for FsBundle {
-    fn name(&self) -> &str {
-        "fs-tools"
-    }
-
-    fn install(&self, host: &mut Host<'_>) -> Result<(), LoadError> {
-        let mut tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ReadFile::new(self.root.clone())),
-            Arc::new(WriteFile::new(self.root.clone())),
-            Arc::new(ListDir::new(self.root.clone())),
-        ];
-        if self.shell {
-            tools.push(Arc::new(Shell::new(self.root.clone())));
-        }
-        for tool in tools {
-            host.tools_mut().register(tool)?;
-        }
-        Ok(())
-    }
+    tools
 }
 
 #[cfg(test)]
@@ -84,5 +60,11 @@ mod tests {
             parse_arguments::<Args>(&ToolArguments::new("not json")),
             Err(ToolError::BadArguments { .. })
         ));
+    }
+
+    #[test]
+    fn builtin_tools_optionally_include_the_shell() {
+        assert_eq!(builtin_tools("/tmp", false).len(), 3);
+        assert_eq!(builtin_tools("/tmp", true).len(), 4);
     }
 }

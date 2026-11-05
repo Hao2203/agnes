@@ -1,0 +1,24 @@
+[package]
+name = "agnes-plugin-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ECS plugin for session state: log, durability, sequencing, and rotation policy."
+
+[dependencies]
+agnes-ecs.workspace = true
+agnes-record.workspace = true
+agnes-plugin-async = { workspace = true, features = ["tokio"] }
+async-channel.workspace = true
+jiff.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+agnes-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

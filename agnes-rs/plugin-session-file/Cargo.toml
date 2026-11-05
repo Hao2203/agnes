@@ -1,0 +1,23 @@
+[package]
+name = "agnes-plugin-session-file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ECS plugin that mounts an opened SessionFile as the session store port."
+
+[dependencies]
+agnes-ecs.workspace = true
+agnes-record.workspace = true
+agnes-session-file.workspace = true
+async-trait.workspace = true
+jiff.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
+
+[dev-dependencies]
+agnes-core.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

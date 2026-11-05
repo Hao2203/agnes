@@ -1,7 +1,4 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_executor::Executor;
 use futures_lite::future::block_on;
@@ -9,8 +6,8 @@ use futures_lite::future::block_on;
 use crate::schedule::Schedule;
 use crate::world::World;
 use crate::{
-    App, AsyncExecutor, CancelToken, Commands, Entity, MessageReader, MessageWriter, Plugin, Query,
-    Res, ResMut, ScheduleError, SpawnError, SystemError, TaskSpawner, Update,
+    App, CancelToken, Commands, Entity, MessageReader, MessageWriter, Plugin, Query, Res, ResMut,
+    ScheduleError, SystemError, Update,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -559,19 +556,6 @@ fn a_schedule_access_conflict_is_reported_from_app() {
     assert!(matches!(error, ScheduleError::ConflictingAccess { .. }));
 }
 
-#[derive(Clone)]
-struct TestSpawner {
-    executor: Arc<Executor<'static>>,
-}
-
-impl TaskSpawner for TestSpawner {
-    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send>>) -> Result<(), SpawnError> {
-        // `async_task::Task` cancels on drop; detach for fire-and-forget.
-        self.executor.spawn(task).detach();
-        Ok(())
-    }
-}
-
 struct RunnerSeen {
     values: Vec<u32>,
     notify: async_channel::Sender<()>,
@@ -594,9 +578,6 @@ fn runtime_events_drive_the_runner_until_shutdown() {
         notify: notify_tx,
     });
     app.add_systems(Update, read_ping_notifying);
-    app.set_spawner(TestSpawner {
-        executor: executor.clone(),
-    });
 
     let sender = app.runtime_sender();
     let shutdown = app.shutdown_handle();
@@ -632,45 +613,6 @@ fn shutdown_exits_the_runner() {
     block_on(async {
         app.run_async().await.expect("runner exits cleanly");
     });
-}
-
-#[test]
-fn spawn_without_a_spawner_reports_an_error() {
-    let app = App::new();
-    let executor = app
-        .world()
-        .resource::<AsyncExecutor>()
-        .expect("executor resource");
-    let result = (*executor).spawn(async {});
-    assert!(matches!(result, Err(SpawnError::NoSpawner)));
-}
-
-#[test]
-fn set_spawner_enables_spawning() {
-    let executor_handle = Arc::new(Executor::new());
-    let mut app = App::new();
-    app.set_spawner(TestSpawner {
-        executor: executor_handle.clone(),
-    });
-
-    let flag = Arc::new(AtomicBool::new(false));
-    {
-        let executor = app
-            .world()
-            .resource::<AsyncExecutor>()
-            .expect("executor resource");
-        let task_flag = flag.clone();
-        (*executor)
-            .spawn(async move { task_flag.store(true, Ordering::SeqCst) })
-            .expect("spawner is installed");
-    }
-
-    block_on(executor_handle.run(async {
-        while !flag.load(Ordering::SeqCst) {
-            futures_lite::future::yield_now().await;
-        }
-    }));
-    assert!(flag.load(Ordering::SeqCst));
 }
 
 #[test]

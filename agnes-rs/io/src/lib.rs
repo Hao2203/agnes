@@ -1,16 +1,18 @@
 //! Async I/O seams for the agnes agent (hexagonal architecture).
 //!
-//! These are the seams hosts implement to give the agent its I/O: model
-//! access ([`llm::Llm`]), tools ([`tool::Tool`]), raw HTTP
-//! ([`http::HttpTransport`]), and the user's out-of-band actions while a run
-//! executes ([`input::Input`]). Seams are async and `Send`; most are also
-//! `Sync`. Swapping runtimes means swapping the implementations (see
-//! `agnes-transport-reqwest`), never `agnes-core`.
+//! These are the seams hosts implement to give the agent its I/O: tools
+//! ([`tool::Tool`]) and raw HTTP ([`http::HttpTransport`]), plus the
+//! installable handle ([`http::HttpTransportResource`]) that plugins mount
+//! into an ECS world. Model calls travel as messages instead
+//! ([`llm::LlmCall`] / [`llm::LlmReply`]), with the codec in
+//! `agnes-llm-openai` and the round trip in `agnes-plugin-http`. Seams are
+//! async and `Send`; most are also `Sync`. Swapping runtimes means swapping
+//! the implementations (see `agnes-transport-reqwest`), never `agnes-core`.
 //!
-//! The durable session seam lives in `agnes-agent`: its record vocabulary is
-//! owned by the host, so the port moved with it.
+//! The recording vocabulary and the durable session seam live in
+//! `agnes-record`. User input is not a seam here: the ECS-based runtime
+//! receives host-injected messages instead.
 
 pub mod http;
-pub mod input;
 pub mod llm;
 pub mod tool;

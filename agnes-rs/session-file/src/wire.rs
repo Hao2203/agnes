@@ -6,8 +6,6 @@
 //! 日志不猜，直接拒载；形状非法（空内容、空工具调用集合、step 0、带空白
 //! 的工具名、非对象的参数模式）在换回领域类型时同样拒载。
 
-use agnes_agent::approval::ApprovalOutcome;
-use agnes_agent::record::{Event, HostEvent, StepOutcome};
 use agnes_core::config::{ConfigError, ModelName, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::header::{Environment, Header};
@@ -17,6 +15,7 @@ use agnes_core::message::{
 };
 use agnes_core::tool::{JsonSchema, SchemaError, ToolName, ToolSpec};
 use agnes_core::turn::Outcome;
+use agnes_record::{ApprovalOutcome, Event, HostEvent, StepOutcome};
 use agnes_util::NonEmpty;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};

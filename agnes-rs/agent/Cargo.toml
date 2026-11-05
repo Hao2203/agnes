@@ -7,7 +7,10 @@ license.workspace = true
 
 [dependencies]
 agnes-core.workspace = true
+agnes-ecs.workspace = true
+agnes-plugin-async = { workspace = true, features = ["tokio"] }
 agnes-io.workspace = true
+agnes-record.workspace = true
 agnes-util.workspace = true
 async-trait.workspace = true
 cold-string.workspace = true
@@ -20,7 +23,7 @@ tokio = { workspace = true, features = ["fs", "process", "sync", "time", "macros
 [dev-dependencies]
 http.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "sync", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
 
 [lints]
 workspace = true

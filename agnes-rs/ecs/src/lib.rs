@@ -1,8 +1,7 @@
 //! A small, single-threaded ECS runtime with Bevy-style typed systems.
 //!
 //! The crate is intentionally independent from the rest of the workspace: it
-//! knows nothing about models, tools, or the agent loop. A reference agent
-//! layer lives in [`demo`] and is built entirely on the public ECS API.
+//! knows nothing about models, tools, or the agent loop.
 //!
 //! # Typed systems
 //!
@@ -59,15 +58,14 @@
 //! [`Commands`] queue structural changes and apply them after the system
 //! returns, once all component borrows have been released.
 //!
-//! # Async tasks without a runtime
+//! # Async tasks
 //!
-//! The core never awaits inside the ECS: systems are synchronous, and async
-//! work is submitted through [`AsyncExecutor`], which delegates to a
-//! [`TaskSpawner`] installed with [`App::set_spawner`]. Ready-made spawners
-//! live in [`adapters`] behind the `tokio` and `async-executor` features; any
-//! other executor can be used by implementing [`TaskSpawner`] directly. The
+//! The core never awaits inside the ECS: systems are synchronous, and the
 //! [`Runner`] itself only needs a channel and a cancellation token, so it runs
-//! under any executor.
+//! under any executor. Submitting async work is a plugin capability — add
+//! `agnes_plugin_async::TokioPlugin` to install an `AsyncExecutor` resource
+//! over the host's task spawner. Without that plugin, systems that take an
+//! executor fail loudly when the schedule prepares.
 
 mod access;
 mod app;
@@ -84,9 +82,6 @@ mod system;
 mod system_param;
 mod world;
 
-pub mod adapters;
-pub mod demo;
-
 #[cfg(test)]
 mod tests;
 
@@ -99,10 +94,7 @@ pub use message::{Message, MessageReader, MessageWriter, ReaderId};
 pub use plugin::Plugin;
 pub use query::{Query, QueryData, QueryFilter, QueryIter, QuerySingleError, With, Without};
 pub use resource::{Res, ResMut, Resource};
-pub use runner::{
-    AsyncExecutor, CancelToken, Runner, RunnerError, RuntimeSendError, RuntimeSender, SpawnError,
-    TaskSpawner,
-};
+pub use runner::{CancelToken, Runner, RunnerError, RuntimeSendError, RuntimeSender};
 pub use schedule::{Schedule, ScheduleError};
 pub use system::{
     BoxError, FunctionSystem, IntoSystem, System, SystemError, SystemOut, SystemParamFunction,
