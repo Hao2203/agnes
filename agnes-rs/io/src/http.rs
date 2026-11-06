@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 /// Failure while performing an HTTP request. Payloads carry the underlying
 /// error — never a formatted string.
@@ -24,8 +25,9 @@ pub enum TransportError {
     /// failure.
     #[error("request was cancelled")]
     Cancelled,
-    /// The response body was not valid UTF-8. The transport never replaces
-    /// invalid sequences silently.
+    /// A buffered response body was not valid UTF-8. The transport never
+    /// replaces invalid sequences silently. Streamed bodies are delivered as
+    /// raw bytes and validated by their consumer instead.
     #[error("response body is not valid UTF-8")]
     InvalidUtf8(#[from] std::str::Utf8Error),
     /// The response body exceeded the transport's safety limit.
@@ -36,14 +38,15 @@ pub enum TransportError {
     Request(#[source] http::Error),
     /// The client reported another failure (TLS, resolver, redirect, …).
     #[error("{0}")]
-    Other(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Other(#[source] anyhow::Error),
 }
 
 /// One part of a streamed response, in arrival order.
 ///
 /// The head always comes first (when the transport has one); body parts follow
-/// as the peer produces them. Parts are UTF-8 text: a transport never splits a
-/// multi-byte sequence across two parts.
+/// as the peer produces them. Body parts are the raw bytes the peer sent: a
+/// transport never splits or re-chunks them, so a multi-byte sequence may
+/// straddle two parts. Framing and text decoding are the consumer's job.
 #[derive(Debug)]
 pub enum HttpStreamPart {
     /// The status line and response headers.
@@ -51,8 +54,8 @@ pub enum HttpStreamPart {
         status: http::StatusCode,
         headers: http::HeaderMap,
     },
-    /// One body chunk.
-    Body(String),
+    /// One body chunk, exactly as received.
+    Body(Bytes),
 }
 
 /// Sends a request and returns the raw response with *any* status code;
@@ -73,8 +76,8 @@ pub trait HttpTransport: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns the same transport failures as [`Self::send`], including
-    /// [`TransportError::InvalidUtf8`] when the body is not valid UTF-8.
+    /// Returns the same transport failures as [`Self::send`]. Body parts carry
+    /// raw bytes; text decoding is up to the consumer.
     async fn send_stream(
         &self,
         request: http::Request<String>,
@@ -87,7 +90,7 @@ pub trait HttpTransport: Send + Sync {
             headers: parts.headers,
         });
         if !body.is_empty() {
-            sink(HttpStreamPart::Body(body));
+            sink(HttpStreamPart::Body(Bytes::from(body.into_bytes())));
         }
         Ok(())
     }
@@ -225,7 +228,7 @@ mod tests {
             }
             HttpStreamPart::Body(_) => panic!("expected the head first"),
         }
-        assert!(matches!(&parts[1], HttpStreamPart::Body(body) if body == "body"));
+        assert!(matches!(&parts[1], HttpStreamPart::Body(body) if body.as_ref() == b"body"));
     }
 
     #[tokio::test]

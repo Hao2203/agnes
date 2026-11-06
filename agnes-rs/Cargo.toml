@@ -42,6 +42,7 @@ agnes-plugin-session-file = { path = "plugin-session-file" }
 async-channel = "2"
 async-executor = "1"
 async-trait = "0.1"
+bytes = "1"
 event-listener = "5"
 log = "0.4"
 ureq = "2"

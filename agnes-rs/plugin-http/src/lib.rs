@@ -205,7 +205,7 @@ fn dispatch_http(
             in_flight.0.remove(&id);
             let _ = executor.sender().send_message(HttpResponse {
                 id,
-                result: Err(TransportError::Other(Box::new(error))),
+                result: Err(TransportError::Other(error.into())),
             });
         }
     }
@@ -244,7 +244,7 @@ fn dispatch_http_streams(
             in_flight.0.remove(&id);
             let _ = executor.sender().send_message(HttpStreamEnd {
                 id,
-                result: Err(TransportError::Other(Box::new(error))),
+                result: Err(TransportError::Other(error.into())),
             });
         }
     }
@@ -278,6 +278,7 @@ mod tests {
     use super::*;
     use agnes_plugin_async::TokioPlugin;
     use async_trait::async_trait;
+    use bytes::Bytes;
 
     struct OkTransport;
 
@@ -341,8 +342,8 @@ mod tests {
                 status: http::StatusCode::OK,
                 headers: http::HeaderMap::new(),
             });
-            sink(HttpStreamPart::Body("one".to_owned()));
-            sink(HttpStreamPart::Body("two".to_owned()));
+            sink(HttpStreamPart::Body(Bytes::from_static(b"one")));
+            sink(HttpStreamPart::Body(Bytes::from_static(b"two")));
             Ok(())
         }
     }
@@ -475,7 +476,9 @@ mod tests {
         for event in events.read() {
             captured.parts.push(match &event.part {
                 HttpStreamPart::Head { status, .. } => format!("head:{}", status.as_u16()),
-                HttpStreamPart::Body(text) => format!("body:{text}"),
+                HttpStreamPart::Body(bytes) => {
+                    format!("body:{}", String::from_utf8_lossy(bytes))
+                }
             });
         }
         for end in ends.read() {

@@ -12,11 +12,13 @@ agnes-ecs.workspace = true
 agnes-io.workspace = true
 agnes-llm-openai.workspace = true
 agnes-plugin-http.workspace = true
+anyhow.workspace = true
 http.workspace = true
 
 [dev-dependencies]
 agnes-plugin-async = { workspace = true, features = ["tokio"] }
 async-trait.workspace = true
+bytes.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

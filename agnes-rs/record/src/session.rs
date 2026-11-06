@@ -26,7 +26,7 @@ pub enum SessionError {
     #[error("session i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("session record could not be encoded")]
-    Encode(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Encode(#[source] anyhow::Error),
     #[error("session writer is poisoned after a failed write")]
     Poisoned,
     #[error("session sequence number exhausted")]

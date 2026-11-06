@@ -8,6 +8,7 @@ use agnes_core::message::{
 use agnes_core::tool::{ToolName, ToolSpec};
 use agnes_io::llm::{LlmError, ProtocolError};
 use agnes_util::NonEmpty;
+use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -310,7 +311,9 @@ pub enum StreamDelta {
 /// the same rules as a buffered response.
 #[derive(Debug, Default)]
 pub struct OpenAiStreamDecoder {
-    buffer: String,
+    /// The start of a line whose terminating newline has not arrived yet.
+    /// Holding a slice of the chunk keeps the common case copy-free.
+    tail: Bytes,
     content: String,
     tool_calls: BTreeMap<u32, AccumulatedToolCall>,
     finish_reason: Option<WireFinishReason>,
@@ -331,22 +334,49 @@ impl OpenAiStreamDecoder {
         Self::default()
     }
 
-    /// Feeds one UTF-8 body chunk and returns the updates it completed.
+    /// Feeds one body chunk and returns the updates it completed.
+    ///
+    /// Chunks are byte ranges straight from the transport: lines are framed on
+    /// `\n`, so a multi-byte sequence may be split across two chunks. Complete
+    /// lines are decoded in place — nothing is copied unless a line straddles
+    /// a chunk boundary.
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::Decode`] when a `data:` line is not valid JSON for
-    /// the chunk shape.
-    pub fn feed(&mut self, chunk: &str) -> Result<Vec<StreamDelta>, LlmError> {
-        if self.done {
+    /// Returns [`LlmError::Decode`] when a line is not valid UTF-8 or is not
+    /// valid JSON for the chunk shape.
+    pub fn feed(&mut self, chunk: Bytes) -> Result<Vec<StreamDelta>, LlmError> {
+        if self.done || chunk.is_empty() {
             return Ok(Vec::new());
         }
-        self.buffer.push_str(chunk);
         let mut deltas = Vec::new();
-        while let Some(end) = self.buffer.find('\n') {
-            let line = self.buffer[..end].trim_end_matches('\r').to_owned();
-            self.buffer.drain(..=end);
+        let mut start = 0;
+
+        // Complete the line carried over from the previous chunk. This is the
+        // only case that ever copies: a straddling line is stitched once.
+        if !self.tail.is_empty() {
+            let Some(end) = chunk.iter().position(|&byte| byte == b'\n') else {
+                self.tail = stitch(&self.tail, &chunk);
+                return Ok(deltas);
+            };
+            let mut line = BytesMut::with_capacity(self.tail.len() + end);
+            line.extend_from_slice(&self.tail);
+            line.extend_from_slice(&chunk[..end]);
+            self.tail = Bytes::new();
             self.handle_line(&line, &mut deltas)?;
+            start = end + 1;
+        }
+
+        // Whole lines inside this chunk: borrow them, allocate nothing.
+        while let Some(offset) = chunk[start..].iter().position(|&byte| byte == b'\n') {
+            let end = start + offset;
+            self.handle_line(&chunk[start..end], &mut deltas)?;
+            start = end + 1;
+        }
+
+        // Keep the unterminated remainder as a slice of this chunk.
+        if start < chunk.len() {
+            self.tail = chunk.slice(start..);
         }
         Ok(deltas)
     }
@@ -363,11 +393,10 @@ impl OpenAiStreamDecoder {
     /// for a stream that does not describe a legal completion.
     pub fn finish(mut self) -> Result<LlmResponse, LlmError> {
         if !self.done {
-            let tail = std::mem::take(&mut self.buffer);
-            let tail = tail.trim();
+            let tail = std::mem::take(&mut self.tail);
             if !tail.is_empty() {
                 let mut deltas = Vec::new();
-                self.handle_line(tail, &mut deltas)?;
+                self.handle_line(&tail, &mut deltas)?;
             }
         }
         let choice = WireChoice {
@@ -397,7 +426,8 @@ impl OpenAiStreamDecoder {
         .into_core()
     }
 
-    fn handle_line(&mut self, line: &str, deltas: &mut Vec<StreamDelta>) -> Result<(), LlmError> {
+    fn handle_line(&mut self, line: &[u8], deltas: &mut Vec<StreamDelta>) -> Result<(), LlmError> {
+        let line = std::str::from_utf8(line).map_err(|error| LlmError::Decode(error.into()))?;
         let line = line.trim();
         if line.is_empty() || line.starts_with(':') {
             return Ok(());
@@ -414,7 +444,7 @@ impl OpenAiStreamDecoder {
             return Ok(());
         }
         let chunk: ChatCompletionChunk =
-            serde_json::from_str(data).map_err(|err| LlmError::Decode(Box::new(err)))?;
+            serde_json::from_str(data).map_err(|err| LlmError::Decode(err.into()))?;
 
         if let Some(usage) = chunk.usage {
             let usage = TokenUsage {
@@ -454,6 +484,20 @@ impl OpenAiStreamDecoder {
         }
         Ok(())
     }
+}
+
+/// Joins a carried line fragment with more bytes. Only called when a line
+/// straddles a chunk boundary or stays unterminated across chunks; the
+/// doubling capacity keeps repeated joins linear for a very long line.
+fn stitch(tail: &Bytes, rest: &[u8]) -> Bytes {
+    let capacity = tail
+        .len()
+        .saturating_add(rest.len())
+        .max(tail.len().saturating_mul(2));
+    let mut joined = BytesMut::with_capacity(capacity);
+    joined.extend_from_slice(tail);
+    joined.extend_from_slice(rest);
+    joined.freeze()
 }
 
 /// One `data:` event of the chat-completions stream.
@@ -580,16 +624,20 @@ mod tests {
         OpenAiStreamDecoder::new()
     }
 
+    fn body(text: &'static str) -> Bytes {
+        Bytes::from_static(text.as_bytes())
+    }
+
     #[test]
     fn a_stream_yields_text_and_usage_then_the_validated_response() {
         let mut decoder = decoder();
         let deltas = decoder
-            .feed(concat!(
+            .feed(body(concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
                 "data: [DONE]\n\n",
-            ))
+            )))
             .unwrap();
         assert_eq!(
             deltas,
@@ -622,12 +670,12 @@ mod tests {
     #[test]
     fn stream_framing_survives_arbitrary_chunk_boundaries() {
         let mut decoder = decoder();
-        assert!(decoder.feed("data: {\"choi").unwrap().is_empty());
+        assert!(decoder.feed(body("data: {\"choi")).unwrap().is_empty());
         let deltas = decoder
-            .feed(concat!(
+            .feed(body(concat!(
                 "ces\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n",
                 "\ndata: [DONE]\n\n",
-            ))
+            )))
             .unwrap();
         assert_eq!(deltas, vec![StreamDelta::Text("hi".to_owned())]);
         let response = decoder.finish().unwrap();
@@ -640,17 +688,62 @@ mod tests {
     }
 
     #[test]
+    fn a_utf8_sequence_split_across_chunks_is_reassembled() {
+        let text =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"中\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let bytes = text.as_bytes();
+        let at = text.find('中').expect("the fixture contains the character") + 1;
+
+        let mut decoder = decoder();
+        assert!(
+            decoder
+                .feed(Bytes::copy_from_slice(&bytes[..at]))
+                .unwrap()
+                .is_empty()
+        );
+        let deltas = decoder.feed(Bytes::copy_from_slice(&bytes[at..])).unwrap();
+        assert_eq!(deltas, vec![StreamDelta::Text("中".to_owned())]);
+        assert_eq!(
+            decoder.finish().unwrap().stop_reason,
+            StopReason::Completed {
+                content: content("中")
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_line_is_a_decode_error() {
+        let mut line = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        line.push(0xFF);
+        line.extend_from_slice(b"\"}}]}\n\n");
+
+        let mut decoder = decoder();
+        assert!(matches!(
+            decoder.feed(Bytes::from(line)),
+            Err(LlmError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn an_incomplete_utf8_tail_is_a_decode_error() {
+        let mut decoder = decoder();
+        // The first two bytes of "中" with no newline: the line never frames.
+        decoder.feed(Bytes::from_static(b"data: \xe4\xb8")).unwrap();
+        assert!(matches!(decoder.finish(), Err(LlmError::Decode(_))));
+    }
+
+    #[test]
     fn streamed_tool_calls_are_accumulated() {
         let mut decoder = decoder();
         decoder
-            .feed(concat!(
+            .feed(body(concat!(
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
                 "\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
                 "\"function\":{\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\"}}]}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
                 "data: [DONE]\n\n",
-            ))
+            )))
             .unwrap();
         let response = decoder.finish().unwrap();
         let StopReason::ToolUse { content, calls } = &response.stop_reason else {
@@ -667,7 +760,9 @@ mod tests {
     fn a_stream_without_a_finish_reason_is_malformed() {
         let mut decoder = decoder();
         decoder
-            .feed("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+            .feed(body(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            ))
             .unwrap();
         assert!(matches!(
             decoder.finish(),
@@ -679,7 +774,7 @@ mod tests {
     fn malformed_stream_json_is_a_decode_error() {
         let mut decoder = decoder();
         assert!(matches!(
-            decoder.feed("data: not json\n\n"),
+            decoder.feed(body("data: not json\n\n")),
             Err(LlmError::Decode(_))
         ));
     }

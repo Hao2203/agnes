@@ -251,8 +251,18 @@ struct Selection {
     head: CellPos,
 }
 
+/// One transcript line and how many visual rows it occupies at the current
+/// width. The row count is cached so a frame never re-wraps the whole
+/// transcript: `Paragraph` only sees the lines the viewport shows.
+struct DisplayLine {
+    line: Line<'static>,
+    rows: usize,
+}
+
 struct TuiState {
-    transcript: Vec<Line<'static>>,
+    transcript: Vec<DisplayLine>,
+    total_rows: usize,
+    width: u16,
     streaming: String,
     input: String,
     cursor: usize,
@@ -275,6 +285,8 @@ impl Default for TuiState {
     fn default() -> Self {
         Self {
             transcript: Vec::new(),
+            total_rows: 0,
+            width: 0,
             streaming: String::new(),
             input: String::new(),
             cursor: 0,
@@ -505,8 +517,10 @@ impl TuiState {
         self.selection = None;
         for line in text.split('\n') {
             let style = style.unwrap_or_else(|| line_style(line));
-            self.transcript
-                .push(Line::from(Span::styled(line.to_owned(), style)));
+            let line = Line::from(Span::styled(line.to_owned(), style));
+            let rows = rows_of(&line, self.width);
+            self.total_rows = self.total_rows.saturating_add(rows);
+            self.transcript.push(DisplayLine { line, rows });
         }
     }
 
@@ -650,20 +664,81 @@ impl TuiState {
         Flow::Continue
     }
 
-    fn content_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = self.transcript.clone();
-        if self.status.streaming || !self.streaming.is_empty() {
-            let mut parts: Vec<&str> = self.streaming.split('\n').collect();
-            let last = parts.pop().unwrap_or_default();
-            for part in parts {
-                lines.push(Line::from(part.to_owned()));
-            }
-            lines.push(Line::from(vec![
-                Span::raw(last.to_owned()),
-                Span::styled("▍", Style::new().fg(Color::Cyan)),
-            ]));
+    /// Recomputes the cached row count of every transcript line. Runs only
+    /// when the viewport width changes (first frame, resize).
+    fn recompute_rows(&mut self, width: u16) {
+        self.width = width;
+        let mut total = 0;
+        for entry in &mut self.transcript {
+            entry.rows = rows_of(&entry.line, width);
+            total += entry.rows;
         }
+        self.total_rows = total;
+    }
+
+    /// The live (in-progress) message as display lines, with the block cursor
+    /// appended to the last one. Rebuilt per frame — the tail changes with
+    /// every delta, so caching it would never hit.
+    fn tail_lines(&self) -> Vec<(Line<'static>, usize)> {
+        if !self.status.streaming && self.streaming.is_empty() {
+            return Vec::new();
+        }
+        let mut parts: Vec<&str> = self.streaming.split('\n').collect();
+        let last = parts.pop().unwrap_or_default();
+        let mut lines = Vec::with_capacity(parts.len() + 1);
+        for part in parts {
+            let line = Line::from(part.to_owned());
+            let rows = rows_of(&line, self.width);
+            lines.push((line, rows));
+        }
+        let line = Line::from(vec![
+            Span::raw(last.to_owned()),
+            Span::styled("▍", Style::new().fg(Color::Cyan)),
+        ]);
+        let rows = rows_of(&line, self.width);
+        lines.push((line, rows));
         lines
+    }
+
+    /// The slice of the transcript the viewport actually shows, plus the
+    /// paragraph-local scroll offset. Only the visible lines are cloned; the
+    /// rest of the transcript is never touched by the widget.
+    fn visible_window(
+        &self,
+        height: u16,
+        tail: &[(Line<'static>, usize)],
+    ) -> (Vec<Line<'static>>, u16) {
+        let target = usize::from(self.scroll);
+        let limit = usize::from(height);
+        let mut lines = Vec::with_capacity(limit + 1);
+        let mut skipped = 0_usize;
+        let mut local_scroll = 0_usize;
+        let mut covered = 0_usize;
+        let mut started = false;
+
+        for (line, rows) in self
+            .transcript
+            .iter()
+            .map(|entry| (&entry.line, entry.rows))
+            .chain(tail.iter().map(|(line, rows)| (line, *rows)))
+        {
+            if !started {
+                if skipped.saturating_add(rows) <= target {
+                    skipped += rows;
+                    continue;
+                }
+                started = true;
+                local_scroll = target - skipped;
+            }
+            lines.push(line.clone());
+            covered += rows;
+            // One extra line keeps a partially visible last row intact.
+            if local_scroll + covered > limit {
+                break;
+            }
+        }
+
+        (lines, u16::try_from(local_scroll).unwrap_or(u16::MAX))
     }
 
     fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> std::io::Result<()> {
@@ -685,22 +760,31 @@ impl TuiState {
         let block = Block::bordered().title(" agnes ");
         let inner = block.inner(chunks[0]);
         self.transcript_area = inner;
-        let paragraph = Paragraph::new(self.content_lines())
-            .block(block)
-            .wrap(Wrap { trim: false });
-        let total = u16::try_from(paragraph.line_count(inner.width)).unwrap_or(u16::MAX);
-        let max_scroll = total.saturating_sub(inner.height);
+        if inner.width != self.width {
+            self.recompute_rows(inner.width);
+        }
+        let tail = self.tail_lines();
+        let tail_rows: usize = tail.iter().map(|(_, rows)| rows).sum();
+        let total = self.total_rows + tail_rows;
+        let max_scroll = total.saturating_sub(usize::from(inner.height));
         let scroll = if self.follow {
             max_scroll
         } else {
-            self.scroll.min(max_scroll)
+            usize::from(self.scroll).min(max_scroll)
         };
-        self.scroll = scroll;
-        self.max_scroll = max_scroll;
+        self.scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+        self.max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
         self.viewport = inner.height;
-        self.hidden_below = max_scroll.saturating_sub(scroll);
-        frame.render_widget(paragraph.scroll((scroll, 0)), chunks[0]);
-        self.snapshot_rows(frame);
+        self.hidden_below = u16::try_from(max_scroll.saturating_sub(scroll)).unwrap_or(u16::MAX);
+
+        let (lines, local_scroll) = self.visible_window(inner.height, &tail);
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph.scroll((local_scroll, 0)), chunks[0]);
+        if self.selection.is_some() {
+            self.snapshot_rows(frame);
+        }
         self.highlight_selection(frame);
 
         if let Some(prompt) = &self.approval {
@@ -724,7 +808,7 @@ impl TuiState {
                 Color::DarkGray
             }));
         frame.render_widget(
-            Paragraph::new(self.input.clone()).block(input_block),
+            Paragraph::new(self.input.as_str()).block(input_block),
             chunks[2],
         );
         let cursor_width = UnicodeWidthStr::width(&self.input[..self.cursor]);
@@ -739,6 +823,17 @@ impl TuiState {
             chunks[3],
         );
     }
+}
+
+/// Visual rows a display line occupies at `width`, using the same wrapping
+/// rules as the paragraph widget. `width == 0` means "not laid out yet".
+fn rows_of(line: &Line<'static>, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
 }
 
 fn line_style(line: &str) -> Style {
@@ -894,9 +989,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut state = state();
         for index in 0..100 {
-            state
-                .transcript
-                .push(Line::from(format!("line {index:03}")));
+            state.push_text(&format!("line {index:03}"), None);
         }
 
         terminal.draw(|frame| state.render(frame)).unwrap();
@@ -1009,7 +1102,7 @@ mod tests {
     fn selection_is_highlighted_in_the_rendered_transcript() {
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         let mut state = state();
-        state.transcript = vec![Line::from("hello")];
+        state.push_text("hello", None);
         terminal.draw(|frame| state.render(frame)).unwrap();
 
         let area = state.transcript_area;
@@ -1044,5 +1137,91 @@ mod tests {
         state.apply(UiCommand::CommitAssistant("hello".to_owned()));
         assert!(state.streaming.is_empty());
         assert_eq!(state.transcript.len(), 1);
+    }
+
+    #[test]
+    fn only_the_visible_lines_reach_the_widget() {
+        let mut state = state();
+        state.recompute_rows(80);
+        for index in 0..1000 {
+            state.push_text(&format!("line {index:03}"), None);
+        }
+        assert_eq!(state.total_rows, 1000);
+
+        state.scroll = 500;
+        let (lines, local) = state.visible_window(10, &[]);
+
+        assert_eq!(local, 0);
+        assert_eq!(lines.len(), 11, "one viewport plus a partial line");
+        assert_eq!(lines[0].spans[0].content, "line 500");
+    }
+
+    #[test]
+    fn the_live_tail_is_part_of_the_window() {
+        let mut state = state();
+        state.recompute_rows(80);
+        state.push_text("done", None);
+        state.apply(UiCommand::StreamStart);
+        state.apply(UiCommand::StreamDelta("live".to_owned()));
+
+        let tail = state.tail_lines();
+        state.scroll = 1;
+        let (lines, local) = state.visible_window(5, &tail);
+
+        assert_eq!(local, 0);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("live"))
+        );
+    }
+
+    #[test]
+    fn resize_recomputes_wrapped_rows() {
+        let mut state = state();
+        state.recompute_rows(4);
+        state.push_text("abcdefgh", None);
+        assert_eq!(state.total_rows, 2);
+
+        state.recompute_rows(8);
+        assert_eq!(state.total_rows, 1);
+    }
+
+    #[test]
+    fn scrolling_inside_a_wrapped_line_uses_the_local_offset() {
+        let mut state = state();
+        state.recompute_rows(4);
+        state.push_text("abcdefghijkl", None);
+        assert_eq!(state.total_rows, 3);
+
+        state.scroll = 1;
+        let (lines, local) = state.visible_window(2, &[]);
+
+        assert_eq!(local, 1);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn the_tail_line_touches_the_bottom_of_the_viewport() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        let mut state = state();
+        for index in 0..50 {
+            state.push_text(&format!("line {index:02}"), None);
+        }
+        terminal.draw(|frame| state.render(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let last = state.transcript_area.y + state.transcript_area.height - 1;
+        let row: String = buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .nth(usize::from(last))
+            .expect("the row exists")
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(row.contains("line 49"), "bottom row was {row:?}");
     }
 }

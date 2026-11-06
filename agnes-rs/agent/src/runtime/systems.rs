@@ -261,7 +261,7 @@ pub fn issue_model_call(
     mut outgoing: MessageWriter<LlmCall>,
 ) -> Result<(), BoxError> {
     if provider.is_none() {
-        return Err(BoxError::from(
+        return Err(BoxError::msg(
             "no LLM provider plugin is installed; add a plugin that installs `LlmProvider`",
         ));
     }
@@ -772,5 +772,5 @@ pub fn close_turn(
     }
 }
 
-/// 系统错误的盒子类型：只有不变量破坏才会走到这里。
-pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+/// 系统错误类型：只有不变量破坏才会走到这里。
+pub(crate) type BoxError = anyhow::Error;

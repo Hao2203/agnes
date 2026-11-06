@@ -29,8 +29,9 @@ use agnes_plugin_http::{
 };
 
 /// The most error-body text kept for an eventual `Api` error. Error bodies
-/// are diagnostic; a hostile peer must not grow them without bound.
-const MAX_ERROR_BODY_CHARS: usize = 64 * 1024;
+/// are diagnostic; a hostile peer must not grow them without bound. The cap is
+/// checked before appending, so one chunk may push it slightly past the limit.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Builds an OpenAI-compatible provider bridge.
 ///
@@ -159,12 +160,12 @@ fn ingest_stream_events(
                     });
                 }
             }
-            HttpStreamPart::Body(text) => {
+            HttpStreamPart::Body(bytes) => {
                 if stream.failure.is_some() {
                     continue;
                 }
                 if stream.status.is_some_and(|status| status.is_success()) {
-                    match stream.decoder.feed(text) {
+                    match stream.decoder.feed(bytes.clone()) {
                         Ok(deltas) => {
                             for delta in deltas {
                                 let update = match delta {
@@ -176,9 +177,8 @@ fn ingest_stream_events(
                         }
                         Err(error) => stream.failure = Some(error),
                     }
-                } else if stream.error_body.chars().count() < MAX_ERROR_BODY_CHARS {
-                    let remaining = MAX_ERROR_BODY_CHARS - stream.error_body.chars().count();
-                    stream.error_body.extend(text.chars().take(remaining));
+                } else if stream.error_body.len() < MAX_ERROR_BODY_BYTES {
+                    stream.error_body.push_str(&String::from_utf8_lossy(bytes));
                 }
             }
         }
@@ -207,7 +207,7 @@ fn ingest_stream_ends(
             Err(error) => Err(LlmError::Transport(to_transport_error(error))),
             Ok(()) => match status {
                 None => Err(LlmError::Transport(TransportError::Other(
-                    "the stream ended before the response head".into(),
+                    anyhow::Error::msg("the stream ended before the response head"),
                 ))),
                 Some(status) if !status.is_success() => {
                     OpenAiCodec::parse_response(status, &error_body)
@@ -228,7 +228,7 @@ fn to_transport_error(error: &TransportError) -> TransportError {
     match error {
         TransportError::Timeout => TransportError::Timeout,
         TransportError::Cancelled => TransportError::Cancelled,
-        other => TransportError::Other(Box::new(std::io::Error::other(other.to_string()))),
+        other => TransportError::Other(std::io::Error::other(other.to_string()).into()),
     }
 }
 
@@ -241,6 +241,7 @@ mod tests {
     use agnes_io::http::HttpTransport;
     use agnes_plugin_async::TokioPlugin;
     use async_trait::async_trait;
+    use bytes::Bytes;
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -272,7 +273,7 @@ mod tests {
                 headers: http::HeaderMap::new(),
             });
             for line in SSE_BODY.split_inclusive("\n\n") {
-                sink(HttpStreamPart::Body(line.to_owned()));
+                sink(HttpStreamPart::Body(Bytes::from(line.to_owned())));
             }
             Ok(())
         }
@@ -298,9 +299,9 @@ mod tests {
                 status: http::StatusCode::UNAUTHORIZED,
                 headers: http::HeaderMap::new(),
             });
-            sink(HttpStreamPart::Body(
-                r#"{"error":{"message":"invalid api key"}}"#.to_owned(),
-            ));
+            sink(HttpStreamPart::Body(Bytes::from_static(
+                br#"{"error":{"message":"invalid api key"}}"#,
+            )));
             Ok(())
         }
     }

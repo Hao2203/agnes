@@ -12,6 +12,7 @@ agnes-plugin-async = { workspace = true, features = ["tokio"] }
 agnes-io.workspace = true
 agnes-record.workspace = true
 agnes-util.workspace = true
+anyhow.workspace = true
 async-trait.workspace = true
 cold-string.workspace = true
 jiff.workspace = true

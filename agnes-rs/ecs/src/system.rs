@@ -28,8 +28,8 @@ pub enum SystemError {
     },
 }
 
-/// A boxed, thread-safe error, used for errors returned by systems.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+/// A thread-safe error, used for errors returned by systems.
+pub type BoxError = anyhow::Error;
 
 /// The output of a system function.
 ///

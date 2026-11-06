@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["macros"] }
 
 [dev-dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 futures-lite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

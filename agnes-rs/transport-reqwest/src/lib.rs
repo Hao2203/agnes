@@ -100,69 +100,15 @@ impl HttpTransport for ReqwestTransport {
             headers: response.headers().clone(),
         });
 
-        let mut utf8 = Utf8Stream::default();
+        let mut total = 0_u64;
         while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-            if let Some(text) = utf8.push(&chunk)? {
-                sink(HttpStreamPart::Body(text));
+            total = total.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            if total > MAX_BODY_BYTES {
+                return Err(body_too_large());
             }
-        }
-        if let Some(text) = utf8.finish()? {
-            sink(HttpStreamPart::Body(text));
+            sink(HttpStreamPart::Body(chunk));
         }
         Ok(())
-    }
-}
-
-/// Decodes a byte stream that may split multi-byte UTF-8 sequences across
-/// chunk boundaries. Complete text is emitted as soon as it is valid; an
-/// incomplete tail waits for the next chunk, and anything still incomplete at
-/// the end is a protocol error rather than replacement characters.
-#[derive(Default)]
-struct Utf8Stream {
-    pending: Vec<u8>,
-    total: u64,
-}
-
-impl Utf8Stream {
-    fn push(&mut self, bytes: &[u8]) -> Result<Option<String>, TransportError> {
-        self.total = self
-            .total
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if self.total > MAX_BODY_BYTES {
-            return Err(body_too_large());
-        }
-        self.pending.extend_from_slice(bytes);
-
-        let mut out = String::new();
-        match std::str::from_utf8(&self.pending) {
-            Ok(text) => {
-                out.push_str(text);
-                self.pending.clear();
-            }
-            Err(error) => {
-                let valid = error.valid_up_to();
-                if valid > 0 {
-                    let prefix = std::str::from_utf8(&self.pending[..valid])
-                        .expect("the prefix up to valid_up_to is valid");
-                    out.push_str(prefix);
-                    self.pending.drain(..valid);
-                }
-                if error.error_len().is_some() {
-                    return Err(TransportError::InvalidUtf8(error));
-                }
-                // Only an incomplete sequence at the tail: wait for more.
-            }
-        }
-        Ok((!out.is_empty()).then_some(out))
-    }
-
-    fn finish(self) -> Result<Option<String>, TransportError> {
-        if self.pending.is_empty() {
-            return Ok(None);
-        }
-        Err(TransportError::InvalidUtf8(
-            std::str::from_utf8(&self.pending).expect_err("the tail is incomplete UTF-8"),
-        ))
     }
 }
 
@@ -179,7 +125,7 @@ fn transport_error(error: reqwest::Error) -> TransportError {
     } else if error.is_connect() || error.is_body() || error.is_decode() {
         TransportError::Io(std::io::Error::other(error))
     } else {
-        TransportError::Other(Box::new(error))
+        TransportError::Other(error.into())
     }
 }
 
@@ -327,36 +273,6 @@ mod tests {
         assert!(matches!(err, TransportError::InvalidUtf8(_)));
     }
 
-    #[test]
-    fn a_utf8_sequence_split_across_chunks_is_reassembled() {
-        let text = "aé中";
-        let bytes = text.as_bytes();
-        let mut stream = Utf8Stream::default();
-        // "a" + the first byte of "é"
-        assert_eq!(stream.push(&bytes[..2]).unwrap().as_deref(), Some("a"));
-        // the second byte of "é"
-        assert_eq!(stream.push(&bytes[2..3]).unwrap().as_deref(), Some("é"));
-        // "中" in full
-        assert_eq!(stream.push(&bytes[3..]).unwrap().as_deref(), Some("中"));
-        assert!(stream.finish().unwrap().is_none());
-    }
-
-    #[test]
-    fn an_incomplete_or_invalid_utf8_tail_is_rejected() {
-        let mut stream = Utf8Stream::default();
-        assert!(stream.push(&[0xC3]).unwrap().is_none());
-        assert!(matches!(
-            stream.finish().unwrap_err(),
-            TransportError::InvalidUtf8(_)
-        ));
-
-        let mut stream = Utf8Stream::default();
-        assert!(matches!(
-            stream.push(&[0xFF]).unwrap_err(),
-            TransportError::InvalidUtf8(_)
-        ));
-    }
-
     /// Serves one response and closes, without a content length.
     fn serve_raw(
         listener: std::net::TcpListener,
@@ -415,14 +331,16 @@ mod tests {
             parts.first(),
             Some(HttpStreamPart::Head { status, .. }) if *status == http::StatusCode::OK
         ));
-        let body: String = parts
+        let body: Vec<u8> = parts
             .iter()
             .filter_map(|part| match part {
-                HttpStreamPart::Body(text) => Some(text.as_str()),
+                HttpStreamPart::Body(bytes) => Some(bytes.as_ref()),
                 HttpStreamPart::Head { .. } => None,
             })
+            .flatten()
+            .copied()
             .collect();
-        assert_eq!(body, "data: one\n\ndata: two\n\n");
+        assert_eq!(body, b"data: one\n\ndata: two\n\n");
     }
 
     #[tokio::test]

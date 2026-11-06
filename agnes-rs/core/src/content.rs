@@ -75,7 +75,9 @@ impl TryFrom<String> for Content {
             return Err(EmptyError);
         }
         if trimmed.len() == value.len() {
-            // No outer whitespace: move the owned buffer instead of copying.
+            // No outer whitespace to trim, so the text is adopted as-is. Both
+            // branches copy into `ArcColdString`: cold-string cannot take over
+            // the `String` buffer.
             Ok(Self(ArcColdString::from(value)))
         } else {
             Ok(Self(ArcColdString::new(trimmed)))

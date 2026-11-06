@@ -293,7 +293,7 @@ impl SessionLog for SessionFile {
 }
 
 fn encode_line(line: &wire::Line) -> Result<Vec<u8>, SessionError> {
-    let mut bytes = serde_json::to_vec(line).map_err(|err| SessionError::Encode(Box::new(err)))?;
+    let mut bytes = serde_json::to_vec(line).map_err(|err| SessionError::Encode(err.into()))?;
     bytes.push(b'\n');
     Ok(bytes)
 }

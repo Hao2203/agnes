@@ -72,7 +72,7 @@ pub enum LlmError {
         body: ApiBody,
     },
     #[error("could not decode the LLM response")]
-    Decode(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Decode(#[source] anyhow::Error),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }

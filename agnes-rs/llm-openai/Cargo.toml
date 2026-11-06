@@ -9,6 +9,7 @@ license.workspace = true
 agnes-core.workspace = true
 agnes-io.workspace = true
 agnes-util.workspace = true
+bytes.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true

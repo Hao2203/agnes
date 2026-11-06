@@ -69,7 +69,7 @@ impl OpenAiCodec {
             });
         }
         let parsed: wire::ChatCompletionResponse =
-            serde_json::from_str(body).map_err(|err| LlmError::Decode(Box::new(err)))?;
+            serde_json::from_str(body).map_err(|err| LlmError::Decode(err.into()))?;
         parsed.into_core()
     }
 }
