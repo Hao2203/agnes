@@ -24,7 +24,7 @@ pub use activity::{Activity, ActivityPlugin, Phase};
 pub use approval::{ApprovalChannel, ApprovalRequest};
 pub use permission::{PermissionRules, Rule, RuleError};
 pub use runtime::{
-    AgentPlugin, ApprovalDecided, InterruptTurn, PendingTurns, PendingUserMessages,
+    ActiveTurn, AgentPlugin, ApprovalDecided, InterruptTurn, PendingTurns, PendingUserMessages,
     RequestBuilderResource, ToolFinished, ToolsPlugin, TurnFailure, TurnFinished, TurnRequested,
     UserMessage,
 };

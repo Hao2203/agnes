@@ -14,7 +14,9 @@
 //! - `agnes_record::Durability`：会话耐久进度（`agnes-plugin-session`
 //!   安装；缺省视为无会话、无需等待）；
 //! - `agnes_record::Log`：会话日志（本插件兜底初始化；装了
-//!   `agnes-plugin-session` 时由它安装恢复的历史并负责轮转重置）。
+//!   `agnes-plugin-session` 时由它安装恢复的历史并负责轮转重置）；
+//! - [`ActiveTurn`]：turn 实体上的零大小标记，宿主可 `Query<&ActiveTurn>`
+//!   判断是否有 turn 在飞（输入路由用）。
 //!
 //! 宿主经 `RuntimeSender` 注入 [`TurnRequested`] / [`UserMessage`] /
 //! [`ApprovalDecided`] / [`InterruptTurn`]；收场结果经 [`TurnFinished`]
@@ -31,7 +33,7 @@ pub use messages::{
     ApprovalDecided, InterruptTurn, ToolFinished, TurnFailure, TurnFinished, TurnRequested,
     UserMessage,
 };
-pub use state::{PendingTurns, PendingUserMessages};
+pub use state::{ActiveTurn, PendingTurns, PendingUserMessages};
 
 use std::sync::Arc;
 

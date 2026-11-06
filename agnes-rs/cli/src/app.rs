@@ -14,7 +14,8 @@ use agnes_agent::activity::ActivityPlugin;
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
 use agnes_agent::permission::{PermissionRules, Rule};
 use agnes_agent::runtime::{
-    AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnFinished, TurnRequested, UserMessage,
+    ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnFinished, TurnRequested,
+    UserMessage,
 };
 use agnes_agent::tools::builtin_tools;
 use agnes_core::config::{ApiKey, StepBudget, SystemPrompt};
@@ -57,9 +58,12 @@ struct HostConfig {
 }
 
 /// 把用户输入路由进管线：没有活跃 turn 时开新 turn，否则交给注入管线。
+///
+/// `turns` 只匹配带 [`ActiveTurn`] 标记的 turn 实体，不会把世界里的其他实体
+/// 误当成活跃 turn。
 fn dispatch_lines(
     mut lines: MessageReader<TaskLine>,
-    turns: Query<agnes_ecs::Entity>,
+    turns: Query<&ActiveTurn>,
     registry: Res<ToolRegistry>,
     config: Res<HostConfig>,
     mut turn_requests: MessageWriter<TurnRequested>,

@@ -11,6 +11,12 @@ use agnes_ecs::{CancelToken, Entity};
 use agnes_io::llm::LlmCallId;
 use jiff::Timestamp;
 
+/// 活跃 turn 的零大小标记：实体存在即“有 turn 在飞”。
+///
+/// 与 `TurnPhase` / `TurnClock` 在同一次 `spawn_turn` 插入、随 turn 实体一起
+/// despawn；不暴露任何阶段内部结构。宿主用它做输入路由（`Query<&ActiveTurn>`）。
+pub struct ActiveTurn;
+
 /// 驱动侧动态阶段：机器在运行时以枚举持有，阶段本身提示下一步动作。
 ///
 /// `Option` 只是转移机制的实现细节：系统取走阶段值做消耗式转移，结束后

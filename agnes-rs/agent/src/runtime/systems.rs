@@ -31,8 +31,8 @@ use super::messages::{
     UserMessage,
 };
 use super::state::{
-    CallPhase, PendingCalls, PendingTurns, PendingUserMessages, Staged, ToolCallEntry, TurnClock,
-    TurnFailed, TurnPhase,
+    ActiveTurn, CallPhase, PendingCalls, PendingTurns, PendingUserMessages, Staged, ToolCallEntry,
+    TurnClock, TurnFailed, TurnPhase,
 };
 use crate::approval::{ApprovalChannel, ApprovalRequest};
 use crate::permission::PermissionRules;
@@ -175,6 +175,7 @@ fn spawn_turn(commands: &mut Commands, recorder: &mut Recorder, config: &AgentCo
             started_at,
             cancellation: CancelToken::new(),
         },
+        ActiveTurn,
     ));
 }
 

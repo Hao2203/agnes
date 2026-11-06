@@ -14,7 +14,7 @@ use agnes_core::llm::{LlmResponse, StopReason};
 use agnes_core::message::{TokenUsage, ToolArguments, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::tool::{JsonSchema, ToolError, ToolName, ToolSpec};
 use agnes_core::turn::{AgentConfig, Outcome};
-use agnes_ecs::{App, MessageReader, MessageWriter, Res, ResMut, RuntimeSender, Update};
+use agnes_ecs::{App, MessageReader, MessageWriter, Query, Res, ResMut, RuntimeSender, Update};
 use agnes_io::http::TransportError;
 use agnes_io::llm::{LlmCall, LlmCancel, LlmError, LlmProvider, LlmReply};
 use agnes_io::tool::Tool;
@@ -24,7 +24,7 @@ use agnes_util::NonEmpty;
 use async_trait::async_trait;
 
 use super::messages::{ApprovalDecided, InterruptTurn, TurnFinished, TurnRequested};
-use super::{AgentPlugin, RequestBuilderResource, ToolsPlugin};
+use super::{ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin};
 use crate::StandardRequestBuilder;
 use crate::approval::ApprovalChannel;
 use crate::permission::{PermissionRules, Rule};
@@ -287,6 +287,48 @@ async fn a_turn_completes_with_a_final_answer() {
             ..
         })
     ));
+}
+
+#[derive(Default)]
+struct ActiveFlag(bool);
+
+fn track_active(turns: Query<&ActiveTurn>, mut flag: ResMut<ActiveFlag>) {
+    flag.0 = !turns.is_empty();
+}
+
+fn active_turn(app: &App) -> bool {
+    app.world()
+        .resource::<ActiveFlag>()
+        .expect("active flag is installed")
+        .0
+}
+
+#[tokio::test]
+async fn the_active_turn_marker_tracks_the_turn_lifecycle() {
+    let mut app = app(ProviderState::muted());
+    app.insert_resource(ActiveFlag::default());
+    app.add_systems(Update, track_active);
+    let sender = app.runtime_sender();
+    sender
+        .send_message(TurnRequested {
+            config: config("hold"),
+        })
+        .expect("runtime is alive");
+
+    app.pump().expect("schedule runs");
+    assert!(
+        active_turn(&app),
+        "the marker appears while the turn is in flight"
+    );
+
+    sender
+        .send_message(InterruptTurn)
+        .expect("runtime is alive");
+    app.pump().expect("schedule runs");
+    assert!(
+        !active_turn(&app),
+        "the marker disappears when the turn closes"
+    );
 }
 
 #[tokio::test]

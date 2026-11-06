@@ -49,6 +49,10 @@ impl<T: Component> QueryData for &mut T {
     }
 }
 
+/// `Entity` matches every live entity, with or without components.
+///
+/// It is not a component-existence filter: to target a kind of entity, query
+/// its component (`Query<&T>`) or add a [`With`] filter.
 impl QueryData for Entity {
     type Item<'w> = Entity;
 
