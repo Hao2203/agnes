@@ -9,6 +9,10 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 ## 特性
 
+- 模型响应全程流式：OpenAI SSE 增量到达即解码，文本实时输出；工具调用与
+  usage 在流尾组装成完整的 `LlmReply`，状态机与日志格式不变
+- 交互式会话默认使用 ratatui TUI：消息区、审批区、输入框与状态栏，实时
+  显示 step、输入/输出 token、会话累计用量与耗时；`--plain` 可回到行式输出
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
   `turn_end`）由系统管线按序铸造并记入 `Log`；core 只持有领域状态
@@ -61,22 +65,28 @@ echo "列出所有 TODO 注释" | agnes run
 
 ### 交互式会话
 
-不指定子命令时默认进入 `chat`：
+不指定子命令时默认进入 `chat`。stdin 与 stdout 都是终端时使用 ratatui
+TUI（消息区、输入框、状态栏），否则退回行式输出；`--plain` 强制行式输出：
 
 ```bash
 agnes chat
+agnes chat --plain
 ```
 
-```text
-$ agnes chat
-agnes> 列出仓库里的所有 crate
-...
-agnes> /new
-(session cleared)
-agnes> exit
-```
+TUI 中：
 
-会话中每一行都是一个任务，且共享完整会话记忆：
+- `Enter` 提交任务；`↑`/`↓` 翻输入历史
+- `PageUp`/`PageDown` 或鼠标滚轮查看历史；`Ctrl-Home` 到顶部，`End` 回到
+  尾部并跟随新输出
+- 恢复 `--session` 时，历史会话会铺进消息区；滚动离开尾部时状态栏显示
+  剩余行数
+- 鼠标拖选消息区会高亮选中内容，松开后自动通过 OSC 52 复制到剪贴板；
+  终端不支持 OSC 52 时，可 `Shift`+拖选使用终端原生复制
+- `Ctrl-C` 运行中打断任务，空闲时退出；`Ctrl-D` 退出
+- 需要审批时，审批区显示问题；`y` / `n` / `a` 直接作答，或输入完整答复后回车
+- 状态栏实时显示模型、step、当前步与累计 token、耗时
+
+行式模式下会话中每一行都是一个任务，且共享完整会话记忆：
 
 带 `--session` 时会话落盘，重启后用同一路径即可恢复（崩溃留下的未收尾
 事件会被自动补写）：
@@ -107,6 +117,7 @@ agnes chat --session ./notes/session.jsonl
 | `--allow-shell` | 关闭 | 向模型提供 `run_shell` 工具 |
 | `--session <PATH>` | 关闭 | chat/run 的会话文件：存在即恢复，不存在即新建 |
 | `--yes` | 关闭 | 自动批准 ask 规则（审批审计仍会落盘） |
+| `--plain` | 关闭 | 禁用 TUI，使用行式输出（非 TTY 环境自动生效） |
 | `--deny <TOOL>` | 无 | 拒绝工具：`name` 精确匹配，`prefix*` 前缀匹配，可重复 |
 
 默认策略：`run_shell`（仅在启用 `--allow-shell` 时）每次执行前在终端询问
@@ -146,17 +157,17 @@ agnes chat --session ./notes/session.jsonl
 | `agnes-core` | 纯领域模型与类型状态机（`Agent` + `Turn`），无 I/O、无异步、不含序列化、不产出事件 |
 | `agnes-ecs` | 独立的轻量系统编排运行时：资源、实体、消息总线、事件循环（`App` + `Plugin`），不含具体异步运行时 |
 | `agnes-record` | 记录词汇与会话状态：`Event` / `HostEvent` / `RunEvent`、`Log`、`Durability`，以及 `SessionLog` / `SessionStore` 端口（零 ecs 依赖） |
-| `agnes-io` | 异步端口 trait（`Tool`、`HttpTransport`）与模型调用词汇（`LlmCall` / `LlmReply` / `LlmCancel` / `LlmProvider`） |
-| `agnes-llm-openai` | OpenAI Chat Completions 纯编解码器（`OpenAiCodec`：请求编码、响应解码，无 I/O） |
-| `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器 |
+| `agnes-io` | 异步端口 trait（`Tool`、`HttpTransport`）与模型调用词汇（`LlmCall` / `LlmReply` / `LlmCancel` / `LlmStreamEvent` / `LlmProvider`） |
+| `agnes-llm-openai` | OpenAI Chat Completions 纯编解码器（`OpenAiCodec` 请求/响应，`OpenAiStreamDecoder` SSE 增量解码，无 I/O） |
+| `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器，支持逐块读取与跨块 UTF-8 拼接 |
 | `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写；线格式（wire）定义在此 |
 | `agnes-plugin-async` | 异步任务执行：`TokioPlugin` / `ExecutorPlugin` 两个插件各自装 `AsyncExecutor`，任务直接交给具体运行时 |
-| `agnes-plugin-http` | ECS 原生 HTTP 能力：`HttpRequest` / `HttpResponse` / `HttpCancel` 消息、发号器 `HttpClient`、在飞表与取消、关停时统一取消 |
-| `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成 `HttpRequest`，`HttpResponse` 解码回 `LlmReply`；装 `LlmProvider` 标记 |
+| `agnes-plugin-http` | ECS 原生 HTTP 能力：`HttpRequest` / `HttpResponse` / `HttpStreamRequest` / `HttpStreamEvent` / `HttpStreamEnd` / `HttpCancel` 消息、发号器 `HttpClient`、在飞表与取消、关停时统一取消 |
+| `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成流式请求，SSE 增量解码并转发 `LlmStreamEvent`，流尾解码回 `LlmReply`；装 `LlmProvider` 标记 |
 | `agnes-plugin-session` | 会话状态与策略：`Log`、`Durability`、序号、`RunEvent` 转发、flush 确认、轮转；不碰文件 |
 | `agnes-plugin-session-file` | 会话持久化：把打开的 `SessionFile` 装成 `SessionStoreResource`，拥有文件句柄、兄弟文件名与重开 |
-| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate；工具注册、权限规则与审批通道 |
-| `agnes-cli` | 二进制 `agnes`：装配 `App`、stdin/审批/Ctrl-C 宿主任务、独立写线程的终端渲染 |
+| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate；工具注册、权限规则与审批通道。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时），只读、不落盘 |
+| `agnes-cli` | 二进制 `agnes`：装配 `App`、stdin/审批/Ctrl-C 宿主任务、独立线程的 plain/ratatui 渲染与输入 |
 
 `agnes-transport-reqwest`、`agnes-llm-openai` 与 `agnes-session-file` 是纯
 适配器；`plugin-async` / `plugin-http` / `plugin-openai` / `plugin-session` /
@@ -168,10 +179,14 @@ agnes chat --session ./notes/session.jsonl
 只需在 `run_async` 之前加入（资源在每 tick 解析）。
 
 模型调用是一条纯消息链：运行时写 `LlmCall` → provider 桥编码成
-`HttpRequest` → HTTP 能力执行并回 `HttpResponse` → 桥解码成 `LlmReply` →
-运行时推进状态机。每跳一条消息即一个 tick；`drain` 会连续推进相邻 tick，
-所以可感延迟趋近于零，而运行时与网络彻底解耦（打断经 `LlmCancel` /
-`HttpCancel` 取消请求，取消总会闭环成一条 `LlmReply`）。
+`HttpStreamRequest` → HTTP 能力执行并回 `HttpStreamEvent`（响应头 + 逐块
+body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组装成
+`LlmReply` → 运行时推进状态机。每跳一条消息即一个 tick；`drain` 会连续
+推进相邻 tick，所以可感延迟趋近于零，而运行时与网络彻底解耦（打断经
+`LlmCancel` / `HttpCancel` 取消请求，取消总会闭环成一条 `LlmReply`）。
+流式增量是观察词汇：状态机只消费完整 `LlmReply`；`ActivityPlugin` 把
+`RunEvent` 与 `LlmStreamEvent` 投影成 `Activity`（阶段、step、用量、耗时），
+渲染系统只读这份快照并输出文本增量。`Activity` 是派生状态，不落盘。
 
 ### 关键设计
 
@@ -211,6 +226,10 @@ agnes chat --session ./notes/session.jsonl
   下一轮从日志继续。
   工具集变化在下一个模型调用前记一条新 header，
   同一 turn 内生效；在飞调用不受影响。
+- **实时状态是派生的**：`ActivityPlugin` 只从 `RunEvent` 与
+  `LlmStreamEvent` 投影出 `Activity`（阶段、step、当前/累计用量、耗时），
+  从不写入 `Log`；session 仍只持有日志与耐久，plain/TUI 渲染只读同一份
+  快照，不各自计数。
 - **日志耐久**：每个上报事件先入内存日志、再作为 `RunEvent` 镜像发出；
   `agnes-plugin-session` 把会话相关的事件按序转发给常驻 writer 任务（经
   `SessionStore` 端口；`agnes-plugin-session-file` 提供文件实现，无 store

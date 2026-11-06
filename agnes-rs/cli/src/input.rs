@@ -81,11 +81,11 @@ impl UserInput {
         }
     }
 
-    fn is_answering(&self) -> bool {
+    pub(crate) fn is_answering(&self) -> bool {
         self.answering.load(Ordering::Acquire)
     }
 
-    fn push_answer(&self, line: String) {
+    pub(crate) fn push_answer(&self, line: String) {
         lock(&self.answers).push_back(line);
         self.answer_wake.notify_one();
     }
@@ -191,7 +191,7 @@ pub fn spawn_ctrl_c(input: Arc<UserInput>, channels: Arc<HostChannels>) -> JoinH
 }
 
 /// Maps one raw line to a [`Line`], or `None` for blank lines.
-fn classify(line: &str) -> Option<Line> {
+pub(crate) fn classify(line: &str) -> Option<Line> {
     let trimmed = line.trim();
     match trimmed {
         "" => None,

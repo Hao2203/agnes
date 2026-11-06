@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod input;
 mod render;
+mod ui;
 
 use std::process::ExitCode;
 use std::time::Duration;

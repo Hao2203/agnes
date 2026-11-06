@@ -13,12 +13,14 @@
 //! 异步任务由宿主安装的 `agnes_plugin_async::TokioPlugin`（或
 //! `ExecutorPlugin`）提供，运行时选择与本 crate 无关。
 
+pub mod activity;
 pub mod approval;
 pub mod permission;
 
 pub mod runtime;
 pub mod tools;
 
+pub use activity::{Activity, ActivityPlugin, Phase};
 pub use approval::{ApprovalChannel, ApprovalRequest};
 pub use permission::{PermissionRules, Rule, RuleError};
 pub use runtime::{

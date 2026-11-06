@@ -39,6 +39,22 @@ pub enum TransportError {
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// One part of a streamed response, in arrival order.
+///
+/// The head always comes first (when the transport has one); body parts follow
+/// as the peer produces them. Parts are UTF-8 text: a transport never splits a
+/// multi-byte sequence across two parts.
+#[derive(Debug)]
+pub enum HttpStreamPart {
+    /// The status line and response headers.
+    Head {
+        status: http::StatusCode,
+        headers: http::HeaderMap,
+    },
+    /// One body chunk.
+    Body(String),
+}
+
 /// Sends a request and returns the raw response with *any* status code;
 /// deciding what a status means is the provider's job, not the transport's.
 #[async_trait]
@@ -47,6 +63,34 @@ pub trait HttpTransport: Send + Sync {
         &self,
         request: http::Request<String>,
     ) -> Result<http::Response<String>, TransportError>;
+
+    /// Sends a request and pushes the response to `sink` as it arrives.
+    ///
+    /// The default implementation buffers through [`Self::send`] and delivers
+    /// the whole body as one part. Transports that can read incrementally
+    /// override it; a caller always sees at least the head (when the peer
+    /// answered at all) and then zero or more body parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same transport failures as [`Self::send`], including
+    /// [`TransportError::InvalidUtf8`] when the body is not valid UTF-8.
+    async fn send_stream(
+        &self,
+        request: http::Request<String>,
+        sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+    ) -> Result<(), TransportError> {
+        let response = self.send(request).await?;
+        let (parts, body) = response.into_parts();
+        sink(HttpStreamPart::Head {
+            status: parts.status,
+            headers: parts.headers,
+        });
+        if !body.is_empty() {
+            sink(HttpStreamPart::Body(body));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -57,6 +101,14 @@ impl<T: HttpTransport + ?Sized> HttpTransport for Arc<T> {
     ) -> Result<http::Response<String>, TransportError> {
         (**self).send(request).await
     }
+
+    async fn send_stream(
+        &self,
+        request: http::Request<String>,
+        sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+    ) -> Result<(), TransportError> {
+        (**self).send_stream(request, sink).await
+    }
 }
 
 #[async_trait]
@@ -66,6 +118,14 @@ impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
         request: http::Request<String>,
     ) -> Result<http::Response<String>, TransportError> {
         (**self).send(request).await
+    }
+
+    async fn send_stream(
+        &self,
+        request: http::Request<String>,
+        sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+    ) -> Result<(), TransportError> {
+        (**self).send_stream(request, sink).await
     }
 }
 
@@ -128,6 +188,72 @@ fn redacted_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BufferedTransport;
+
+    #[async_trait]
+    impl HttpTransport for BufferedTransport {
+        async fn send(
+            &self,
+            _request: http::Request<String>,
+        ) -> Result<http::Response<String>, TransportError> {
+            Ok(http::Response::builder()
+                .status(201)
+                .header("x-test", "yes")
+                .body("body".to_owned())
+                .expect("static response is valid"))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_stream_buffers_the_whole_body() {
+        let request = http::Request::builder()
+            .uri("https://example.com")
+            .body(String::new())
+            .unwrap();
+        let mut parts = Vec::new();
+        BufferedTransport
+            .send_stream(request, &mut |part| parts.push(part))
+            .await
+            .unwrap();
+
+        assert_eq!(parts.len(), 2);
+        match &parts[0] {
+            HttpStreamPart::Head { status, headers } => {
+                assert_eq!(*status, http::StatusCode::CREATED);
+                assert_eq!(headers.get("x-test").unwrap(), "yes");
+            }
+            HttpStreamPart::Body(_) => panic!("expected the head first"),
+        }
+        assert!(matches!(&parts[1], HttpStreamPart::Body(body) if body == "body"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_delivers_only_the_head() {
+        struct Empty;
+        #[async_trait]
+        impl HttpTransport for Empty {
+            async fn send(
+                &self,
+                _request: http::Request<String>,
+            ) -> Result<http::Response<String>, TransportError> {
+                Ok(http::Response::builder()
+                    .body(String::new())
+                    .expect("static response is valid"))
+            }
+        }
+
+        let request = http::Request::builder()
+            .uri("https://example.com")
+            .body(String::new())
+            .unwrap();
+        let mut parts = Vec::new();
+        Empty
+            .send_stream(request, &mut |part| parts.push(part))
+            .await
+            .unwrap();
+        assert!(matches!(&parts[..], [HttpStreamPart::Head { .. }]));
+    }
 
     #[test]
     fn redacted_debug_masks_authorization() {

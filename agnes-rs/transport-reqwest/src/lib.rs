@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use agnes_io::http::{HttpTransport, TransportError};
+use agnes_io::http::{HttpStreamPart, HttpTransport, TransportError};
 use async_trait::async_trait;
 
 /// Hard cap on one response body; a runaway or hostile peer must not be able
@@ -33,21 +33,28 @@ impl ReqwestTransport {
     }
 }
 
+impl ReqwestTransport {
+    fn begin(&self, request: http::Request<String>) -> reqwest::RequestBuilder {
+        let (parts, body) = request.into_parts();
+        let builder = self
+            .client
+            .request(parts.method, parts.uri.to_string())
+            .headers(parts.headers);
+        if body.is_empty() {
+            builder
+        } else {
+            builder.body(body)
+        }
+    }
+}
+
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn send(
         &self,
         request: http::Request<String>,
     ) -> Result<http::Response<String>, TransportError> {
-        let (parts, body) = request.into_parts();
-        let mut builder = self
-            .client
-            .request(parts.method, parts.uri.to_string())
-            .headers(parts.headers);
-        if !body.is_empty() {
-            builder = builder.body(body);
-        }
-        let mut response = builder.send().await.map_err(transport_error)?;
+        let mut response = self.begin(request).send().await.map_err(transport_error)?;
         if let Some(length) = response.content_length()
             && length > MAX_BODY_BYTES
         {
@@ -74,6 +81,88 @@ impl HttpTransport for ReqwestTransport {
         }
         let body = std::str::from_utf8(&bytes)?.to_owned();
         builder.body(body).map_err(TransportError::Request)
+    }
+
+    async fn send_stream(
+        &self,
+        request: http::Request<String>,
+        sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+    ) -> Result<(), TransportError> {
+        let mut response = self.begin(request).send().await.map_err(transport_error)?;
+        if let Some(length) = response.content_length()
+            && length > MAX_BODY_BYTES
+        {
+            return Err(body_too_large());
+        }
+
+        sink(HttpStreamPart::Head {
+            status: response.status(),
+            headers: response.headers().clone(),
+        });
+
+        let mut utf8 = Utf8Stream::default();
+        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+            if let Some(text) = utf8.push(&chunk)? {
+                sink(HttpStreamPart::Body(text));
+            }
+        }
+        if let Some(text) = utf8.finish()? {
+            sink(HttpStreamPart::Body(text));
+        }
+        Ok(())
+    }
+}
+
+/// Decodes a byte stream that may split multi-byte UTF-8 sequences across
+/// chunk boundaries. Complete text is emitted as soon as it is valid; an
+/// incomplete tail waits for the next chunk, and anything still incomplete at
+/// the end is a protocol error rather than replacement characters.
+#[derive(Default)]
+struct Utf8Stream {
+    pending: Vec<u8>,
+    total: u64,
+}
+
+impl Utf8Stream {
+    fn push(&mut self, bytes: &[u8]) -> Result<Option<String>, TransportError> {
+        self.total = self
+            .total
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if self.total > MAX_BODY_BYTES {
+            return Err(body_too_large());
+        }
+        self.pending.extend_from_slice(bytes);
+
+        let mut out = String::new();
+        match std::str::from_utf8(&self.pending) {
+            Ok(text) => {
+                out.push_str(text);
+                self.pending.clear();
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let prefix = std::str::from_utf8(&self.pending[..valid])
+                        .expect("the prefix up to valid_up_to is valid");
+                    out.push_str(prefix);
+                    self.pending.drain(..valid);
+                }
+                if error.error_len().is_some() {
+                    return Err(TransportError::InvalidUtf8(error));
+                }
+                // Only an incomplete sequence at the tail: wait for more.
+            }
+        }
+        Ok((!out.is_empty()).then_some(out))
+    }
+
+    fn finish(self) -> Result<Option<String>, TransportError> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        Err(TransportError::InvalidUtf8(
+            std::str::from_utf8(&self.pending).expect_err("the tail is incomplete UTF-8"),
+        ))
     }
 }
 
@@ -236,6 +325,104 @@ mod tests {
 
         server.join().unwrap();
         assert!(matches!(err, TransportError::InvalidUtf8(_)));
+    }
+
+    #[test]
+    fn a_utf8_sequence_split_across_chunks_is_reassembled() {
+        let text = "aé中";
+        let bytes = text.as_bytes();
+        let mut stream = Utf8Stream::default();
+        // "a" + the first byte of "é"
+        assert_eq!(stream.push(&bytes[..2]).unwrap().as_deref(), Some("a"));
+        // the second byte of "é"
+        assert_eq!(stream.push(&bytes[2..3]).unwrap().as_deref(), Some("é"));
+        // "中" in full
+        assert_eq!(stream.push(&bytes[3..]).unwrap().as_deref(), Some("中"));
+        assert!(stream.finish().unwrap().is_none());
+    }
+
+    #[test]
+    fn an_incomplete_or_invalid_utf8_tail_is_rejected() {
+        let mut stream = Utf8Stream::default();
+        assert!(stream.push(&[0xC3]).unwrap().is_none());
+        assert!(matches!(
+            stream.finish().unwrap_err(),
+            TransportError::InvalidUtf8(_)
+        ));
+
+        let mut stream = Utf8Stream::default();
+        assert!(matches!(
+            stream.push(&[0xFF]).unwrap_err(),
+            TransportError::InvalidUtf8(_)
+        ));
+    }
+
+    /// Serves one response and closes, without a content length.
+    fn serve_raw(
+        listener: std::net::TcpListener,
+        response: Vec<u8>,
+    ) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).expect("read request");
+                assert!(n > 0, "client closed early");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end + 4]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().expect("content-length"))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + content_length {
+                        stream.write_all(&response).expect("write response");
+                        return String::from_utf8_lossy(&buf[end + 4..]).into_owned();
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_streamed_response_delivers_the_head_and_body_parts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = serve_raw(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+              data: one\n\ndata: two\n\n"
+                .to_vec(),
+        );
+
+        let mut parts = Vec::new();
+        test_transport()
+            .send_stream(post(url, "{}"), &mut |part| parts.push(part))
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(matches!(
+            parts.first(),
+            Some(HttpStreamPart::Head { status, .. }) if *status == http::StatusCode::OK
+        ));
+        let body: String = parts
+            .iter()
+            .filter_map(|part| match part {
+                HttpStreamPart::Body(text) => Some(text.as_str()),
+                HttpStreamPart::Head { .. } => None,
+            })
+            .collect();
+        assert_eq!(body, "data: one\n\ndata: two\n\n");
     }
 
     #[tokio::test]

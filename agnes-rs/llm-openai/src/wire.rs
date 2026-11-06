@@ -10,15 +10,24 @@ use agnes_io::llm::{LlmError, ProtocolError};
 use agnes_util::NonEmpty;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
-/// `POST /chat/completions` request body.
+/// `POST /chat/completions` request body. Every request asks for a stream;
+/// `include_usage` makes the provider report token usage in its final chunk.
 #[derive(Debug, serde::Serialize)]
 pub struct ChatCompletionRequest {
     model: String,
     messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
+    stream: bool,
+    stream_options: StreamOptions,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 impl ChatCompletionRequest {
@@ -37,6 +46,10 @@ impl ChatCompletionRequest {
                 .iter()
                 .map(WireTool::from_core)
                 .collect(),
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         }
     }
 }
@@ -281,6 +294,211 @@ fn optional_content(raw: Option<String>) -> Result<Option<Content>, LlmError> {
     }
 }
 
+/// One incremental update produced while decoding a streamed response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    /// Assistant text produced by this update.
+    Text(String),
+    /// The provider reported usage for the whole response.
+    Usage(TokenUsage),
+}
+
+/// Incremental decoder for the OpenAI chat-completions SSE stream.
+///
+/// Text deltas are emitted as they arrive; tool calls and the finish reason
+/// are accumulated until [`OpenAiStreamDecoder::finish`] validates them with
+/// the same rules as a buffered response.
+#[derive(Debug, Default)]
+pub struct OpenAiStreamDecoder {
+    buffer: String,
+    content: String,
+    tool_calls: BTreeMap<u32, AccumulatedToolCall>,
+    finish_reason: Option<WireFinishReason>,
+    usage: Option<TokenUsage>,
+    done: bool,
+}
+
+#[derive(Debug, Default)]
+struct AccumulatedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl OpenAiStreamDecoder {
+    /// Creates a decoder positioned before the first event.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one UTF-8 body chunk and returns the updates it completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Decode`] when a `data:` line is not valid JSON for
+    /// the chunk shape.
+    pub fn feed(&mut self, chunk: &str) -> Result<Vec<StreamDelta>, LlmError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        self.buffer.push_str(chunk);
+        let mut deltas = Vec::new();
+        while let Some(end) = self.buffer.find('\n') {
+            let line = self.buffer[..end].trim_end_matches('\r').to_owned();
+            self.buffer.drain(..=end);
+            self.handle_line(&line, &mut deltas)?;
+        }
+        Ok(deltas)
+    }
+
+    /// Validates the accumulated response.
+    ///
+    /// A final event without a trailing newline is still processed. The
+    /// response must carry a finish reason; text, calls and usage follow the
+    /// same rules as [`OpenAiCodec::parse_response`](crate::OpenAiCodec::parse_response).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Decode`] for malformed JSON and [`LlmError::Protocol`]
+    /// for a stream that does not describe a legal completion.
+    pub fn finish(mut self) -> Result<LlmResponse, LlmError> {
+        if !self.done {
+            let tail = std::mem::take(&mut self.buffer);
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                let mut deltas = Vec::new();
+                self.handle_line(tail, &mut deltas)?;
+            }
+        }
+        let choice = WireChoice {
+            message: WireAssistantMessage {
+                content: (!self.content.is_empty()).then_some(self.content),
+                tool_calls: self
+                    .tool_calls
+                    .into_values()
+                    .map(|call| WireToolCallOut {
+                        id: call.id,
+                        function: WireFunctionOut {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                    })
+                    .collect(),
+            },
+            finish_reason: self.finish_reason,
+        };
+        ChatCompletionResponse {
+            choices: vec![choice],
+            usage: self.usage.map(|usage| WireUsage {
+                prompt_tokens: usage.input,
+                completion_tokens: usage.output,
+            }),
+        }
+        .into_core()
+    }
+
+    fn handle_line(&mut self, line: &str, deltas: &mut Vec<StreamDelta>) -> Result<(), LlmError> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            return Ok(());
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(());
+        };
+        let data = data.strip_prefix(' ').unwrap_or(data);
+        if data == "[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let chunk: ChatCompletionChunk =
+            serde_json::from_str(data).map_err(|err| LlmError::Decode(Box::new(err)))?;
+
+        if let Some(usage) = chunk.usage {
+            let usage = TokenUsage {
+                input: usage.prompt_tokens,
+                output: usage.completion_tokens,
+            };
+            self.usage = Some(usage);
+            deltas.push(StreamDelta::Usage(usage));
+        }
+
+        for choice in chunk.choices {
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
+            if let Some(content) = choice.delta.content
+                && !content.is_empty()
+            {
+                self.content.push_str(&content);
+                deltas.push(StreamDelta::Text(content));
+            }
+            for call in choice.delta.tool_calls {
+                let slot = self.tool_calls.entry(call.index).or_default();
+                if let Some(id) = call.id
+                    && !id.is_empty()
+                {
+                    slot.id = id;
+                }
+                if let Some(function) = call.function {
+                    if let Some(name) = function.name {
+                        slot.name.push_str(&name);
+                    }
+                    if let Some(arguments) = function.arguments {
+                        slot.arguments.push_str(&arguments);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One `data:` event of the chat-completions stream.
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChunk {
+    #[serde(default)]
+    choices: Vec<WireChunkChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireChunkChoice {
+    #[serde(default)]
+    delta: WireDelta,
+    #[serde(default)]
+    finish_reason: Option<WireFinishReason>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WireDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<WireToolCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireToolCallDelta {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<WireFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
 /// Extracts a human-readable detail from an error body, tolerating arbitrary
 /// shapes across OpenAI-compatible servers.
 pub fn extract_error_body(body: &str) -> String {
@@ -354,6 +572,116 @@ mod tests {
         assert!(object.get("tools").is_none());
         assert_eq!(object["messages"][0]["role"], "system");
         assert_eq!(object["messages"][1]["role"], "user");
+        assert_eq!(object["stream"], true);
+        assert_eq!(object["stream_options"]["include_usage"], true);
+    }
+
+    fn decoder() -> OpenAiStreamDecoder {
+        OpenAiStreamDecoder::new()
+    }
+
+    #[test]
+    fn a_stream_yields_text_and_usage_then_the_validated_response() {
+        let mut decoder = decoder();
+        let deltas = decoder
+            .feed(concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+                "data: [DONE]\n\n",
+            ))
+            .unwrap();
+        assert_eq!(
+            deltas,
+            vec![
+                StreamDelta::Text("Hel".to_owned()),
+                StreamDelta::Text("lo".to_owned()),
+                StreamDelta::Usage(TokenUsage {
+                    input: 3,
+                    output: 2
+                }),
+            ]
+        );
+
+        let response = decoder.finish().unwrap();
+        assert_eq!(
+            response.stop_reason,
+            StopReason::Completed {
+                content: content("Hello")
+            }
+        );
+        assert_eq!(
+            response.usage,
+            TokenUsage {
+                input: 3,
+                output: 2
+            }
+        );
+    }
+
+    #[test]
+    fn stream_framing_survives_arbitrary_chunk_boundaries() {
+        let mut decoder = decoder();
+        assert!(decoder.feed("data: {\"choi").unwrap().is_empty());
+        let deltas = decoder
+            .feed(concat!(
+                "ces\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n",
+                "\ndata: [DONE]\n\n",
+            ))
+            .unwrap();
+        assert_eq!(deltas, vec![StreamDelta::Text("hi".to_owned())]);
+        let response = decoder.finish().unwrap();
+        assert_eq!(
+            response.stop_reason,
+            StopReason::Completed {
+                content: content("hi")
+            }
+        );
+    }
+
+    #[test]
+    fn streamed_tool_calls_are_accumulated() {
+        let mut decoder = decoder();
+        decoder
+            .feed(concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+                "\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+                "\"function\":{\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ))
+            .unwrap();
+        let response = decoder.finish().unwrap();
+        let StopReason::ToolUse { content, calls } = &response.stop_reason else {
+            panic!("expected ToolUse");
+        };
+        assert!(content.is_none());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.first().id.as_str(), "call_1");
+        assert_eq!(calls.first().name.as_str(), "read_file");
+        assert_eq!(calls.first().arguments.as_str(), r#"{"path":"x"}"#);
+    }
+
+    #[test]
+    fn a_stream_without_a_finish_reason_is_malformed() {
+        let mut decoder = decoder();
+        decoder
+            .feed("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+            .unwrap();
+        assert!(matches!(
+            decoder.finish(),
+            Err(LlmError::Protocol(ProtocolError::MissingFinishReason))
+        ));
+    }
+
+    #[test]
+    fn malformed_stream_json_is_a_decode_error() {
+        let mut decoder = decoder();
+        assert!(matches!(
+            decoder.feed("data: not json\n\n"),
+            Err(LlmError::Decode(_))
+        ));
     }
 
     #[test]

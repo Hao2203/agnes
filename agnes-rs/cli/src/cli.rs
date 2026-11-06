@@ -49,6 +49,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub yes: bool,
 
+    /// Print plain lines instead of the TUI (also implied without a TTY)
+    #[arg(long, global = true)]
+    pub plain: bool,
+
     /// Deny a tool by exact name, or by prefix with a trailing `*` (repeatable)
     #[arg(long = "deny", global = true, value_name = "TOOL")]
     pub deny: Vec<Rule>,

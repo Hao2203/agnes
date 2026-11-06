@@ -4,8 +4,9 @@
 //! ([`tool::Tool`]) and raw HTTP ([`http::HttpTransport`]), plus the
 //! installable handle ([`http::HttpTransportResource`]) that plugins mount
 //! into an ECS world. Model calls travel as messages instead
-//! ([`llm::LlmCall`] / [`llm::LlmReply`]), with the codec in
-//! `agnes-llm-openai` and the round trip in `agnes-plugin-http`. Seams are
+//! ([`llm::LlmCall`] / [`llm::LlmReply`]), with observation-only
+//! [`llm::LlmStreamEvent`]s while the response streams in; the codec lives in
+//! `agnes-llm-openai` and the round trip in `agnes-plugin-openai`. Seams are
 //! async and `Send`; most are also `Sync`. Swapping runtimes means swapping
 //! the implementations (see `agnes-transport-reqwest`), never `agnes-core`.
 //!

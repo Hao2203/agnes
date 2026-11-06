@@ -1,107 +1,157 @@
-//! 输出层：所有 stdout 写入都交给一个独立线程，异步任务从不阻塞在终端上。
-//! [`RendererPlugin`] 把 [`RunEvent`] 流渲染成行，并在 turn 收场时打印
-//! 摘要、把没生效的用户消息还给输入队列。
+//! 渲染层：[`Renderer`] 句柄、渲染系统，以及从 `Activity` / `RunEvent`
+//! 到输出命令的投影。
+//!
+//! 实时统计属于 `agnes-agent` 的 [`Activity`]；本模块只读快照并决定怎么画，
+//! 具体终端 I/O 在 [`crate::ui`] 的 plain/TUI 后端线程里完成。turn 收场摘要
+//! 等落盘确认之后才打印：否则退出可能抢掉最后一批事件。
 
-use std::io::{BufWriter, Write};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
+use agnes_agent::activity::{Activity, Phase};
 use agnes_agent::runtime::{PendingUserMessages, TurnFinished};
+#[cfg(test)]
 use agnes_core::config::ModelName;
 use agnes_core::llm::StopKind;
 use agnes_core::message::{AssistantMessage, Message};
 use agnes_core::turn::Outcome;
-use agnes_ecs::{App, MessageReader, Plugin, Res, ResMut, RuntimeSender, Update};
+use agnes_ecs::{App, CancelToken, MessageReader, Plugin, Res, ResMut, RuntimeSender, Update};
+use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate};
 use agnes_plugin_async::AsyncExecutor;
 use agnes_record::{Event as RecordEvent, Log, RunEvent};
 use jiff::Timestamp;
 
-enum RenderCommand {
-    Line(String),
-    Prompt(String),
-    Flush,
-    Shutdown,
-}
+use crate::input::UserInput;
+pub use crate::ui::Status;
+use crate::ui::{UiCommand, plain, tui};
 
 struct RendererInner {
-    tx: std_mpsc::Sender<RenderCommand>,
-    writer: Mutex<Option<JoinHandle<()>>>,
+    tx: std_mpsc::Sender<UiCommand>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// A cloneable handle to the stdout writer thread.
+/// A cloneable handle to the terminal backend.
 #[derive(Clone)]
 pub struct Renderer {
     inner: Arc<RendererInner>,
 }
 
 impl Renderer {
-    pub fn new() -> std::io::Result<Self> {
-        let (tx, rx) = std_mpsc::channel::<RenderCommand>();
-        let writer = thread::Builder::new()
+    /// Starts the line-based backend (pipes, non-TTY, `agnes run`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the thread spawn error.
+    pub fn plain() -> std::io::Result<Self> {
+        let (tx, rx) = std_mpsc::channel();
+        let worker = thread::Builder::new()
             .name("agnes-render".into())
-            .spawn(move || {
-                let stdout = std::io::stdout();
-                let mut out = BufWriter::new(stdout.lock());
-                while let Ok(command) = rx.recv() {
-                    match command {
-                        RenderCommand::Line(line) => {
-                            let _ = out.write_all(line.as_bytes());
-                            let _ = out.write_all(b"\n");
-                            let _ = out.flush();
-                        }
-                        RenderCommand::Prompt(prompt) => {
-                            let _ = out.write_all(prompt.as_bytes());
-                            let _ = out.flush();
-                        }
-                        RenderCommand::Flush => {
-                            let _ = out.flush();
-                        }
-                        RenderCommand::Shutdown => {
-                            let _ = out.flush();
-                            break;
-                        }
-                    }
-                }
-            })?;
+            .spawn(move || plain::run(rx))?;
         Ok(Self {
             inner: Arc::new(RendererInner {
                 tx,
-                writer: Mutex::new(Some(writer)),
+                worker: Mutex::new(Some(worker)),
             }),
         })
     }
 
+    /// Starts the ratatui backend and its input loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the thread spawn error; the terminal itself is initialized on
+    /// the worker thread so a failed setup never leaves the host in raw mode.
+    pub fn tui(
+        input: Arc<UserInput>,
+        sender: RuntimeSender,
+        shutdown: CancelToken,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = std_mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("agnes-tui".into())
+            .spawn(move || tui::run(rx, input, sender, shutdown))?;
+        Ok(Self {
+            inner: Arc::new(RendererInner {
+                tx,
+                worker: Mutex::new(Some(worker)),
+            }),
+        })
+    }
+
+    /// Appends one line to the transcript.
     pub fn line(&self, text: impl Into<String>) {
-        let _ = self.inner.tx.send(RenderCommand::Line(text.into()));
+        let _ = self.inner.tx.send(UiCommand::Line(text.into()));
     }
 
+    /// Shows a plain-mode prompt. The TUI has a permanent input box, so this
+    /// only marks the frontend as idle.
     pub fn prompt(&self, text: impl Into<String>) {
-        let _ = self.inner.tx.send(RenderCommand::Prompt(text.into()));
+        let _ = self.inner.tx.send(UiCommand::Prompt(text.into()));
     }
 
+    /// Starts (or restarts) the live stream buffer.
+    pub fn stream_start(&self) {
+        let _ = self.inner.tx.send(UiCommand::StreamStart);
+    }
+
+    /// Appends streamed assistant text.
+    pub fn stream_delta(&self, text: &str) {
+        let _ = self.inner.tx.send(UiCommand::StreamDelta(text.to_owned()));
+    }
+
+    /// Ends the live stream buffer.
+    pub fn stream_end(&self) {
+        let _ = self.inner.tx.send(UiCommand::StreamEnd);
+    }
+
+    /// Commits the authoritative assistant message: plain mode prints it only
+    /// when nothing was streamed; the TUI replaces the live buffer with it.
+    pub fn commit_assistant(&self, text: &str) {
+        let _ = self
+            .inner
+            .tx
+            .send(UiCommand::CommitAssistant(text.to_owned()));
+    }
+
+    /// Reports one finished step's token usage (plain prints a line; the TUI
+    /// also gets the fresh `Activity` snapshot from `render`).
+    pub fn step_stats(&self, step: u32, usage: agnes_core::message::TokenUsage) {
+        let _ = self.inner.tx.send(UiCommand::StepStats { step, usage });
+    }
+
+    /// Replaces the status bar snapshot.
+    pub fn status(&self, status: Status) {
+        let _ = self.inner.tx.send(UiCommand::Status(status));
+    }
+
+    /// Shows (or clears) the approval prompt.
+    pub fn approval(&self, prompt: Option<String>) {
+        let _ = self.inner.tx.send(UiCommand::Approval(prompt));
+    }
+
+    /// Flushes pending plain output.
     pub fn flush(&self) {
-        let _ = self.inner.tx.send(RenderCommand::Flush);
+        let _ = self.inner.tx.send(UiCommand::Flush);
     }
 }
 
 impl Drop for RendererInner {
     fn drop(&mut self) {
-        let _ = self.tx.send(RenderCommand::Shutdown);
-        let writer = self
-            .writer
+        let _ = self.tx.send(UiCommand::Shutdown);
+        let worker = self
+            .worker
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(writer) = writer {
-            let _ = writer.join();
+        if let Some(worker) = worker {
+            let _ = worker.join();
         }
     }
 }
 
 /// 渲染所需的宿主状态。
 struct DisplayState {
-    model: ModelName,
     renderer: Renderer,
     sender: RuntimeSender,
     /// 单次运行模式：收场即退出，未生效的用户消息只打印提示。
@@ -125,9 +175,8 @@ struct ReportData {
     failure: Option<String>,
 }
 
-/// 注册渲染系统：[`RunEvent`] 流 + turn 收场报告。
+/// 注册渲染系统：流式输出、[`RunEvent`] 流与 turn 收场报告。
 pub struct RendererPlugin {
-    model: ModelName,
     renderer: Renderer,
     sender: RuntimeSender,
     single_shot: bool,
@@ -136,14 +185,12 @@ pub struct RendererPlugin {
 
 impl RendererPlugin {
     pub fn new(
-        model: ModelName,
         renderer: Renderer,
         sender: RuntimeSender,
         single_shot: bool,
         has_session: bool,
     ) -> Self {
         Self {
-            model,
             renderer,
             sender,
             single_shot,
@@ -159,13 +206,13 @@ impl Plugin for RendererPlugin {
 
     fn build(&self, app: &mut App) {
         app.insert_resource(DisplayState {
-            model: self.model.clone(),
             renderer: self.renderer.clone(),
             sender: self.sender.clone(),
             single_shot: self.single_shot,
             has_session: self.has_session,
         })
         .init_resource::<PendingReport>()
+        .add_systems(Update, track_stream)
         .add_systems(Update, render_run_events)
         .add_systems(Update, render_rotations)
         .add_systems(Update, rotate_feedback)
@@ -173,10 +220,107 @@ impl Plugin for RendererPlugin {
     }
 }
 
-fn render_run_events(mut events: MessageReader<RunEvent>, state: Res<DisplayState>) {
-    for event in events.read() {
-        if let Some(text) = event_text(&state.model, event.as_ref()) {
-            state.renderer.line(text);
+/// 把模型增量投递到输出层，并刷新状态栏；统计本身由 `Activity` 负责。
+fn track_stream(
+    mut events: MessageReader<LlmStreamEvent>,
+    activity: Res<Activity>,
+    state: Res<DisplayState>,
+) {
+    let events = events.read();
+    if events.is_empty() {
+        return;
+    }
+    for event in &events {
+        match &event.update {
+            LlmStreamUpdate::Started => state.renderer.stream_start(),
+            LlmStreamUpdate::Delta { text } => state.renderer.stream_delta(text),
+            LlmStreamUpdate::Usage { .. } => {}
+        }
+    }
+    state.renderer.status(status_snapshot(&activity));
+}
+
+fn render_run_events(
+    mut events: MessageReader<RunEvent>,
+    activity: Res<Activity>,
+    state: Res<DisplayState>,
+) {
+    let events = events.read();
+    if events.is_empty() {
+        return;
+    }
+    for event in &events {
+        match event.as_ref() {
+            RunEvent::Started { tools, .. } => {
+                let names: Vec<&str> = tools.iter().map(|tool| tool.as_str()).collect();
+                state.renderer.line(format!(
+                    "* model {}, tools: [{}]",
+                    activity.model(),
+                    names.join(", ")
+                ));
+            }
+            RunEvent::Recorded { event, .. } => render_recorded(event, &state),
+            RunEvent::ToolGated { denied, .. } => {
+                state
+                    .renderer
+                    .line(format!("  ⛔ denied by {}: {}", denied.by, denied.reason));
+            }
+            // The approver task owns the interactive prompt: it must enter
+            // answer mode before the question is visible.
+            RunEvent::ApprovalRequested { .. } => {}
+            RunEvent::ApprovalResolved { outcome, .. } => {
+                if !outcome.allows() {
+                    state
+                        .renderer
+                        .line(format!("  ✗ not approved ({outcome:?})"));
+                }
+            }
+            RunEvent::Aborted { by, reason, .. } => {
+                state
+                    .renderer
+                    .line(format!("  ⛔ aborted by {by}: {reason}"));
+            }
+            RunEvent::Finished { .. } | RunEvent::Failed { .. } => {
+                state.renderer.stream_end();
+            }
+            _ => {}
+        }
+    }
+    state.renderer.status(status_snapshot(&activity));
+}
+
+fn render_recorded(event: &RecordEvent, state: &DisplayState) {
+    match event {
+        RecordEvent::MessageStart { .. } => {
+            state.renderer.stream_start();
+            state.renderer.line("→ model call");
+        }
+        RecordEvent::Message(Message::Assistant(message)) => {
+            let text = match message {
+                AssistantMessage::Text(content) => Some(content.as_str()),
+                AssistantMessage::ToolCalls {
+                    content: Some(content),
+                    ..
+                } => Some(content.as_str()),
+                AssistantMessage::ToolCalls { content: None, .. } => None,
+            };
+            if let Some(text) = text {
+                state.renderer.commit_assistant(text);
+            }
+        }
+        RecordEvent::MessageEnd {
+            step, usage, stop, ..
+        } => {
+            state.renderer.stream_end();
+            state.renderer.step_stats(step.get(), *usage);
+            if matches!(stop, StopKind::ToolUse) {
+                state.renderer.line("← tool calls requested");
+            }
+        }
+        _ => {
+            if let Some(text) = recorded_text(event) {
+                state.renderer.line(text);
+            }
         }
     }
 }
@@ -271,7 +415,6 @@ fn report_finished(
         }
         None => print_turn_summary(
             &state.renderer,
-            &log,
             data.outcome,
             data.usage,
             data.steps_used,
@@ -295,6 +438,57 @@ fn report_finished(
         executor.cancellation().cancel();
     } else {
         state.renderer.prompt("agnes> ");
+    }
+}
+
+/// 启动时回放的历史最多保留多少行，避免超长会话拖慢首帧。
+pub(crate) const MAX_HISTORY_LINES: usize = 2_000;
+
+/// TUI 启动时铺设恢复出的会话历史：只保留用户/助手可见消息与工具调用、
+/// 失败标记，不铺开工具输出（与实时渲染保持一致）。
+pub(crate) fn history_lines(log: &Log) -> Vec<String> {
+    let mut lines = Vec::new();
+    for event in log.events() {
+        match event {
+            RecordEvent::TurnStart => lines.push("─ turn ─".to_owned()),
+            RecordEvent::Message(Message::User { content }) => {
+                lines.push(format!("› {}", content.as_str()));
+            }
+            RecordEvent::Message(Message::Assistant(message)) => match message {
+                AssistantMessage::Text(content) => lines.push(content.as_str().to_owned()),
+                AssistantMessage::ToolCalls { content, calls } => {
+                    if let Some(content) = content {
+                        lines.push(content.as_str().to_owned());
+                    }
+                    for call in calls.iter() {
+                        lines.push(format!("  ⚒ {} {}", call.name, call.arguments.as_str()));
+                    }
+                }
+            },
+            RecordEvent::Message(Message::ToolResult { output, .. }) if output.is_error() => {
+                lines.push("  ✗ failed".to_owned());
+            }
+            _ => {}
+        }
+    }
+    if lines.len() > MAX_HISTORY_LINES {
+        let skip = lines.len() - MAX_HISTORY_LINES;
+        lines.drain(..skip);
+        lines.insert(0, "… (earlier history omitted)".to_owned());
+    }
+    lines
+}
+
+fn status_snapshot(activity: &Activity) -> Status {
+    Status {
+        model: activity.model().to_string(),
+        step: activity.step(),
+        usage: activity.step_usage(),
+        session_usage: activity.session_usage(),
+        live_chars: activity.live_output_chars(),
+        running: activity.is_running(),
+        streaming: activity.phase() == Phase::Streaming,
+        elapsed: activity.elapsed(),
     }
 }
 
@@ -323,6 +517,7 @@ fn recorded_text(event: &RecordEvent) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn event_text(model: &ModelName, event: &RunEvent) -> Option<String> {
     match event {
         RunEvent::Started { tools, .. } => {
@@ -348,31 +543,18 @@ fn event_text(model: &ModelName, event: &RunEvent) -> Option<String> {
     }
 }
 
-/// turn 收场摘要：结果、最终答复与耗时。
+/// turn 收场摘要：结果与耗时。最终答复已经由流式输出/消息事件落地，
+/// 这里不再重复打印。
 fn print_turn_summary(
     renderer: &Renderer,
-    log: &Log,
     outcome: Outcome,
     usage: agnes_core::message::TokenUsage,
     steps_used: u32,
     started_at: Timestamp,
     finished_at: Timestamp,
 ) {
-    let reply = log
-        .messages()
-        .filter_map(|message| match message {
-            Message::Assistant(AssistantMessage::Text(content)) => Some(content),
-            _ => None,
-        })
-        .last()
-        .cloned();
     match outcome {
-        Outcome::Answered => {
-            renderer.line("");
-            if let Some(reply) = reply {
-                renderer.line(reply.as_str());
-            }
-        }
+        Outcome::Answered => {}
         Outcome::Interrupted => {
             renderer.line("");
             renderer.line("(stopped: interrupted by the user — session kept)");
@@ -398,12 +580,74 @@ fn print_turn_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::message::{ToolCallId, ToolOutput};
+    use agnes_core::content::Content;
+    use agnes_core::message::{ToolArguments, ToolCall, ToolCallId, ToolOutput};
+    use agnes_core::tool::ToolName;
     use agnes_core::turn::StepNumber;
+    use agnes_util::NonEmpty;
     use std::str::FromStr;
 
     fn model() -> ModelName {
         ModelName::from_str("gpt-test").unwrap()
+    }
+
+    fn content(text: &str) -> Content {
+        Content::try_from(text).unwrap()
+    }
+
+    #[test]
+    fn resumed_history_renders_the_conversation() {
+        let mut log = Log::default();
+        log.record(RecordEvent::TurnStart);
+        log.record(RecordEvent::Message(Message::User {
+            content: content("hi"),
+        }));
+        log.record(RecordEvent::Message(Message::Assistant(
+            AssistantMessage::Text(content("hello")),
+        )));
+        log.record(RecordEvent::Message(Message::Assistant(
+            AssistantMessage::ToolCalls {
+                content: Some(content("checking")),
+                calls: NonEmpty::from_iter([ToolCall {
+                    id: ToolCallId::new("c1"),
+                    name: ToolName::from_str("read_file").unwrap(),
+                    arguments: ToolArguments::new(r#"{"path":"x"}"#),
+                }])
+                .unwrap(),
+            },
+        )));
+        log.record(RecordEvent::Message(Message::ToolResult {
+            call_id: ToolCallId::new("c1"),
+            output: ToolOutput::error("boom"),
+        }));
+
+        assert_eq!(
+            history_lines(&log),
+            vec![
+                "─ turn ─".to_owned(),
+                "› hi".to_owned(),
+                "hello".to_owned(),
+                "checking".to_owned(),
+                r#"  ⚒ read_file {"path":"x"}"#.to_owned(),
+                "  ✗ failed".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn long_histories_keep_the_tail() {
+        let mut log = Log::default();
+        for index in 0..MAX_HISTORY_LINES + 5 {
+            log.record(RecordEvent::Message(Message::User {
+                content: content(&format!("u{index}")),
+            }));
+        }
+
+        let lines = history_lines(&log);
+        assert_eq!(lines.len(), MAX_HISTORY_LINES + 1);
+        assert_eq!(lines[0], "… (earlier history omitted)");
+        let last = format!("› u{}", MAX_HISTORY_LINES + 4);
+        assert_eq!(lines.last().map(String::as_str), Some(last.as_str()));
     }
 
     #[test]

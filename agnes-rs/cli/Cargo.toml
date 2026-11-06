@@ -24,10 +24,14 @@ agnes-transport-reqwest.workspace = true
 agnes-agent.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 jiff.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync"] }
 
 [dev-dependencies]
+agnes-util.workspace = true
 tempfile.workspace = true
 
 [lints]

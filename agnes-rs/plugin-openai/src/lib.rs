@@ -2,10 +2,11 @@
 //!
 //! [`OpenAiPlugin`] connects the runtime's [`LlmCall`] / [`LlmCancel`] messages
 //! to the HTTP capability installed by `agnes-plugin-http`: it encodes each
-//! call with [`OpenAiCodec`], submits it as a [`HttpRequest`], and turns the
-//! matching [`HttpResponse`] back into an [`LlmReply`]. Each hop is one
-//! message and therefore costs one schedule tick; the runner drains
-//! consecutive ticks, so the latency is not observable.
+//! call with [`OpenAiCodec`], submits it as a [`HttpStreamRequest`], decodes
+//! the streamed body with [`OpenAiStreamDecoder`] — forwarding text deltas and
+//! usage as [`LlmStreamEvent`]s — and closes the call with an [`LlmReply`].
+//! Each hop is one message and therefore costs one schedule tick; the runner
+//! drains consecutive ticks, so the latency is not observable.
 //!
 //! Plugins apply immediately in registration order: add
 //! `agnes_plugin_http::HttpPlugin` **before** this plugin. The bridge submits
@@ -18,10 +19,18 @@ use std::collections::HashMap;
 
 use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_ecs::{App, MessageReader, MessageWriter, Plugin, Res, ResMut, Update};
-use agnes_io::http::TransportError;
-use agnes_io::llm::{LlmCall, LlmCallId, LlmCancel, LlmError, LlmProvider, LlmReply};
-use agnes_llm_openai::OpenAiCodec;
-use agnes_plugin_http::{HttpCancel, HttpClient, HttpRequest, HttpRequestId, HttpResponse};
+use agnes_io::http::{HttpStreamPart, TransportError};
+use agnes_io::llm::{
+    LlmCall, LlmCallId, LlmCancel, LlmError, LlmProvider, LlmReply, LlmStreamEvent, LlmStreamUpdate,
+};
+use agnes_llm_openai::{OpenAiCodec, OpenAiStreamDecoder, StreamDelta};
+use agnes_plugin_http::{
+    HttpCancel, HttpClient, HttpRequestId, HttpStreamEnd, HttpStreamEvent, HttpStreamRequest,
+};
+
+/// The most error-body text kept for an eventual `Api` error. Error bodies
+/// are diagnostic; a hostile peer must not grow them without bound.
+const MAX_ERROR_BODY_CHARS: usize = 64 * 1024;
 
 /// Builds an OpenAI-compatible provider bridge.
 ///
@@ -39,11 +48,20 @@ impl OpenAiPlugin {
     }
 }
 
-/// In-flight model calls: the runtime's id and the HTTP request performing it.
+/// In-flight model calls: the runtime's id, the HTTP stream performing it,
+/// and the decoder accumulating that stream.
 #[derive(Default)]
 pub struct OpenAiBridge {
     pending: HashMap<LlmCallId, HttpRequestId>,
-    reverse: HashMap<HttpRequestId, LlmCallId>,
+    streams: HashMap<HttpRequestId, StreamState>,
+}
+
+struct StreamState {
+    call: LlmCallId,
+    status: Option<http::StatusCode>,
+    decoder: OpenAiStreamDecoder,
+    error_body: String,
+    failure: Option<LlmError>,
 }
 
 impl Plugin for OpenAiPlugin {
@@ -66,18 +84,19 @@ impl Plugin for OpenAiPlugin {
             .insert_resource(LlmProvider)
             .add_systems(Update, dispatch_llm_calls)
             .add_systems(Update, dispatch_llm_cancels)
-            .add_systems(Update, ingest_http_responses);
+            .add_systems(Update, ingest_stream_events)
+            .add_systems(Update, ingest_stream_ends);
     }
 }
 
-/// Encodes calls and submits them as HTTP requests; encoding failures answer
-/// immediately.
+/// Encodes calls and submits them as streaming HTTP requests; encoding
+/// failures answer immediately.
 fn dispatch_llm_calls(
     codec: Res<OpenAiCodec>,
     mut client: ResMut<HttpClient>,
     mut bridge: ResMut<OpenAiBridge>,
     mut calls: MessageReader<LlmCall>,
-    mut requests: MessageWriter<HttpRequest>,
+    mut requests: MessageWriter<HttpStreamRequest>,
     mut replies: MessageWriter<LlmReply>,
 ) {
     for call in calls.read() {
@@ -85,8 +104,17 @@ fn dispatch_llm_calls(
             Ok(request) => {
                 let id = client.request_id();
                 bridge.pending.insert(call.id, id);
-                bridge.reverse.insert(id, call.id);
-                requests.write(HttpRequest { id, request });
+                bridge.streams.insert(
+                    id,
+                    StreamState {
+                        call: call.id,
+                        status: None,
+                        decoder: OpenAiStreamDecoder::new(),
+                        error_body: String::new(),
+                        failure: None,
+                    },
+                );
+                requests.write(HttpStreamRequest { id, request });
             }
             Err(error) => replies.write(LlmReply {
                 id: call.id,
@@ -109,24 +137,88 @@ fn dispatch_llm_cancels(
     }
 }
 
-/// Decodes responses into replies and retires the mapping.
-fn ingest_http_responses(
+/// Consumes stream parts: success bodies feed the decoder and become
+/// [`LlmStreamEvent`]s; error bodies are kept for the eventual `Api` error.
+fn ingest_stream_events(
     mut bridge: ResMut<OpenAiBridge>,
-    mut responses: MessageReader<HttpResponse>,
-    mut replies: MessageWriter<LlmReply>,
+    mut events: MessageReader<HttpStreamEvent>,
+    mut updates: MessageWriter<LlmStreamEvent>,
 ) {
-    for response in responses.read() {
-        let Some(id) = bridge.reverse.remove(&response.id) else {
+    for event in events.read() {
+        let Some(stream) = bridge.streams.get_mut(&event.id) else {
             continue;
         };
-        bridge.pending.remove(&id);
-        let result = match &response.result {
-            Ok(http_response) => {
-                OpenAiCodec::parse_response(http_response.status(), http_response.body())
+        let call = stream.call;
+        match &event.part {
+            HttpStreamPart::Head { status, .. } => {
+                stream.status = Some(*status);
+                if status.is_success() {
+                    updates.write(LlmStreamEvent {
+                        id: call,
+                        update: LlmStreamUpdate::Started,
+                    });
+                }
             }
-            Err(error) => Err(LlmError::Transport(to_transport_error(error))),
+            HttpStreamPart::Body(text) => {
+                if stream.failure.is_some() {
+                    continue;
+                }
+                if stream.status.is_some_and(|status| status.is_success()) {
+                    match stream.decoder.feed(text) {
+                        Ok(deltas) => {
+                            for delta in deltas {
+                                let update = match delta {
+                                    StreamDelta::Text(text) => LlmStreamUpdate::Delta { text },
+                                    StreamDelta::Usage(usage) => LlmStreamUpdate::Usage { usage },
+                                };
+                                updates.write(LlmStreamEvent { id: call, update });
+                            }
+                        }
+                        Err(error) => stream.failure = Some(error),
+                    }
+                } else if stream.error_body.chars().count() < MAX_ERROR_BODY_CHARS {
+                    let remaining = MAX_ERROR_BODY_CHARS - stream.error_body.chars().count();
+                    stream.error_body.extend(text.chars().take(remaining));
+                }
+            }
+        }
+    }
+}
+
+/// Turns the end of a stream into the one reply the runtime consumes.
+fn ingest_stream_ends(
+    mut bridge: ResMut<OpenAiBridge>,
+    mut ends: MessageReader<HttpStreamEnd>,
+    mut replies: MessageWriter<LlmReply>,
+) {
+    for end in ends.read() {
+        let Some(stream) = bridge.streams.remove(&end.id) else {
+            continue;
         };
-        replies.write(LlmReply { id, result });
+        bridge.pending.remove(&stream.call);
+        let StreamState {
+            call,
+            status,
+            decoder,
+            error_body,
+            failure,
+        } = stream;
+        let result = match &end.result {
+            Err(error) => Err(LlmError::Transport(to_transport_error(error))),
+            Ok(()) => match status {
+                None => Err(LlmError::Transport(TransportError::Other(
+                    "the stream ended before the response head".into(),
+                ))),
+                Some(status) if !status.is_success() => {
+                    OpenAiCodec::parse_response(status, &error_body)
+                }
+                Some(_) => match failure {
+                    Some(error) => Err(error),
+                    None => decoder.finish(),
+                },
+            },
+        };
+        replies.write(LlmReply { id: call, result });
     }
 }
 
@@ -152,30 +244,89 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    struct OkTransport;
+    const SSE_BODY: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"o\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"k\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    struct StreamingTransport;
 
     #[async_trait]
-    impl HttpTransport for OkTransport {
+    impl HttpTransport for StreamingTransport {
         async fn send(
             &self,
             _request: http::Request<String>,
         ) -> Result<http::Response<String>, TransportError> {
-            Ok(http::Response::builder()
-                .status(200)
-                .body(
-                    r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#
-                        .to_owned(),
-                )
-                .expect("static response is valid"))
+            unreachable!("the bridge always streams")
+        }
+
+        async fn send_stream(
+            &self,
+            _request: http::Request<String>,
+            sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+        ) -> Result<(), TransportError> {
+            sink(HttpStreamPart::Head {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+            });
+            for line in SSE_BODY.split_inclusive("\n\n") {
+                sink(HttpStreamPart::Body(line.to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    struct ErrorTransport;
+
+    #[async_trait]
+    impl HttpTransport for ErrorTransport {
+        async fn send(
+            &self,
+            _request: http::Request<String>,
+        ) -> Result<http::Response<String>, TransportError> {
+            unreachable!("the bridge always streams")
+        }
+
+        async fn send_stream(
+            &self,
+            _request: http::Request<String>,
+            sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+        ) -> Result<(), TransportError> {
+            sink(HttpStreamPart::Head {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: http::HeaderMap::new(),
+            });
+            sink(HttpStreamPart::Body(
+                r#"{"error":{"message":"invalid api key"}}"#.to_owned(),
+            ));
+            Ok(())
         }
     }
 
     #[derive(Default, Clone)]
     struct Captured {
         replies: Vec<Result<String, String>>,
+        deltas: Vec<String>,
+        usage: Vec<(u64, u64)>,
+        started: usize,
     }
 
-    fn capture_replies(mut replies: MessageReader<LlmReply>, mut captured: ResMut<Captured>) {
+    fn capture_replies(
+        mut replies: MessageReader<LlmReply>,
+        mut updates: MessageReader<LlmStreamEvent>,
+        mut captured: ResMut<Captured>,
+    ) {
+        for update in updates.read() {
+            match &update.update {
+                LlmStreamUpdate::Started => captured.started += 1,
+                LlmStreamUpdate::Delta { text } => captured.deltas.push(text.clone()),
+                LlmStreamUpdate::Usage { usage } => {
+                    captured.usage.push((usage.input, usage.output));
+                }
+            }
+        }
         for reply in replies.read() {
             captured.replies.push(match &reply.result {
                 Ok(response) => match &response.stop_reason {
@@ -187,9 +338,9 @@ mod tests {
         }
     }
 
-    fn app() -> App {
+    fn app_with(transport: Arc<dyn HttpTransport>) -> App {
         let mut app = App::new();
-        app.add_plugin(agnes_plugin_http::HttpPlugin::new(Arc::new(OkTransport)))
+        app.add_plugin(agnes_plugin_http::HttpPlugin::new(transport))
             .add_plugin(OpenAiPlugin::new(
                 BaseUrl::from_str("https://api.example.com/v1").expect("static url is valid"),
                 ApiKey::from_str("sk-test").expect("static key is valid"),
@@ -198,6 +349,23 @@ mod tests {
             .add_systems(Update, capture_replies)
             .add_plugin(TokioPlugin);
         app
+    }
+
+    async fn run_call(app: &mut App) -> Captured {
+        app.world_mut().send_message(sample_call());
+        for _ in 0..256 {
+            app.pump().expect("schedule runs");
+            tokio::task::yield_now().await;
+            let captured = app
+                .world()
+                .resource::<Captured>()
+                .expect("captured is installed")
+                .clone();
+            if !captured.replies.is_empty() {
+                return captured;
+            }
+        }
+        panic!("no reply after 256 pumps");
     }
 
     fn sample_call() -> LlmCall {
@@ -216,25 +384,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_model_call_travels_to_a_reply() {
-        let mut app = app();
-        app.world_mut().send_message(sample_call());
+    async fn a_model_call_streams_deltas_and_ends_with_a_reply() {
+        let mut app = app_with(Arc::new(StreamingTransport));
+        let captured = run_call(&mut app).await;
 
-        let mut replies = Vec::new();
-        for _ in 0..256 {
-            app.pump().expect("schedule runs");
-            tokio::task::yield_now().await;
-            replies = app
-                .world()
-                .resource::<Captured>()
-                .expect("captured is installed")
-                .replies
-                .clone();
-            if !replies.is_empty() {
-                break;
-            }
-        }
-        assert_eq!(replies, vec![Ok("ok".to_owned())]);
+        assert_eq!(captured.started, 1);
+        assert_eq!(captured.deltas, vec!["o".to_owned(), "k".to_owned()]);
+        assert_eq!(captured.usage, vec![(3, 2)]);
+        assert_eq!(captured.replies, vec![Ok("ok".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn an_error_status_surfaces_the_buffered_body() {
+        let mut app = app_with(Arc::new(ErrorTransport));
+        let captured = run_call(&mut app).await;
+
+        assert!(captured.started == 0);
+        assert!(captured.deltas.is_empty());
+        assert!(
+            matches!(&captured.replies[..], [Err(message)] if message.contains("invalid api key")),
+            "the api error body is decoded"
+        );
     }
 
     #[test]

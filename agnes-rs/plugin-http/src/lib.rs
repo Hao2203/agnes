@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agnes_ecs::{App, CancelToken, MessageReader, Plugin, Res, ResMut, Update};
-use agnes_io::http::{HttpTransport, HttpTransportResource, TransportError};
+use agnes_io::http::{HttpStreamPart, HttpTransport, HttpTransportResource, TransportError};
 use agnes_plugin_async::AsyncExecutor;
 
 /// The identity of one HTTP request.
@@ -97,6 +97,32 @@ pub struct HttpResponse {
     pub result: Result<http::Response<String>, TransportError>,
 }
 
+/// One request whose response is consumed incrementally.
+///
+/// The parts arrive as [`HttpStreamEvent`] messages and the call closes with
+/// [`HttpStreamEnd`]; no [`HttpResponse`] is produced for it.
+#[derive(Debug)]
+pub struct HttpStreamRequest {
+    pub id: HttpRequestId,
+    pub request: http::Request<String>,
+}
+
+/// One part of a streamed response, in arrival order. The head carries the
+/// status and headers; body parts follow.
+#[derive(Debug)]
+pub struct HttpStreamEvent {
+    pub id: HttpRequestId,
+    pub part: HttpStreamPart,
+}
+
+/// A streamed response ended; the result is the transport outcome, not an
+/// HTTP status (the status arrived with the head).
+#[derive(Debug)]
+pub struct HttpStreamEnd {
+    pub id: HttpRequestId,
+    pub result: Result<(), TransportError>,
+}
+
 /// Stops an in-flight request (best effort).
 #[derive(Clone, Copy, Debug)]
 pub struct HttpCancel {
@@ -144,6 +170,7 @@ impl Plugin for HttpPlugin {
             .insert_resource(HttpClient::default())
             .insert_resource(HttpInFlight::default())
             .add_systems(Update, dispatch_http)
+            .add_systems(Update, dispatch_http_streams)
             .add_systems(Update, cancel_http)
             .add_systems(Update, reap_http);
     }
@@ -184,6 +211,45 @@ fn dispatch_http(
     }
 }
 
+/// Performs submitted streaming requests on the async executor; parts arrive
+/// as [`HttpStreamEvent`] host messages and the call closes with
+/// [`HttpStreamEnd`].
+fn dispatch_http_streams(
+    executor: Res<AsyncExecutor>,
+    transport: Res<HttpTransportResource>,
+    mut in_flight: ResMut<HttpInFlight>,
+    mut requests: MessageReader<HttpStreamRequest>,
+) {
+    for message in requests.read() {
+        let id = message.id;
+        let request = message.request.clone();
+        let token = CancelToken::new();
+        in_flight.0.insert(id, token.clone());
+        let transport = Arc::clone(transport.transport());
+        let shutdown = executor.cancellation();
+        let sender = executor.sender();
+        let task = async move {
+            let mut sink = |part: HttpStreamPart| {
+                let _ = sender.send_message(HttpStreamEvent { id, part });
+            };
+            let result = tokio::select! {
+                biased;
+                () = token.cancelled() => Err(TransportError::Cancelled),
+                () = shutdown.cancelled() => Err(TransportError::Cancelled),
+                result = transport.send_stream(request, &mut sink) => result,
+            };
+            let _ = sender.send_message(HttpStreamEnd { id, result });
+        };
+        if let Err(error) = executor.spawn(task) {
+            in_flight.0.remove(&id);
+            let _ = executor.sender().send_message(HttpStreamEnd {
+                id,
+                result: Err(TransportError::Other(Box::new(error))),
+            });
+        }
+    }
+}
+
 /// Cancels in-flight requests; unknown ids are ignored.
 fn cancel_http(mut cancels: MessageReader<HttpCancel>, in_flight: ResMut<HttpInFlight>) {
     for message in cancels.read() {
@@ -194,8 +260,15 @@ fn cancel_http(mut cancels: MessageReader<HttpCancel>, in_flight: ResMut<HttpInF
 }
 
 /// Drops finished requests from the in-flight table.
-fn reap_http(mut responses: MessageReader<HttpResponse>, mut in_flight: ResMut<HttpInFlight>) {
+fn reap_http(
+    mut responses: MessageReader<HttpResponse>,
+    mut ends: MessageReader<HttpStreamEnd>,
+    mut in_flight: ResMut<HttpInFlight>,
+) {
     for message in responses.read() {
+        in_flight.0.remove(&message.id);
+    }
+    for message in ends.read() {
         in_flight.0.remove(&message.id);
     }
 }
@@ -241,6 +314,55 @@ mod tests {
             &self,
             _request: http::Request<String>,
         ) -> Result<http::Response<String>, TransportError> {
+            std::future::pending().await
+        }
+    }
+
+    struct StreamingTransport;
+
+    #[async_trait]
+    impl HttpTransport for StreamingTransport {
+        async fn send(
+            &self,
+            _request: http::Request<String>,
+        ) -> Result<http::Response<String>, TransportError> {
+            Ok(http::Response::builder()
+                .status(200)
+                .body("buffered".to_owned())
+                .expect("static response is valid"))
+        }
+
+        async fn send_stream(
+            &self,
+            _request: http::Request<String>,
+            sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+        ) -> Result<(), TransportError> {
+            sink(HttpStreamPart::Head {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+            });
+            sink(HttpStreamPart::Body("one".to_owned()));
+            sink(HttpStreamPart::Body("two".to_owned()));
+            Ok(())
+        }
+    }
+
+    struct HangingStream;
+
+    #[async_trait]
+    impl HttpTransport for HangingStream {
+        async fn send(
+            &self,
+            _request: http::Request<String>,
+        ) -> Result<http::Response<String>, TransportError> {
+            std::future::pending().await
+        }
+
+        async fn send_stream(
+            &self,
+            _request: http::Request<String>,
+            _sink: &mut (dyn FnMut(HttpStreamPart) + Send),
+        ) -> Result<(), TransportError> {
             std::future::pending().await
         }
     }
@@ -334,6 +456,101 @@ mod tests {
 
         let snapshot = wait_for(&mut app, 1).await;
         assert!(matches!(&snapshot.outcomes[..], [Err(message)] if message.contains("cancelled")));
+        assert_eq!(snapshot.in_flight, 0);
+    }
+
+    #[derive(Default, Clone)]
+    struct CapturedStream {
+        parts: Vec<String>,
+        ended: Vec<Result<(), String>>,
+        in_flight: usize,
+    }
+
+    fn capture_stream(
+        mut events: MessageReader<HttpStreamEvent>,
+        mut ends: MessageReader<HttpStreamEnd>,
+        in_flight: Res<HttpInFlight>,
+        mut captured: ResMut<CapturedStream>,
+    ) {
+        for event in events.read() {
+            captured.parts.push(match &event.part {
+                HttpStreamPart::Head { status, .. } => format!("head:{}", status.as_u16()),
+                HttpStreamPart::Body(text) => format!("body:{text}"),
+            });
+        }
+        for end in ends.read() {
+            captured.ended.push(match &end.result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            });
+        }
+        captured.in_flight = in_flight.len();
+    }
+
+    fn stream_app(transport: Arc<dyn HttpTransport>) -> App {
+        let mut app = App::new();
+        app.add_plugin(HttpPlugin::new(transport))
+            .insert_resource(CapturedStream::default())
+            .add_systems(Update, capture_stream)
+            .add_plugin(TokioPlugin);
+        app
+    }
+
+    fn send_stream(app: &mut App, id: u64) {
+        app.world_mut().send_message(HttpStreamRequest {
+            id: HttpRequestId::new(id),
+            request: http::Request::builder()
+                .uri("https://example.com")
+                .body(String::new())
+                .expect("static request is valid"),
+        });
+    }
+
+    async fn wait_for_stream(app: &mut App) -> CapturedStream {
+        for _ in 0..256 {
+            app.pump().expect("schedule runs");
+            tokio::task::yield_now().await;
+            let snapshot = app
+                .world()
+                .resource::<CapturedStream>()
+                .expect("captured stream is installed")
+                .clone();
+            if !snapshot.ended.is_empty() {
+                return snapshot;
+            }
+        }
+        panic!("no stream end after 256 pumps");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_request_answers_with_parts_then_end() {
+        let mut app = stream_app(Arc::new(StreamingTransport));
+        send_stream(&mut app, 3);
+
+        let snapshot = wait_for_stream(&mut app).await;
+        assert_eq!(
+            snapshot.parts,
+            vec!["head:200", "body:one", "body:two"],
+            "the head arrives before the body parts"
+        );
+        assert_eq!(snapshot.ended, vec![Ok(())]);
+        assert_eq!(snapshot.in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn a_stream_cancel_answers_cancelled() {
+        let mut app = stream_app(Arc::new(HangingStream));
+        send_stream(&mut app, 9);
+        app.pump().expect("dispatch runs");
+        app.world_mut().send_message(HttpCancel {
+            id: HttpRequestId::new(9),
+        });
+
+        let snapshot = wait_for_stream(&mut app).await;
+        assert!(
+            matches!(&snapshot.ended[..], [Err(message)] if message.contains("cancelled")),
+            "the stream ends with a cancellation"
+        );
         assert_eq!(snapshot.in_flight, 0);
     }
 

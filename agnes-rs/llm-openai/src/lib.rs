@@ -3,9 +3,12 @@
 //!
 //! Pure data in, pure data out — no I/O, no transport. The ECS bridge in
 //! `agnes-plugin-openai` pairs it with the HTTP capability: `LlmCall` →
-//! [`OpenAiCodec::build_request`] → `HttpRequest` → `HttpResponse` →
-//! [`OpenAiCodec::parse_response`] → `LlmReply`.
+//! [`OpenAiCodec::build_request`] → `HttpStreamRequest` → [`OpenAiStreamDecoder`]
+//! → `LlmReply`. Requests always ask for a stream; the decoder emits text
+//! deltas as they arrive and validates the accumulated response at the end.
 mod wire;
+
+pub use wire::{OpenAiStreamDecoder, StreamDelta};
 
 use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_core::llm::{LlmRequest, LlmResponse};

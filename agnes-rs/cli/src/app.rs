@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agnes_agent::StandardRequestBuilder;
+use agnes_agent::activity::ActivityPlugin;
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
 use agnes_agent::permission::{PermissionRules, Rule};
 use agnes_agent::runtime::{
@@ -37,7 +38,7 @@ use tokio::task::JoinHandle;
 
 use crate::cli::{Cli, Command};
 use crate::input::{self, TaskLine, UserInput};
-use crate::render::{Renderer, RendererPlugin};
+use crate::render::{Renderer, RendererPlugin, Status};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const SYSTEM_PROMPT: &str = "You are agnes, a terminal coding assistant. Use the provided tools \
@@ -112,29 +113,39 @@ impl SessionAssembly {
     }
 }
 
-/// 把各组件的 Plugin 装配成一个 App。
-///
-/// 注册顺序即每 tick 的系统执行顺序；会话系统必须在渲染/agent 系统之前，
-/// 让落盘确认在同一 tick 内先于耐久门禁与收场报告更新。
-fn build_app(
-    cli: &Cli,
+/// 宿主侧装配输入：渲染句柄、输入状态、权限与会话。
+struct HostAssembly {
     renderer: Renderer,
     input: Arc<UserInput>,
     rules: PermissionRules,
     approvals: Option<ApprovalChannel>,
     session: SessionAssembly,
     single_shot: bool,
-) -> Result<App> {
+}
+
+/// 把各组件的 Plugin 装配成一个 App。
+///
+/// 注册顺序即每 tick 的系统执行顺序；会话系统必须在渲染/agent 系统之前，
+/// 让落盘确认在同一 tick 内先于耐久门禁与收场报告更新。
+fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<App> {
+    let HostAssembly {
+        renderer,
+        input,
+        rules,
+        approvals,
+        session,
+        single_shot,
+    } = host;
     let transport = Arc::new(ReqwestTransport::new(REQUEST_TIMEOUT)?);
     let root = std::env::current_dir().context("cannot determine the working directory")?;
 
-    let mut app = App::new();
     app.add_plugin(HttpPlugin::new(transport))
         .add_plugin(OpenAiPlugin::new(
             cli.base_url.clone(),
             resolve_api_key(cli.api_key.clone())?,
         ))
         .add_plugin(ToolsPlugin::empty().with_tools(builtin_tools(root, cli.allow_shell)))
+        .add_plugin(ActivityPlugin::new(cli.model.clone()))
         .insert_resource(rules)
         .insert_resource(HostConfig {
             budget: cli.max_steps,
@@ -159,7 +170,6 @@ fn build_app(
     app.add_plugin(session.state);
     let sender = app.runtime_sender();
     app.add_plugin(RendererPlugin::new(
-        cli.model.clone(),
         renderer,
         sender,
         single_shot,
@@ -171,7 +181,6 @@ fn build_app(
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let renderer = Renderer::new().context("starting the renderer")?;
     let rules = PermissionRules {
         deny: cli.deny.clone(),
         ask: ask_rules(cli.allow_shell),
@@ -187,6 +196,30 @@ pub async fn run(cli: Cli) -> Result<()> {
         );
     }
     let input = UserInput::new();
+
+    // 交互式 chat 在真实终端上使用 TUI；`run`、管道与非 TTY 保持行式
+    // 输出（一次性运行的答复不能随备用屏幕消失）。
+    let app = App::new();
+    let host_sender = app.runtime_sender();
+    let host_shutdown = app.shutdown_handle();
+    let tui = !single_shot
+        && !cli.plain
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+    let renderer = if tui {
+        Renderer::tui(
+            Arc::clone(&input),
+            host_sender.clone(),
+            host_shutdown.clone(),
+        )
+        .context("starting the TUI")?
+    } else {
+        Renderer::plain().context("starting the renderer")?
+    };
+    renderer.status(Status {
+        model: cli.model.to_string(),
+        ..Status::default()
+    });
 
     // 会话打开需要 await：在进 App 之前完成，恢复历史交给状态插件。
     let mut session_plugin = SessionPlugin::new();
@@ -214,20 +247,31 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
 
     let app = build_app(
+        app,
         &cli,
-        renderer.clone(),
-        Arc::clone(&input),
-        rules,
-        approvals,
-        SessionAssembly::new(session_plugin, session_file),
-        single_shot,
+        HostAssembly {
+            renderer: renderer.clone(),
+            input: Arc::clone(&input),
+            rules,
+            approvals,
+            session: SessionAssembly::new(session_plugin, session_file),
+            single_shot,
+        },
     )?;
+
+    // TUI 的备用屏幕没有终端回滚；把恢复出的会话历史铺进消息区，供滚动查看。
+    if tui && let Some(log) = app.world().resource::<agnes_record::Log>() {
+        for line in crate::render::history_lines(&log) {
+            renderer.line(line);
+        }
+    }
 
     let channels = Arc::new(HostChannels {
         sender: app.runtime_sender(),
         shutdown: app.shutdown_handle(),
     });
-    let ctrl_c = input::spawn_ctrl_c(Arc::clone(&input), Arc::clone(&channels));
+    // TUI 在 raw mode 下自己接收 Ctrl-C；信号处理器只服务行式模式。
+    let ctrl_c = (!tui).then(|| input::spawn_ctrl_c(Arc::clone(&input), Arc::clone(&channels)));
     let approver = questions.map(|questions| {
         spawn_approver(
             cli.yes,
@@ -253,7 +297,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             None
         }
     };
-    let stdin_task = needs_line_reader
+    let stdin_task = (needs_line_reader && !tui)
         .then(|| input::spawn_stdin_reader(Arc::clone(&input), Arc::clone(&channels)));
 
     if let Some(goal) = goal {
@@ -268,10 +312,14 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(stdin_task) = stdin_task {
         stdin_task.abort();
     }
-    ctrl_c.abort();
+    if let Some(ctrl_c) = ctrl_c {
+        ctrl_c.abort();
+    }
     if let Some(approver) = approver {
         approver.abort();
     }
+    // TUI 的最后一份句柄释放时恢复终端；之后才能安全打印错误。
+    drop(renderer);
 
     run_result.map_err(anyhow::Error::new)?;
     Ok(())
@@ -298,12 +346,13 @@ fn spawn_approver(
             } else {
                 // Enter answer mode before the prompt becomes visible.
                 let mode = input.begin_answer();
-                renderer.prompt(format!(
+                renderer.approval(Some(format!(
                     "\napprove `{}`: {}\n  [y] once  [n] reject  [a] always this session: ",
                     question.tool_name,
                     question.arguments.as_str()
-                ));
+                )));
                 let answer = input.answer().await;
+                renderer.approval(None);
                 drop(mode);
                 match answer.trim() {
                     "a" | "A" => {

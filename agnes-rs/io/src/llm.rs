@@ -6,6 +6,7 @@ use std::fmt;
 use crate::http::TransportError;
 use agnes_core::config::ConfigError;
 use agnes_core::llm::{LlmRequest, LlmResponse};
+use agnes_core::message::TokenUsage;
 
 /// An API error body: the raw response is kept as data, while `Display`
 /// uses the bounded human-readable detail.
@@ -111,6 +112,29 @@ pub struct LlmCall {
 pub struct LlmReply {
     pub id: LlmCallId,
     pub result: Result<LlmResponse, LlmError>,
+}
+
+/// One observation-only update from an in-flight model call.
+///
+/// Provider bridges emit these while a response streams in; the final
+/// [`LlmReply`] still carries the complete response and is the only input to
+/// the runtime state machine. Hosts use the updates for live output and
+/// token accounting.
+#[derive(Debug)]
+pub struct LlmStreamEvent {
+    pub id: LlmCallId,
+    pub update: LlmStreamUpdate,
+}
+
+/// The payload of one [`LlmStreamEvent`].
+#[derive(Debug)]
+pub enum LlmStreamUpdate {
+    /// The provider accepted the request and started streaming.
+    Started,
+    /// Assistant text produced by this update.
+    Delta { text: String },
+    /// The provider reported token usage for the whole response.
+    Usage { usage: TokenUsage },
 }
 
 /// Cancels an in-flight model call (best effort). A cancellation always ends
