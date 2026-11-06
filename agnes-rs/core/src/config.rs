@@ -41,6 +41,8 @@ pub enum ConfigError {
         #[source]
         source: std::num::ParseIntError,
     },
+    #[error("thinking must be one of `off`, `low`, `medium`, `high`: {value}")]
+    BadThinking { value: String },
     #[error("tool name must not contain whitespace: {value}")]
     ToolNameWhitespace { value: String },
 }
@@ -255,9 +257,107 @@ impl FromStr for StepBudget {
     }
 }
 
+/// 思考强度，映射到 OpenAI 兼容接口的 `reasoning_effort`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 思考模式：关闭，或开启并指定强度。`off` 时请求不携带任何思考参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Thinking {
+    #[default]
+    Off,
+    On(ReasoningEffort),
+}
+
+impl Thinking {
+    /// 开启时返回强度；关闭时为 `None`。
+    pub fn effort(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::Off => None,
+            Self::On(effort) => Some(*effort),
+        }
+    }
+}
+
+impl fmt::Display for Thinking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::On(effort) => effort.fmt(f),
+        }
+    }
+}
+
+impl FromStr for Thinking {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.trim();
+        match value {
+            "off" => Ok(Self::Off),
+            "low" => Ok(Self::On(ReasoningEffort::Low)),
+            "medium" => Ok(Self::On(ReasoningEffort::Medium)),
+            "high" => Ok(Self::On(ReasoningEffort::High)),
+            _ => Err(ConfigError::BadThinking {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_parses_levels_and_rejects_garbage() {
+        assert_eq!("off".parse::<Thinking>().unwrap(), Thinking::Off);
+        assert_eq!(
+            " low ".parse::<Thinking>().unwrap(),
+            Thinking::On(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            "medium".parse::<Thinking>().unwrap(),
+            Thinking::On(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            "high".parse::<Thinking>().unwrap(),
+            Thinking::On(ReasoningEffort::High)
+        );
+        for garbage in ["", "none", "on", "true", "1", "OFF", "Low", "loud"] {
+            assert!(
+                garbage.parse::<Thinking>().is_err(),
+                "{garbage:?} must be rejected"
+            );
+        }
+        assert_eq!(Thinking::Off.effort(), None);
+        assert_eq!(
+            Thinking::On(ReasoningEffort::Low).effort(),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(Thinking::Off.to_string(), "off");
+        assert_eq!(Thinking::On(ReasoningEffort::Medium).to_string(), "medium");
+    }
 
     #[test]
     fn model_name_trims_and_rejects_empty() {

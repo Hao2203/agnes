@@ -7,8 +7,11 @@
 //! in-flight request (best effort — a cancellation always answers with
 //! [`TransportError::Cancelled`], so callers are never left waiting).
 //!
-//! In-flight requests live in [`HttpInFlight`] and are cancelled when the app
-//! shuts down. The plugin mounts the transport implementation as
+//! Each in-flight request is an entity carrying the [`HttpInFlight`] marker,
+//! its [`HttpRequestId`], and a [`CancelToken`] — one entity per request,
+//! spawned at dispatch and despawned when the outcome arrives, so the
+//! in-flight table can never leak an entry. Everything is cancelled when the
+//! app shuts down. The plugin mounts the transport implementation as
 //! [`HttpTransportResource`] for its own dispatch system; consumers never
 //! touch the transport directly.
 //!
@@ -31,10 +34,11 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use agnes_ecs::{App, CancelToken, MessageReader, Plugin, Res, ResMut, Update};
+use agnes_ecs::{
+    App, CancelToken, Commands, Entity, MessageReader, Plugin, Query, Res, Update, With,
+};
 use agnes_io::http::{HttpStreamPart, HttpTransport, HttpTransportResource, TransportError};
 use agnes_plugin_async::AsyncExecutor;
 
@@ -129,21 +133,16 @@ pub struct HttpCancel {
     pub id: HttpRequestId,
 }
 
-/// The requests currently in flight, keyed by id.
-#[derive(Default)]
-pub struct HttpInFlight(HashMap<HttpRequestId, CancelToken>);
+/// Marker for an in-flight request entity.
+///
+/// One entity per submitted request, carrying the [`HttpInFlight`] marker,
+/// the request's [`HttpRequestId`], and the [`CancelToken`] that stops it.
+/// Spawned by the dispatch systems and despawned by the reaper once the
+/// outcome (response, stream end, or transport failure) has been delivered,
+/// so a finished request can never linger.
+pub struct HttpInFlight;
 
-impl HttpInFlight {
-    /// The number of requests in flight.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether no request is in flight.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
+agnes_ecs::component!(HttpInFlight, HttpRequestId);
 
 /// The HTTP capability: dispatch, cancellation, and in-flight bookkeeping.
 ///
@@ -168,7 +167,6 @@ impl Plugin for HttpPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(HttpTransportResource::new(Arc::clone(&self.transport)))
             .insert_resource(HttpClient::default())
-            .insert_resource(HttpInFlight::default())
             .add_systems(Update, dispatch_http)
             .add_systems(Update, dispatch_http_streams)
             .add_systems(Update, cancel_http)
@@ -181,33 +179,37 @@ impl Plugin for HttpPlugin {
 fn dispatch_http(
     executor: Res<AsyncExecutor>,
     transport: Res<HttpTransportResource>,
-    mut in_flight: ResMut<HttpInFlight>,
     mut requests: MessageReader<HttpRequest>,
+    mut commands: Commands,
 ) {
     for message in requests.read() {
         let id = message.id;
         let request = message.request.clone();
         let token = CancelToken::new();
-        in_flight.0.insert(id, token.clone());
+        let cancel = token.clone();
         let transport = Arc::clone(transport.transport());
         let shutdown = executor.cancellation();
         let sender = executor.sender();
         let task = async move {
             let result = tokio::select! {
                 biased;
-                () = token.cancelled() => Err(TransportError::Cancelled),
+                () = cancel.cancelled() => Err(TransportError::Cancelled),
                 () = shutdown.cancelled() => Err(TransportError::Cancelled),
                 result = transport.send(request) => result,
             };
             let _ = sender.send_message(HttpResponse { id, result });
         };
-        if let Err(error) = executor.spawn(task) {
-            in_flight.0.remove(&id);
-            let _ = executor.sender().send_message(HttpResponse {
-                id,
-                result: Err(TransportError::Other(error.into())),
-            });
-        }
+        match executor.spawn(task) {
+            Ok(()) => {
+                commands.spawn_bundle((HttpInFlight, id, token));
+            }
+            Err(error) => {
+                let _ = executor.sender().send_message(HttpResponse {
+                    id,
+                    result: Err(TransportError::Other(error.into())),
+                });
+            }
+        };
     }
 }
 
@@ -217,14 +219,14 @@ fn dispatch_http(
 fn dispatch_http_streams(
     executor: Res<AsyncExecutor>,
     transport: Res<HttpTransportResource>,
-    mut in_flight: ResMut<HttpInFlight>,
     mut requests: MessageReader<HttpStreamRequest>,
+    mut commands: Commands,
 ) {
     for message in requests.read() {
         let id = message.id;
         let request = message.request.clone();
         let token = CancelToken::new();
-        in_flight.0.insert(id, token.clone());
+        let cancel = token.clone();
         let transport = Arc::clone(transport.transport());
         let shutdown = executor.cancellation();
         let sender = executor.sender();
@@ -234,48 +236,65 @@ fn dispatch_http_streams(
             };
             let result = tokio::select! {
                 biased;
-                () = token.cancelled() => Err(TransportError::Cancelled),
+                () = cancel.cancelled() => Err(TransportError::Cancelled),
                 () = shutdown.cancelled() => Err(TransportError::Cancelled),
                 result = transport.send_stream(request, &mut sink) => result,
             };
             let _ = sender.send_message(HttpStreamEnd { id, result });
         };
-        if let Err(error) = executor.spawn(task) {
-            in_flight.0.remove(&id);
-            let _ = executor.sender().send_message(HttpStreamEnd {
-                id,
-                result: Err(TransportError::Other(error.into())),
-            });
-        }
+        match executor.spawn(task) {
+            Ok(()) => {
+                commands.spawn_bundle((HttpInFlight, id, token));
+            }
+            Err(error) => {
+                let _ = executor.sender().send_message(HttpStreamEnd {
+                    id,
+                    result: Err(TransportError::Other(error.into())),
+                });
+            }
+        };
     }
 }
 
 /// Cancels in-flight requests; unknown ids are ignored.
-fn cancel_http(mut cancels: MessageReader<HttpCancel>, in_flight: ResMut<HttpInFlight>) {
+fn cancel_http(
+    mut cancels: MessageReader<HttpCancel>,
+    in_flight: Query<(&HttpRequestId, &CancelToken), With<HttpInFlight>>,
+) {
     for message in cancels.read() {
-        if let Some(token) = in_flight.0.get(&message.id) {
-            token.cancel();
+        for (id, token) in in_flight.iter() {
+            if *id == message.id {
+                token.cancel();
+            }
         }
     }
 }
 
-/// Drops finished requests from the in-flight table.
+/// Despawns the entities of finished requests so the in-flight table can
+/// never leak an entry.
 fn reap_http(
     mut responses: MessageReader<HttpResponse>,
     mut ends: MessageReader<HttpStreamEnd>,
-    mut in_flight: ResMut<HttpInFlight>,
+    in_flight: Query<(Entity, &HttpRequestId), With<HttpInFlight>>,
+    mut commands: Commands,
 ) {
-    for message in responses.read() {
-        in_flight.0.remove(&message.id);
-    }
-    for message in ends.read() {
-        in_flight.0.remove(&message.id);
+    let finished: Vec<HttpRequestId> = responses
+        .read()
+        .iter()
+        .map(|message| message.id)
+        .chain(ends.read().iter().map(|message| message.id))
+        .collect();
+    for (entity, id) in in_flight.iter() {
+        if finished.contains(&id) {
+            commands.entity(entity).despawn();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agnes_ecs::ResMut;
     use agnes_plugin_async::TokioPlugin;
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -376,7 +395,7 @@ mod tests {
 
     fn capture(
         mut responses: MessageReader<HttpResponse>,
-        in_flight: Res<HttpInFlight>,
+        in_flight: Query<Entity, With<HttpInFlight>>,
         mut captured: ResMut<Captured>,
     ) {
         for message in responses.read() {
@@ -385,7 +404,7 @@ mod tests {
                 Err(error) => Err(error.to_string()),
             });
         }
-        captured.in_flight = in_flight.len();
+        captured.in_flight = in_flight.iter().count();
     }
 
     fn app(transport: Arc<dyn HttpTransport>) -> App {
@@ -470,7 +489,7 @@ mod tests {
     fn capture_stream(
         mut events: MessageReader<HttpStreamEvent>,
         mut ends: MessageReader<HttpStreamEnd>,
-        in_flight: Res<HttpInFlight>,
+        in_flight: Query<Entity, With<HttpInFlight>>,
         mut captured: ResMut<CapturedStream>,
     ) {
         for event in events.read() {
@@ -487,7 +506,7 @@ mod tests {
                 Err(error) => Err(error.to_string()),
             });
         }
-        captured.in_flight = in_flight.len();
+        captured.in_flight = in_flight.iter().count();
     }
 
     fn stream_app(transport: Arc<dyn HttpTransport>) -> App {

@@ -44,7 +44,8 @@ impl<'w, 's> Commands<'w, 's> {
     /// Reserves an entity and queues its component insertion.
     ///
     /// The returned entity is not visible to queries until commands are
-    /// applied.
+    /// applied. To attach several components in one call, use
+    /// [`Commands::spawn_bundle`] — a tuple is not itself a component.
     pub fn spawn<T: Component>(&mut self, component: T) -> Entity {
         let entity = self.world.reserve_entity();
         self.queue.push(Box::new(move |world| {

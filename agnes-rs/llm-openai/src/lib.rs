@@ -10,7 +10,7 @@ mod wire;
 
 pub use wire::{OpenAiStreamDecoder, StreamDelta};
 
-use agnes_core::config::{ApiKey, BaseUrl};
+use agnes_core::config::{ApiKey, BaseUrl, ModelName};
 use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_io::http::TransportError;
 use agnes_io::llm::{ApiBody, LlmError};
@@ -72,12 +72,53 @@ impl OpenAiCodec {
             serde_json::from_str(body).map_err(|err| LlmError::Decode(err.into()))?;
         parsed.into_core()
     }
+
+    /// Encodes a `GET /models` request. The list is small, so it uses the
+    /// buffered HTTP path instead of the streaming one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Config`] when the endpoint cannot be joined and
+    /// [`LlmError::Transport`] when the `http` crate rejects the request.
+    pub fn build_models_request(&self) -> Result<http::Request<String>, LlmError> {
+        let endpoint = self.base_url.join("models")?;
+        http::Request::builder()
+            .method(http::Method::GET)
+            .uri(endpoint.as_str())
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", self.api_key.expose()),
+            )
+            .header(http::header::ACCEPT, "application/json")
+            .body(String::new())
+            .map_err(|e| LlmError::Transport(TransportError::Request(e)))
+    }
+
+    /// Decodes a `GET /models` response into sorted, deduplicated names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Api`] for non-success statuses and
+    /// [`LlmError::Decode`] for a body that is not a model list.
+    pub fn parse_models_response(
+        status: http::StatusCode,
+        body: &str,
+    ) -> Result<Vec<ModelName>, LlmError> {
+        if !status.is_success() {
+            let detail = wire::extract_error_body(body);
+            return Err(LlmError::Api {
+                status,
+                body: ApiBody::new(body, detail),
+            });
+        }
+        wire::parse_model_list(body)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::config::{ModelName, SystemPrompt};
+    use agnes_core::config::{ModelName, ReasoningEffort, SystemPrompt, Thinking};
     use agnes_core::content::Content;
     use agnes_core::llm::{Prompt, StopReason};
     use agnes_core::message::Message;
@@ -94,6 +135,7 @@ mod tests {
     fn sample_request() -> LlmRequest {
         LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
+            thinking: Thinking::Off,
             prompt: Prompt {
                 input: vec![
                     Message::System {
@@ -129,6 +171,90 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(request.body()).unwrap();
         assert_eq!(body["model"], "gpt-test");
+    }
+
+    #[test]
+    fn reasoning_effort_is_omitted_when_thinking_is_off() {
+        let request = codec().build_request(&sample_request()).unwrap();
+        let body: serde_json::Value = serde_json::from_str(request.body()).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_follows_the_thinking_setting() {
+        for (effort, wire) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+        ] {
+            let mut request = sample_request();
+            request.thinking = Thinking::On(effort);
+            let encoded = codec().build_request(&request).unwrap();
+            let body: serde_json::Value = serde_json::from_str(encoded.body()).unwrap();
+            assert_eq!(body["reasoning_effort"], wire);
+        }
+    }
+
+    #[test]
+    fn models_request_is_a_bearer_get() {
+        let request = codec().build_models_request().unwrap();
+        assert_eq!(request.method(), http::Method::GET);
+        assert_eq!(
+            request.uri().to_string(),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            request.headers().get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
+        );
+        assert_eq!(
+            request.headers().get(http::header::ACCEPT).unwrap(),
+            "application/json"
+        );
+        assert!(request.body().is_empty());
+    }
+
+    #[test]
+    fn model_list_parses_wrapped_and_bare_bodies() {
+        let models = OpenAiCodec::parse_models_response(
+            http::StatusCode::OK,
+            r#"{"object":"list","data":[{"id":"b"},{"id":"a"},{"id":"a"},{"id":" "}]}"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = models.iter().map(ModelName::as_str).collect();
+        assert_eq!(names, ["a", "b"]);
+
+        let models =
+            OpenAiCodec::parse_models_response(http::StatusCode::OK, r#"[{"id":"z"},{"id":"m"}]"#)
+                .unwrap();
+        let names: Vec<&str> = models.iter().map(ModelName::as_str).collect();
+        assert_eq!(names, ["m", "z"]);
+    }
+
+    #[test]
+    fn model_list_surfaces_api_errors() {
+        let err = OpenAiCodec::parse_models_response(
+            http::StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"no models endpoint"}}"#,
+        )
+        .unwrap_err();
+        let LlmError::Api { status, body } = &err else {
+            panic!("expected Api error");
+        };
+        assert_eq!(*status, http::StatusCode::NOT_FOUND);
+        assert!(body.detail().contains("no models endpoint"));
+    }
+
+    #[test]
+    fn model_list_garbage_is_a_decode_error() {
+        assert!(matches!(
+            OpenAiCodec::parse_models_response(http::StatusCode::OK, "not json"),
+            Err(LlmError::Decode(_))
+        ));
+        assert!(matches!(
+            OpenAiCodec::parse_models_response(http::StatusCode::OK, r#"{"models":[]}"#),
+            Err(LlmError::Decode(_))
+        ));
     }
 
     #[test]
@@ -183,6 +309,7 @@ mod tests {
 
         let request = LlmRequest {
             model: model.clone(),
+            thinking: Thinking::Off,
             prompt: agent.prompt(),
         };
         codec()
@@ -215,6 +342,7 @@ mod tests {
         };
         let request = LlmRequest {
             model: model.clone(),
+            thinking: Thinking::Off,
             prompt: agent.prompt(),
         };
         codec()

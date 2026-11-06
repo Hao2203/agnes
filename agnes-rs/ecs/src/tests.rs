@@ -30,6 +30,8 @@ fn conflicting_queries(_first: Query<&mut Health>, _second: Query<&Health>) {}
 
 fn conflicting_tuple_query(_query: Query<(&mut Health, &Health)>) {}
 
+fn conflicting_optional_query(_first: Query<&mut Health>, _second: Query<Option<&Health>>) {}
+
 fn conflicting_messages(_writer: MessageWriter<Ping>, _reader: MessageReader<Ping>) {}
 
 fn missing_resource(_config: Res<Config>, _state: ResMut<State>) {}
@@ -143,6 +145,30 @@ fn tuple_query_read_write_conflicts_are_rejected() {
 }
 
 #[test]
+fn optional_query_reads_still_conflict_with_writes() {
+    let mut schedule = Schedule::new();
+    let error = schedule
+        .add_system(conflicting_optional_query)
+        .expect_err("Option<&T> is still read access");
+
+    assert!(matches!(error, ScheduleError::ConflictingAccess { .. }));
+}
+
+#[test]
+fn entity_with_finds_the_first_live_match() {
+    let mut world = World::new();
+    world.spawn(Health(1));
+    let tagged = world.spawn(Ping(2));
+    world.spawn(Health(3));
+
+    assert_eq!(world.entity_with::<Ping>(), Some(tagged));
+    assert!(world.entity_with::<Config>().is_none());
+
+    world.despawn(tagged);
+    assert!(world.entity_with::<Ping>().is_none());
+}
+
+#[test]
 fn message_read_write_conflicts_are_rejected() {
     let mut schedule = Schedule::new();
     let error = schedule
@@ -169,6 +195,8 @@ fn tuple_parameters_with_an_empty_option_run() {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Ping(u32);
+
+crate::component!(Health, Ping, Config);
 
 #[derive(Default)]
 struct Seen(Vec<u32>);

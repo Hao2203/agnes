@@ -10,21 +10,26 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use agnes_agent::activity::{Activity, Phase};
+use agnes_agent::model::{ModelSettings, ModelSettingsChanged};
 use agnes_agent::runtime::{PendingUserMessages, TurnFinished};
-#[cfg(test)]
 use agnes_core::config::ModelName;
 use agnes_core::llm::StopKind;
 use agnes_core::message::{AssistantMessage, Message};
 use agnes_core::turn::Outcome;
-use agnes_ecs::{App, CancelToken, MessageReader, Plugin, Res, ResMut, RuntimeSender, Update};
-use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate};
+use agnes_ecs::{
+    App, CancelToken, MessageReader, Plugin, Query, Res, ResMut, RuntimeSender, Update, With,
+};
+use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate, ModelsListed};
 use agnes_plugin_async::AsyncExecutor;
-use agnes_record::{Event as RecordEvent, Log, RunEvent};
+use agnes_record::{AgentRoot, Event as RecordEvent, Log, RunEvent};
 use jiff::Timestamp;
 
 use crate::input::UserInput;
 pub use crate::ui::Status;
 use crate::ui::{UiCommand, plain, tui};
+
+/// 每会话状态的只读快照对（都在 agent 根实体上）。
+type Snapshot<'w> = Query<'w, (&'static Activity, &'static ModelSettings), With<AgentRoot>>;
 
 struct RendererInner {
     tx: std_mpsc::Sender<UiCommand>,
@@ -100,6 +105,14 @@ impl Renderer {
         let _ = self.inner.tx.send(UiCommand::StreamDelta(text.to_owned()));
     }
 
+    /// Appends streamed reasoning text (observation only; never recorded).
+    pub fn reasoning_delta(&self, text: &str) {
+        let _ = self
+            .inner
+            .tx
+            .send(UiCommand::ReasoningDelta(text.to_owned()));
+    }
+
     /// Ends the live stream buffer.
     pub fn stream_end(&self) {
         let _ = self.inner.tx.send(UiCommand::StreamEnd);
@@ -123,6 +136,16 @@ impl Renderer {
     /// Replaces the status bar snapshot.
     pub fn status(&self, status: Status) {
         let _ = self.inner.tx.send(UiCommand::Status(status));
+    }
+
+    /// Hands the provider's model list to the frontend (picker or plain list).
+    pub fn models(&self, current: ModelName, models: Vec<ModelName>) {
+        let _ = self.inner.tx.send(UiCommand::Models { current, models });
+    }
+
+    /// Reports a failed model-list query.
+    pub fn models_failed(&self, error: String) {
+        let _ = self.inner.tx.send(UiCommand::ModelsFailed(error));
     }
 
     /// Shows (or clears) the approval prompt.
@@ -214,6 +237,8 @@ impl Plugin for RendererPlugin {
         .init_resource::<PendingReport>()
         .add_systems(Update, track_stream)
         .add_systems(Update, render_run_events)
+        .add_systems(Update, render_model_list)
+        .add_systems(Update, render_settings_changes)
         .add_systems(Update, render_rotations)
         .add_systems(Update, rotate_feedback)
         .add_systems(Update, report_finished);
@@ -223,7 +248,7 @@ impl Plugin for RendererPlugin {
 /// 把模型增量投递到输出层，并刷新状态栏；统计本身由 `Activity` 负责。
 fn track_stream(
     mut events: MessageReader<LlmStreamEvent>,
-    activity: Res<Activity>,
+    snapshot: Snapshot,
     state: Res<DisplayState>,
 ) {
     let events = events.read();
@@ -234,15 +259,18 @@ fn track_stream(
         match &event.update {
             LlmStreamUpdate::Started => state.renderer.stream_start(),
             LlmStreamUpdate::Delta { text } => state.renderer.stream_delta(text),
+            LlmStreamUpdate::Reasoning { text } => state.renderer.reasoning_delta(text),
             LlmStreamUpdate::Usage { .. } => {}
         }
     }
-    state.renderer.status(status_snapshot(&activity));
+    if let Ok((activity, settings)) = snapshot.single() {
+        state.renderer.status(status_snapshot(&activity, &settings));
+    }
 }
 
 fn render_run_events(
     mut events: MessageReader<RunEvent>,
-    activity: Res<Activity>,
+    snapshot: Snapshot,
     state: Res<DisplayState>,
 ) {
     let events = events.read();
@@ -255,7 +283,10 @@ fn render_run_events(
                 let names: Vec<&str> = tools.iter().map(|tool| tool.as_str()).collect();
                 state.renderer.line(format!(
                     "* model {}, tools: [{}]",
-                    activity.model(),
+                    snapshot
+                        .single()
+                        .map(|(_, settings)| settings.model().to_string())
+                        .unwrap_or_default(),
                     names.join(", ")
                 ));
             }
@@ -286,7 +317,46 @@ fn render_run_events(
             _ => {}
         }
     }
-    state.renderer.status(status_snapshot(&activity));
+    if let Ok((activity, settings)) = snapshot.single() {
+        state.renderer.status(status_snapshot(&activity, &settings));
+    }
+}
+
+/// 模型列表查询的结果：TUI 用它填选择器，plain 直接打印。
+fn render_model_list(
+    mut listed: MessageReader<ModelsListed>,
+    snapshot: Snapshot,
+    state: Res<DisplayState>,
+) {
+    let Ok((_, settings)) = snapshot.single() else {
+        return;
+    };
+    let current = settings.model().clone();
+    for message in listed.read() {
+        match &message.result {
+            Ok(models) => state.renderer.models(current.clone(), models.clone()),
+            Err(error) => state.renderer.models_failed(error.to_string()),
+        }
+    }
+}
+
+/// 设置变化：回显一行并立即刷新状态栏。
+fn render_settings_changes(
+    mut changed: MessageReader<ModelSettingsChanged>,
+    snapshot: Snapshot,
+    state: Res<DisplayState>,
+) {
+    if changed.read().is_empty() {
+        return;
+    }
+    if let Ok((activity, settings)) = snapshot.single() {
+        state.renderer.line(format!(
+            "(model {} · thinking {})",
+            settings.model(),
+            settings.thinking()
+        ));
+        state.renderer.status(status_snapshot(&activity, &settings));
+    }
 }
 
 fn render_recorded(event: &RecordEvent, state: &DisplayState) {
@@ -362,9 +432,11 @@ fn rotate_feedback(
 /// 单次运行模式随后请求退出。
 fn report_finished(
     executor: Res<AsyncExecutor>,
-    log: Res<Log>,
-    durability: Option<Res<agnes_record::Durability>>,
-    mut pending_msgs: ResMut<PendingUserMessages>,
+    sessions: Query<(
+        &Log,
+        Option<&agnes_record::Durability>,
+        &mut PendingUserMessages,
+    )>,
     mut finished: MessageReader<TurnFinished>,
     mut report: ResMut<PendingReport>,
     state: Res<DisplayState>,
@@ -394,6 +466,10 @@ fn report_finished(
     }
 
     let Some(data) = report.0.take() else {
+        return;
+    };
+    let Ok((log, durability, mut pending_msgs)) = sessions.single() else {
+        report.0 = Some(data);
         return;
     };
     // 会话失败也是终态：没有可等的落盘了。否则要求「已记录的事件全部
@@ -479,13 +555,15 @@ pub(crate) fn history_lines(log: &Log) -> Vec<String> {
     lines
 }
 
-fn status_snapshot(activity: &Activity) -> Status {
+fn status_snapshot(activity: &Activity, settings: &ModelSettings) -> Status {
     Status {
-        model: activity.model().to_string(),
+        model: settings.model().to_string(),
+        thinking: settings.thinking(),
         step: activity.step(),
         usage: activity.step_usage(),
         session_usage: activity.session_usage(),
         live_chars: activity.live_output_chars(),
+        live_reasoning_chars: activity.live_reasoning_chars(),
         running: activity.is_running(),
         streaming: activity.phase() == Phase::Streaming,
         elapsed: activity.elapsed(),

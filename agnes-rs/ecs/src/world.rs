@@ -33,6 +33,9 @@ impl World {
     }
 
     /// Spawns an entity with one component.
+    ///
+    /// To attach several components in one call, use
+    /// [`World::spawn_bundle`] — a tuple is not itself a component.
     pub fn spawn<T: Component>(&mut self, component: T) -> Entity {
         let entity = self.entities.get_mut().spawn();
         self.insert_confirmed(entity, component);
@@ -173,6 +176,17 @@ impl World {
             .as_any()
             .downcast_ref::<Storage<T>>()
             .is_some_and(|storage| storage.contains(entity))
+    }
+
+    /// The first live entity carrying a component of type `T`.
+    ///
+    /// A build-time find helper for anchor patterns (for example a plugin
+    /// attaching its state to a shared root entity). Iteration order follows
+    /// entity creation; use [`Query`](crate::Query) when every match matters.
+    pub fn entity_with<T: Component>(&self) -> Option<Entity> {
+        self.alive_entities()
+            .into_iter()
+            .find(|entity| self.contains::<T>(*entity))
     }
 
     /// Inserts a resource, returning the previous value if one existed.

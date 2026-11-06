@@ -13,9 +13,12 @@
 //!   耐久存储的异步接缝。
 //! - [`Log`] 是进程内的会话日志：历史即状态，[`Log::messages`] 与
 //!   [`Log::header`] 是它的投影。
+//! - [`AgentRoot`] 是 agent 会话根实体的标记：每会话状态以组件形式挂在
+//!   各自的根实体上，一个世界可以同时运行多个 agent。
 //!
 //! [`Turn`]: agnes_core::turn::Turn
 
+mod agent;
 mod approval;
 mod decision;
 mod event;
@@ -24,6 +27,7 @@ mod origin;
 mod run_event;
 mod session;
 
+pub use agent::AgentRoot;
 pub use approval::ApprovalOutcome;
 pub use decision::Denied;
 pub use event::{Event, HostEvent, StepOutcome};
@@ -33,3 +37,7 @@ pub use run_event::{RunEvent, Sink};
 pub use session::{
     Durability, RotateSession, SessionError, SessionLog, SessionStore, SessionStoreResource,
 };
+
+// 会话状态以组件形式挂在各 agent 的根实体上（见 [`agent`] 模块文档），
+// 这里集中声明本 crate 的组件词汇。
+agnes_ecs::component!(AgentRoot, Log, Durability, SessionStoreResource);

@@ -15,6 +15,7 @@
 
 pub mod activity;
 pub mod approval;
+pub mod model;
 pub mod permission;
 
 pub mod runtime;
@@ -22,41 +23,34 @@ pub mod tools;
 
 pub use activity::{Activity, ActivityPlugin, Phase};
 pub use approval::{ApprovalChannel, ApprovalRequest};
+pub use model::{ModelPlugin, ModelSettings, ModelSettingsChanged, SetModel, SetThinking};
 pub use permission::{PermissionRules, Rule, RuleError};
 pub use runtime::{
     ActiveTurn, AgentPlugin, ApprovalDecided, InterruptTurn, PendingTurns, PendingUserMessages,
     RequestBuilderResource, ToolFinished, ToolsPlugin, TurnFailure, TurnFinished, TurnRequested,
-    UserMessage,
+    UserMessage, agent_root,
 };
 
-use agnes_core::config::ModelName;
 use agnes_core::llm::LlmRequest;
 use agnes_core::turn::Turn;
 
 /// 把 [`Turn`] 转换成具体请求。宿主提供一个，运行时在每次模型调用前
 /// 询问它 —— 提示词长什么样完全是宿主的事，[`Turn::prompt`] 只是标准
-/// 投影。
+/// 投影；模型与思考参数来自当前的 [`ModelSettings`]。
 pub trait RequestBuilder: Send + Sync {
-    fn build(&self, turn: &Turn) -> LlmRequest;
+    fn build(&self, turn: &Turn, settings: &ModelSettings) -> LlmRequest;
 }
 
-/// 标准转换者：turn 的标准投影（[`Turn::prompt`]）加模型名。
+/// 标准转换者：turn 的标准投影（[`Turn::prompt`]）加当前请求设置。
 /// 对提示词有想法的宿主自己实现 [`RequestBuilder`]。
-#[derive(Debug, Clone)]
-pub struct StandardRequestBuilder {
-    model: ModelName,
-}
-
-impl StandardRequestBuilder {
-    pub fn new(model: ModelName) -> Self {
-        Self { model }
-    }
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StandardRequestBuilder;
 
 impl RequestBuilder for StandardRequestBuilder {
-    fn build(&self, turn: &Turn) -> LlmRequest {
+    fn build(&self, turn: &Turn, settings: &ModelSettings) -> LlmRequest {
         LlmRequest {
-            model: self.model.clone(),
+            model: settings.model().clone(),
+            thinking: settings.thinking(),
             prompt: turn.prompt(),
         }
     }

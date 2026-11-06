@@ -1,6 +1,5 @@
 //! 运行时状态：typestate 值落进组件，工具调用落成实体。
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use agnes_core::agent::{Agent, AwaitingCall, AwaitingModel, AwaitingTools, Closed};
@@ -45,6 +44,22 @@ pub struct TurnClock {
     pub cancellation: CancelToken,
 }
 
+/// turn 实体的归属：它属于哪个 agent 根实体。
+///
+/// 对齐 [`ToolCallEntry::turn`] 的父回引模式：begin_turn 的每 agent 守卫、
+/// inject_pending 与 recorder 都靠它把 turn 路由回所属会话。
+pub struct TurnOwner(pub Entity);
+
+/// 挂在 turn 实体上的在飞模型调用：回复与取消按 id 路由回这里。
+///
+/// `issue_model_call` 在发出 [`LlmCall`](agnes_io::llm::LlmCall) 时挂上，
+/// `process_llm_reply` 收到回复时取走；turn 收场随实体一起消失，迟到的
+/// 回复落在已关闭的阶段上被安全忽略。
+pub(crate) struct InFlightCall {
+    pub(crate) id: LlmCallId,
+    pub(crate) model: ModelName,
+}
+
 /// 失败收场的标记：阶段已丢弃（session repairs 负责补写收尾事件），
 /// `close_turn` 按它发出 [`TurnFinished`](crate::runtime::TurnFinished)。
 pub struct TurnFailed {
@@ -80,52 +95,37 @@ pub struct ToolCallEntry {
     pub phase: CallPhase,
 }
 
-/// 在飞的模型调用：调用 id 与它归属的 turn、模型名。
+agnes_ecs::component!(
+    ActiveTurn,
+    TurnPhase,
+    TurnClock,
+    TurnFailed,
+    ToolCallEntry,
+    TurnOwner,
+    InFlightCall,
+    PendingTurns,
+    PendingUserMessages
+);
+
+/// 模型调用 id 的全局发放器：id 空间跨 agent 唯一，回复按 id 路由回
+/// 挂在 turn 实体上的 [`InFlightCall`]。
 #[derive(Default)]
-pub(crate) struct PendingCalls {
-    next: u64,
-    by_id: HashMap<LlmCallId, PendingCall>,
-}
+pub(crate) struct LlmCallSeq(u64);
 
-/// 一条在飞调用的归属信息。
-pub(crate) struct PendingCall {
-    pub turn: Entity,
-    pub model: ModelName,
-}
-
-impl PendingCalls {
-    /// 发一个调用：分配 id 并记住归属。
-    pub fn issue(&mut self, turn: Entity, model: ModelName) -> LlmCallId {
-        let id = LlmCallId::new(self.next);
-        self.next = self
-            .next
+impl LlmCallSeq {
+    /// 发放下一个调用 id。
+    pub(crate) fn issue(&mut self) -> LlmCallId {
+        let id = LlmCallId::new(self.0);
+        self.0 = self
+            .0
             .checked_add(1)
             .expect("model call id space exhausted");
-        self.by_id.insert(id, PendingCall { turn, model });
         id
-    }
-
-    /// 收走一条回复的归属信息；未知 id（迟到或已取消）返回 `None`。
-    pub fn take(&mut self, id: LlmCallId) -> Option<PendingCall> {
-        self.by_id.remove(&id)
-    }
-
-    /// 取走某个 turn 的全部在飞调用（打断时取消）。
-    pub fn take_for(&mut self, turn: Entity) -> Vec<LlmCallId> {
-        let mut ids = Vec::new();
-        self.by_id.retain(|id, call| {
-            if call.turn == turn {
-                ids.push(*id);
-                false
-            } else {
-                true
-            }
-        });
-        ids
     }
 }
 
-/// 活跃 turn 存在时到达的 turn 请求，等收场后依次开跑。
+/// 某 agent 根实体上等待开跑的 turn 请求：它有活跃 turn 时到达的请求
+/// 在这里排队，收场后依次开跑。
 #[derive(Default)]
 pub struct PendingTurns(pub(crate) Vec<std::sync::Arc<super::messages::TurnRequested>>);
 
@@ -141,7 +141,8 @@ impl PendingTurns {
     }
 }
 
-/// 还没有并入会话的用户消息：只在待调用阶段生效，其余场合在这里等待。
+/// 某 agent 根实体上还没有并入会话的用户消息：只在待调用阶段生效，
+/// 其余场合在这里等待。
 #[derive(Default)]
 pub struct PendingUserMessages(pub(crate) Vec<agnes_core::content::Content>);
 

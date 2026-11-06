@@ -4,8 +4,14 @@ use std::ops::{Deref, DerefMut};
 
 /// Marker trait for global values stored in the [`World`](crate::World).
 ///
-/// Every `Any + Send + Sync` type implements it. Resource storage is separate
-/// from component storage, so the same type can be both.
+/// Every `Any + Send + Sync` type implements it — unlike [`Component`], which
+/// is opt-in. That is safe here because the resource API surface has no
+/// bundle-shaped sibling: `insert_resource` always stores exactly the value
+/// it is given, so a tuple cannot silently masquerade as several resources.
+/// Resource storage is separate from component storage, so the same type can
+/// be both.
+///
+/// [`Component`]: crate::Component
 pub trait Resource: Any + Send + Sync {}
 
 impl<T: Any + Send + Sync> Resource for T {}

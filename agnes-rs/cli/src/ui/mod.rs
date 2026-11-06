@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use agnes_core::config::{ModelName, Thinking};
 use agnes_core::message::TokenUsage;
 
 pub(crate) mod plain;
@@ -17,22 +18,33 @@ pub(crate) enum UiCommand {
     StreamStart,
     StreamDelta(String),
     StreamEnd,
+    ReasoningDelta(String),
     CommitAssistant(String),
-    StepStats { step: u32, usage: TokenUsage },
+    StepStats {
+        step: u32,
+        usage: TokenUsage,
+    },
     Status(Status),
+    Models {
+        current: ModelName,
+        models: Vec<ModelName>,
+    },
+    ModelsFailed(String),
     Approval(Option<String>),
     Flush,
     Shutdown,
 }
 
-/// 状态栏快照，由 render 从 `Activity` 投影而来。
+/// 状态栏快照，由 render 从 `Activity` 与 `ModelSettings` 投影而来。
 #[derive(Clone, Debug, Default)]
 pub struct Status {
     pub model: String,
+    pub thinking: Thinking,
     pub step: u32,
     pub usage: TokenUsage,
     pub session_usage: TokenUsage,
     pub live_chars: u64,
+    pub live_reasoning_chars: u64,
     pub running: bool,
     pub streaming: bool,
     pub elapsed: Duration,

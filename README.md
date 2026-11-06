@@ -11,8 +11,15 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
 
 - 模型响应全程流式：OpenAI SSE 增量到达即解码，文本实时输出；工具调用与
   usage 在流尾组装成完整的 `LlmReply`，状态机与日志格式不变
+- 模型可在线切换：`/model` 拉取 provider 的 `GET /models` 列表并在 TUI 弹出
+  选择器，plain 模式直接打印；`/model <名称>` 直接切换。`MessageEnd` 仍按
+  step 记录实际模型，切换后日志可归因
+- 思考模式与强度：`--think off|low|medium|high` 或 `/think` 选择器；开启时
+  下发 `reasoning_effort`，响应里的 `reasoning_content` 以灰字流式展示，
+  不写入会话文件
 - 交互式会话默认使用 ratatui TUI：消息区、审批区、输入框与状态栏，实时
-  显示 step、输入/输出 token、会话累计用量与耗时；`--plain` 可回到行式输出
+  显示模型、思考强度、step、输入/输出 token、会话累计用量与耗时；`--plain`
+  可回到行式输出
 - 类型状态机驱动的 agent 循环，非法协议顺序在编译期即不可构造
 - 一轮 turn 的生命周期（`turn_start` / `message_*` / `tool_execution_*` /
   `turn_end`）由系统管线按序铸造并记入 `Log`；core 只持有领域状态
@@ -84,7 +91,11 @@ TUI 中：
   终端不支持 OSC 52 时，可 `Shift`+拖选使用终端原生复制
 - `Ctrl-C` 运行中打断任务，空闲时退出；`Ctrl-D` 退出
 - 需要审批时，审批区显示问题；`y` / `n` / `a` 直接作答，或输入完整答复后回车
-- 状态栏实时显示模型、step、当前步与累计 token、耗时
+- `/model`（或 `/model <名称>`）拉取并选择模型；`/think`（或
+  `/think off|low|medium|high`）设置思考模式。选择器内 `↑`/`↓` 移动、
+  `Enter` 确认、`Esc` 取消；打开选择器时 `Ctrl-C` 只关闭选择器
+- 状态栏实时显示模型、思考强度、step、当前步与累计 token、耗时；思考开启
+  时还会显示流式思考的 token 估算
 
 行式模式下会话中每一行都是一个任务，且共享完整会话记忆：
 
@@ -97,6 +108,10 @@ agnes chat --session ./notes/session.jsonl
 
 - `/new`：清空会话日志（系统提示与工具环境由下一轮重新记录一条 header）；
   带 `--session` 时轮转到新的兄弟文件，因为日志只追加
+- `/model`：打印 provider 的模型列表（当前模型带 `(current)`）；`/model <名称>`
+  直接切换，下一轮请求生效
+- `/think off|low|medium|high`：设置思考模式与强度（TUI 中 `/think` 无参数
+  会打开选择器）
 - `exit`、`quit` 或 EOF：退出会话
 - `Ctrl-C`：任务运行中中断任务并保留会话；在提示符处则退出
 - 运行期间输入的消息会排队，在下一个 step 边界注入；如果模型已经给出
@@ -114,6 +129,7 @@ agnes chat --session ./notes/session.jsonl
 | `--base-url <URL>` | `https://api.openai.com/v1` | OpenAI 兼容 API 地址 |
 | `--api-key <KEY>` | 见环境变量 | API 密钥 |
 | `--max-steps <N>` | `32` | 每个任务的最大模型轮次 |
+| `--think <LEVEL>` | `off` | 思考模式与强度：`off`、`low`、`medium`、`high`；开启时下发 `reasoning_effort` |
 | `--allow-shell` | 关闭 | 向模型提供 `run_shell` 工具 |
 | `--session <PATH>` | 关闭 | chat/run 的会话文件：存在即恢复，不存在即新建 |
 | `--yes` | 关闭 | 自动批准 ask 规则（审批审计仍会落盘） |
@@ -156,17 +172,17 @@ agnes chat --session ./notes/session.jsonl
 | `agnes-util` | 零依赖基础类型：`NonEmpty<T>`、`EmptyError` |
 | `agnes-core` | 纯领域模型与类型状态机（`Agent` + `Turn`），无 I/O、无异步、不含序列化、不产出事件 |
 | `agnes-ecs` | 独立的轻量系统编排运行时：资源、实体、消息总线、事件循环（`App` + `Plugin`），不含具体异步运行时 |
-| `agnes-record` | 记录词汇与会话状态：`Event` / `HostEvent` / `RunEvent`、`Log`、`Durability`，以及 `SessionLog` / `SessionStore` 端口（零 ecs 依赖） |
-| `agnes-io` | 异步端口 trait（`Tool`、`HttpTransport`）与模型调用词汇（`LlmCall` / `LlmReply` / `LlmCancel` / `LlmStreamEvent` / `LlmProvider`） |
-| `agnes-llm-openai` | OpenAI Chat Completions 纯编解码器（`OpenAiCodec` 请求/响应，`OpenAiStreamDecoder` SSE 增量解码，无 I/O） |
+| `agnes-record` | 记录词汇与会话状态：`Event` / `HostEvent` / `RunEvent`、`Log`、`Durability`，以及 `SessionLog` / `SessionStore` 端口（对 ecs 的依赖仅限把状态类型注册成组件） |
+| `agnes-io` | 异步端口 trait（`Tool`、`HttpTransport`）与模型调用词汇（`LlmCall` / `LlmReply` / `LlmCancel` / `LlmStreamEvent` / `ListModels` / `ModelsListed` / `LlmProvider`） |
+| `agnes-llm-openai` | OpenAI Chat Completions 纯编解码器（`OpenAiCodec` 请求/响应与 `GET /models` 列表，`OpenAiStreamDecoder` SSE 增量解码含 reasoning，无 I/O） |
 | `agnes-transport-reqwest` | 基于 `reqwest` 的 HTTP 传输适配器，支持逐块读取与跨块 UTF-8 拼接 |
 | `agnes-session-file` | 会话日志的 JSONL 实现：单写者、格式版本、崩溃补写；线格式（wire）定义在此 |
 | `agnes-plugin-async` | 异步任务执行：`TokioPlugin` / `ExecutorPlugin` 两个插件各自装 `AsyncExecutor`，任务直接交给具体运行时 |
-| `agnes-plugin-http` | ECS 原生 HTTP 能力：`HttpRequest` / `HttpResponse` / `HttpStreamRequest` / `HttpStreamEvent` / `HttpStreamEnd` / `HttpCancel` 消息、发号器 `HttpClient`、在飞表与取消、关停时统一取消 |
-| `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成流式请求，SSE 增量解码并转发 `LlmStreamEvent`，流尾解码回 `LlmReply`；装 `LlmProvider` 标记 |
-| `agnes-plugin-session` | 会话状态与策略：`Log`、`Durability`、序号、`RunEvent` 转发、flush 确认、轮转；不碰文件 |
-| `agnes-plugin-session-file` | 会话持久化：把打开的 `SessionFile` 装成 `SessionStoreResource`，拥有文件句柄、兄弟文件名与重开 |
-| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate；工具注册、权限规则与审批通道。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时），只读、不落盘 |
+| `agnes-plugin-http` | ECS 原生 HTTP 能力：`HttpRequest` / `HttpResponse` / `HttpStreamRequest` / `HttpStreamEvent` / `HttpStreamEnd` / `HttpCancel` 消息、发号器 `HttpClient`、每请求一张在飞实体（标记 + id + 取消令牌）、关停时统一取消 |
+| `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成流式请求，SSE 增量解码并转发 `LlmStreamEvent`，流尾解码回 `LlmReply`；`ListModels` 走缓冲 HTTP 路径回答 `ModelsListed`；装 `LlmProvider` 标记 |
+| `agnes-plugin-session` | 会话状态与策略：`Log`、`Durability`、序号、`RunEvent` 转发、flush 确认、轮转，全部挂在 agent 根实体上；不碰文件 |
+| `agnes-plugin-session-file` | 会话持久化：把打开的 `SessionFile` 装成根实体上的 `SessionStoreResource` 组件，拥有文件句柄、兄弟文件名与重开 |
+| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate；工具注册、权限规则与审批通道。`ModelPlugin`：当前模型与思考设置（`ModelSettings`，唯一写者）。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时、流式思考字符数），只读、不落盘 |
 | `agnes-cli` | 二进制 `agnes`：装配 `App`、stdin/审批/Ctrl-C 宿主任务、独立线程的 plain/ratatui 渲染与输入 |
 
 `agnes-transport-reqwest`、`agnes-llm-openai` 与 `agnes-session-file` 是纯
@@ -199,13 +215,19 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
   一个 `Turn`（系统提示与工具环境、会话消息、用量、step 记账）；core
   不持有日志、不产出事件，`agnes-agent` 的系统管线读取 `Turn` 并铸造、
   记录事件。
+- **每会话状态 = 组件，能力 = 资源**：每个 agent 会话是带 `AgentRoot`
+  标记的根实体，`Log`、`Durability`、`ModelSettings`、`Activity`、待处理
+  队列都以组件挂在它上面，turn 实体经 `TurnOwner` 回指归属，begin_turn
+  的单 turn 守卫按 agent 隔离 —— 多个 agent 在同一世界里并发互不串扰
+  （CLI 本轮仍只装配一个）。真正的全局能力保持资源：`AsyncExecutor`、
+  `HttpTransportResource`、`HttpClient`、`OpenAiCodec`、`ToolRegistry`、
+  `PermissionRules`、`ApprovalChannel`、`LlmProvider`。在飞桥接状态
+  （HTTP 在飞请求、OpenAI 流解码）各自成实体，按全局唯一 id 路由。
 - **插件与权限**：每个能力是一个 ecs `Plugin`，注册顺序即每 tick 的系统
-  执行顺序；插件之间只通过资源（`HttpClient`、`HttpTransportResource`、
-  `SessionStoreResource`、`AsyncExecutor`、`ToolRegistry`、
-  `PermissionRules`、`ApprovalChannel`、`Durability`、`LlmProvider`）与
-  消息协作。权限规则 deny > ask > 不表态，拒绝单调（规则无法把拒绝变回
-  放行，批准后还会做第二次门禁）；ask 命中而没接审批口时按 fail-closed
-  拒绝，`--yes` 自动批准但审计照记。
+  执行顺序；插件之间只通过上述资源、根实体组件与消息协作。权限规则
+  deny > ask > 不表态，拒绝单调（规则无法把拒绝变回放行，批准后还会做
+  第二次门禁）；ask 命中而没接审批口时按 fail-closed 拒绝，`--yes`
+  自动批准但审计照记。
 - **启动即校验**：`ask` 规则命中却无从应答（管道输入、无 TTY 又没给
   `--yes`）时启动即报错，而不是挂起等待；配置错误不等到第一次调用。
 - **端口与适配器**：`Tool`、`HttpTransport` 是 `io` 的 `async_trait`
@@ -248,6 +270,18 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
 - **审计与可追溯**：`MessageEnd` 记录产生该消息的模型（从系统自己构造的
   `LlmRequest.model` 回带），切换模型后日志仍能归因；审批落定、会话失败
   原因不扩 core 词汇，作为 `HostEvent` 与事件一起落盘。
+- **模型与思考设置是 ECS 状态**：`ModelSettings` 由 `ModelPlugin` 独占写入；
+  宿主（TUI、plain、未来的 GUI）只发 `SetModel` / `SetThinking` 意图消息，
+  观察 `ModelSettingsChanged`。`RequestBuilder` 只投影提示词，模型参数来自
+  设置资源，因此切换只影响下一份 `LlmCall`，in-flight 调用不变。该插件必须
+  先于 `AgentPlugin` 注册，才能在同一 tick 内让设置先于模型调用生效。
+- **模型列表是 provider 能力**：`ListModels` / `ModelsListed` 是 provider
+  中立词汇；OpenAI 兼容桥用缓冲 HTTP 路径发 `GET {base_url}models`，解析时
+  容忍 `{data: [...]}` 与裸数组两种形状，并排序去重。请求在飞时重复的
+  `ListModels` 被忽略，失败（404、超时、坏 JSON）原样回到界面。
+- **reasoning 只观察**：SSE 的 `reasoning_content`（别名 `reasoning`）解码为
+  `LlmStreamUpdate::Reasoning`，只用于灰字展示与字符计数；不进入 `LlmReply`、
+  不写入 `Log`，会话线格式与版本保持不变。
 - **转换者由宿主决定**：core 不组装提示词；系统管线在每次模型调用前用
   宿主侧的 `RequestBuilder`（`agnes-agent`）把 `Turn` 转成 `LlmRequest`。
 - **格式由上层定义**：core 与 record 的领域词汇（`Turn`、`Event`、

@@ -8,15 +8,19 @@ use agnes_core::message::{ToolCallId, ToolOutput};
 use agnes_core::turn::TurnResult;
 use agnes_ecs::Entity;
 
-/// 宿主要开始一个 turn：配置（header、goal、预算）一次性给出。
+/// 宿主要开始一个 turn：目标 agent 与配置（header、goal、预算）一次性给出。
 #[derive(Debug)]
 pub struct TurnRequested {
+    /// 这个 turn 属于哪个 agent 根实体。
+    pub agent: Entity,
     pub config: AgentConfig,
 }
 
-/// 运行中注入的用户消息：在下一次待调用阶段并入会话。
+/// 运行中注入的用户消息：在目标 agent 的下一次待调用阶段并入会话。
 #[derive(Debug)]
 pub struct UserMessage {
+    /// 消息注入哪个 agent 根实体的会话。
+    pub agent: Entity,
     pub content: Content,
 }
 
@@ -34,13 +38,18 @@ pub struct ApprovalDecided {
     pub approved: bool,
 }
 
-/// 宿主要打断当前 turn：in-flight 的模型/工具任务一并取消。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InterruptTurn;
+/// 宿主要打断目标 agent 的当前 turn：in-flight 的模型/工具任务一并取消。
+#[derive(Clone, Copy, Debug)]
+pub struct InterruptTurn {
+    /// 打断哪个 agent 根实体的活跃 turn。
+    pub agent: Entity,
+}
 
 /// 一个 turn 收场：正常收场带结果，失败带原因。
 #[derive(Debug)]
 pub struct TurnFinished {
+    /// 收场的 turn 属于哪个 agent 根实体。
+    pub agent: Entity,
     pub result: Result<TurnResult, TurnFailure>,
     /// turn 的开始与结束时刻（供宿主计算耗时）。
     pub started_at: jiff::Timestamp,

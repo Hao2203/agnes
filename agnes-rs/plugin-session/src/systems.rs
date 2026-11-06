@@ -1,12 +1,15 @@
-//! 会话系统的三件事：转发、确认、轮转。
+//! 会话系统的三件事：转发、确认、轮转。状态全部挂在各 agent 的
+//! [`AgentRoot`] 实体上，系统按实体迭代；当前宿主只装一个 agent，多 agent
+//! 时每个根实体的队列与耐久进度天然互相隔离。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agnes_ecs::{MessageReader, Res, ResMut, RuntimeSender};
+use agnes_ecs::{Entity, MessageReader, Query, Res, RuntimeSender, With};
 use agnes_plugin_async::AsyncExecutor;
 use agnes_record::{
-    Durability, HostEvent, Log, RotateSession, RunEvent, SessionStore, SessionStoreResource,
+    AgentRoot, Durability, HostEvent, Log, RotateSession, RunEvent, SessionStore,
+    SessionStoreResource,
 };
 
 use crate::{CHANNEL_CAPACITY, SessionCommand, SessionPump};
@@ -14,43 +17,81 @@ use crate::{CHANNEL_CAPACITY, SessionCommand, SessionPump};
 /// The writer acknowledged everything up to this sequence as durable.
 #[derive(Clone, Debug)]
 pub struct SessionFlushed {
+    /// The agent root whose durability advanced.
+    pub agent: Entity,
     pub seq: u64,
 }
 
 /// The writer gave up: the session is unwritable from now on (fail-closed).
 #[derive(Clone, Debug)]
 pub struct SessionWriteFailed {
+    /// The agent root whose session failed.
+    pub agent: Entity,
     pub cause: String,
 }
 
 /// The store opened the rotated file.
 #[derive(Clone, Debug)]
 pub struct SessionRotated {
+    /// The agent root whose store rotated.
+    pub agent: Entity,
     pub path: PathBuf,
 }
 
-/// Forwards session-relevant [`RunEvent`]s to the writer task and starts the
-/// task lazily on the first run with a store installed.
+/// Forwards session-relevant [`RunEvent`]s to each session's writer task and
+/// starts the task lazily on the first run with a store installed.
 ///
 /// Never awaits: the system only enqueues commands onto a bounded channel.
 /// Run events and rotation requests are drained on every tick even when no
 /// store is installed, so the message bus never piles up behind this reader.
+/// The run-event stream itself is global this round (one agent per app);
+/// addressing it per agent is part of the multi-agent follow-up.
 pub fn session_pump(
     executor: Res<AsyncExecutor>,
-    mut pump: ResMut<SessionPump>,
-    mut durability: ResMut<Durability>,
-    store: Option<Res<SessionStoreResource>>,
+    mut sessions: Query<
+        (
+            Entity,
+            &mut SessionPump,
+            &mut Durability,
+            Option<&SessionStoreResource>,
+        ),
+        With<AgentRoot>,
+    >,
     mut run_events: MessageReader<RunEvent>,
     mut rotations: MessageReader<RotateSession>,
 ) {
     let events = run_events.read();
     let rotations = rotations.read();
+    for (agent, mut pump, mut durability, store) in sessions.iter_mut() {
+        pump_session(
+            agent,
+            &executor,
+            &mut pump,
+            &mut durability,
+            store.as_deref(),
+            &events,
+            &rotations,
+        );
+    }
+}
+
+/// Drives one session's pump: forwards this tick's events and rotations to
+/// its writer, starting the writer lazily when a store is installed.
+fn pump_session(
+    agent: Entity,
+    executor: &AsyncExecutor,
+    pump: &mut SessionPump,
+    durability: &mut Durability,
+    store: Option<&SessionStoreResource>,
+    events: &[Arc<RunEvent>],
+    rotations: &[Arc<RotateSession>],
+) {
     if durability.failed.is_some() {
         return;
     }
     let Some(store) = store else {
         // 内存模式：没有落盘可等，序号随日志同步前移，报告门禁恒开。
-        for run_event in &events {
+        for run_event in events {
             if translate(&mut durability.sent_seq, run_event).is_some() {
                 durability.flushed_seq = durability.sent_seq;
             }
@@ -59,9 +100,14 @@ pub fn session_pump(
     };
     if pump.sender.is_none() {
         let (sender, receiver) = async_channel::bounded(CHANNEL_CAPACITY);
-        let writer = writer_task(receiver, executor.sender(), Arc::clone(store.store()));
+        let writer = writer_task(
+            receiver,
+            executor.sender(),
+            Arc::clone(store.store()),
+            agent,
+        );
         if let Err(error) = executor.spawn(writer) {
-            fail(&mut durability, error);
+            fail(durability, error);
             return;
         }
         pump.sender = Some(sender);
@@ -72,11 +118,11 @@ pub fn session_pump(
         .expect("the writer task is started above");
 
     for run_event in events {
-        let Some(command) = translate(&mut durability.sent_seq, &run_event) else {
+        let Some(command) = translate(&mut durability.sent_seq, run_event) else {
             continue;
         };
         if let Err(error) = sender.try_send(command) {
-            fail(&mut durability, error);
+            fail(durability, error);
             return;
         }
     }
@@ -84,12 +130,12 @@ pub fn session_pump(
         let seq = match durability.sent_seq.checked_add(1) {
             Some(seq) => seq,
             None => {
-                fail(&mut durability, "session sequence number exhausted");
+                fail(durability, "session sequence number exhausted");
                 return;
             }
         };
         if let Err(error) = sender.try_send(SessionCommand::Rotate { seq }) {
-            fail(&mut durability, error);
+            fail(durability, error);
             return;
         }
         durability.sent_seq = seq;
@@ -155,16 +201,29 @@ fn fail(durability: &mut Durability, cause: impl std::fmt::Display) {
     }
 }
 
-/// Applies writer acknowledgements and failures to the [`Durability`] state.
+/// Applies writer acknowledgements and failures to each session's
+/// [`Durability`], routed by the agent root the writer belongs to.
 pub fn session_ack(
-    mut durability: ResMut<Durability>,
+    mut sessions: Query<(Entity, &mut Durability), With<AgentRoot>>,
     mut flushed: MessageReader<SessionFlushed>,
     mut failures: MessageReader<SessionWriteFailed>,
 ) {
     for message in flushed.read() {
+        let Some((_, mut durability)) = sessions
+            .iter_mut()
+            .find(|(entity, _)| *entity == message.agent)
+        else {
+            continue;
+        };
         durability.flushed_seq = durability.flushed_seq.max(message.seq);
     }
     for message in failures.read() {
+        let Some((_, mut durability)) = sessions
+            .iter_mut()
+            .find(|(entity, _)| *entity == message.agent)
+        else {
+            continue;
+        };
         fail(&mut durability, &message.cause);
     }
 }
@@ -173,16 +232,17 @@ pub fn session_ack(
 /// the session; a persistence store opens the next storage and reports it as
 /// [`SessionRotated`].
 pub fn session_rotate(
-    mut log: ResMut<Log>,
-    mut durability: ResMut<Durability>,
+    mut sessions: Query<(&mut Log, &mut Durability), With<AgentRoot>>,
     mut requests: MessageReader<RotateSession>,
 ) {
     if requests.read().is_empty() {
         return;
     }
-    log.reset();
-    durability.sent_seq = 0;
-    durability.flushed_seq = 0;
+    for (mut log, mut durability) in sessions.iter_mut() {
+        log.reset();
+        durability.sent_seq = 0;
+        durability.flushed_seq = 0;
+    }
 }
 
 /// The ordered writer: appends commands in arrival order through the store,
@@ -193,41 +253,45 @@ async fn writer_task(
     receiver: async_channel::Receiver<SessionCommand>,
     sender: RuntimeSender,
     store: Arc<dyn SessionStore>,
+    agent: Entity,
 ) {
     loop {
         let command = match receiver.recv().await {
             Ok(command) => command,
             Err(_) => return,
         };
-        let mut acked = match apply(&store, &sender, command).await {
+        let mut acked = match apply(&store, &sender, command, agent).await {
             Ok(seq) => seq,
             Err(cause) => {
-                report(&sender, cause);
+                report(&sender, cause, agent);
                 return;
             }
         };
         while let Ok(command) = receiver.try_recv() {
-            acked = match apply(&store, &sender, command).await {
+            acked = match apply(&store, &sender, command, agent).await {
                 Ok(seq) => seq,
                 Err(cause) => {
-                    report(&sender, cause);
+                    report(&sender, cause, agent);
                     return;
                 }
             };
         }
         if let Err(error) = store.flush().await {
-            report(&sender, error.to_string());
+            report(&sender, error.to_string(), agent);
             return;
         }
-        if sender.send_message(SessionFlushed { seq: acked }).is_err() {
+        if sender
+            .send_message(SessionFlushed { agent, seq: acked })
+            .is_err()
+        {
             return;
         }
     }
 }
 
-fn report(sender: &RuntimeSender, cause: String) {
+fn report(sender: &RuntimeSender, cause: String, agent: Entity) {
     log::error!("session writer failed; failing closed: {cause}");
-    let _ = sender.send_message(SessionWriteFailed { cause });
+    let _ = sender.send_message(SessionWriteFailed { agent, cause });
 }
 
 /// Applies one command to the store, returning the command's sequence number.
@@ -235,6 +299,7 @@ async fn apply(
     store: &Arc<dyn SessionStore>,
     sender: &RuntimeSender,
     command: SessionCommand,
+    agent: Entity,
 ) -> Result<u64, String> {
     match command {
         SessionCommand::Append { seq, at, event } => store
@@ -249,7 +314,7 @@ async fn apply(
             .map_err(|error| error.to_string()),
         SessionCommand::Rotate { seq } => {
             let path = store.rotate().await.map_err(|error| error.to_string())?;
-            let _ = sender.send_message(SessionRotated { path });
+            let _ = sender.send_message(SessionRotated { agent, path });
             Ok(seq)
         }
     }
@@ -258,7 +323,7 @@ async fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_ecs::{App, Update};
+    use agnes_ecs::{App, ResMut, Update};
     use agnes_record::{Event, SessionError};
     use async_trait::async_trait;
     use jiff::Timestamp;
@@ -320,7 +385,13 @@ mod tests {
             .expect("send");
         drop(sender_tx);
 
-        writer_task(receiver, app.runtime_sender(), memory.clone()).await;
+        writer_task(
+            receiver,
+            app.runtime_sender(),
+            memory.clone(),
+            agnes_ecs::Entity::PLACEHOLDER,
+        )
+        .await;
 
         let events = memory.events.lock().expect("lock").clone();
         assert!(
@@ -359,7 +430,13 @@ mod tests {
             .expect("send");
         drop(sender_tx);
 
-        writer_task(receiver, app.runtime_sender(), memory).await;
+        writer_task(
+            receiver,
+            app.runtime_sender(),
+            memory,
+            agnes_ecs::Entity::PLACEHOLDER,
+        )
+        .await;
         app.pump().expect("apply the ack");
 
         let acked = app.world().resource::<Acked>().expect("acked is installed");
@@ -379,7 +456,13 @@ mod tests {
             .await
             .expect("send");
         drop(sender_tx);
-        writer_task(receiver, app.runtime_sender(), memory).await;
+        writer_task(
+            receiver,
+            app.runtime_sender(),
+            memory,
+            agnes_ecs::Entity::PLACEHOLDER,
+        )
+        .await;
         app.pump().expect("apply the rotation report");
 
         let rotated = app
@@ -393,12 +476,16 @@ mod tests {
     fn a_write_failure_marks_the_session_failed_and_stops_the_pump() {
         let mut app = App::new();
         app.add_plugin(agnes_plugin_async::TokioPlugin);
-        app.insert_resource(Durability {
-            sent_seq: 0,
-            flushed_seq: 0,
-            failed: None,
-        });
-        app.insert_resource(SessionPump::default());
+        let root = app.world_mut().spawn(AgentRoot);
+        app.world_mut().insert(
+            root,
+            Durability {
+                sent_seq: 0,
+                flushed_seq: 0,
+                failed: None,
+            },
+        );
+        app.world_mut().insert(root, SessionPump::default());
         // ack 先于 pump：失败在本 tick 内生效，pump 当场短路。
         app.add_systems(Update, session_ack);
         app.add_systems(Update, session_pump);
@@ -406,13 +493,14 @@ mod tests {
         let sender = app.runtime_sender();
         sender
             .send_message(SessionWriteFailed {
+                agent: root,
                 cause: "disk full".into(),
             })
             .expect("runtime is alive");
         app.pump().expect("schedule runs");
         assert_eq!(
             app.world()
-                .resource::<Durability>()
+                .get::<Durability>(root)
                 .expect("durability is installed")
                 .failed
                 .as_deref(),
@@ -429,7 +517,7 @@ mod tests {
         app.pump().expect("schedule runs");
         assert_eq!(
             app.world()
-                .resource::<Durability>()
+                .get::<Durability>(root)
                 .expect("durability is installed")
                 .sent_seq,
             0,

@@ -49,6 +49,43 @@ impl<T: Component> QueryData for &mut T {
     }
 }
 
+/// `Option<&T>` matches every entity and yields `None` when `T` is absent.
+///
+/// Unlike `&T` it never filters an entity out of the query. The component is
+/// still read access: combining `Option<&T>` with `&mut T` in one system is
+/// rejected at registration time.
+impl<T: Component> QueryData for Option<&T> {
+    type Item<'w> = Option<Ref<'w, T>>;
+
+    fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
+        Some(world.get::<T>(entity))
+    }
+
+    fn access() -> AccessSet {
+        let mut set = AccessSet::new();
+        set.push(Access::component::<T>(AccessMode::Read));
+        set
+    }
+}
+
+/// `Option<&mut T>` matches every entity and yields `None` when `T` is absent.
+///
+/// The component is still write access, so two parameters writing `T` in one
+/// system are rejected at registration time even behind `Option`.
+impl<T: Component> QueryData for Option<&mut T> {
+    type Item<'w> = Option<RefMut<'w, T>>;
+
+    fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
+        Some(world.get_mut::<T>(entity))
+    }
+
+    fn access() -> AccessSet {
+        let mut set = AccessSet::new();
+        set.push(Access::component::<T>(AccessMode::Write));
+        set
+    }
+}
+
 /// `Entity` matches every live entity, with or without components.
 ///
 /// It is not a component-existence filter: to target a kind of entity, query
@@ -296,6 +333,8 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct Running;
 
+    crate::component!(Name, Active, Running);
+
     fn query<'w>(world: &'w World) -> Query<'w, &'static Name> {
         Query::new(world)
     }
@@ -406,5 +445,38 @@ mod tests {
         assert_eq!(idle.count(), 2);
         assert_eq!(none.count(), 1);
         assert!(!none.is_empty());
+    }
+
+    #[test]
+    fn optional_read_matches_every_entity() {
+        let mut world = World::new();
+        let with_tag = world.spawn(Name("tagged"));
+        world.spawn(Active(true));
+
+        let query = Query::<Option<&'static Name>>::new(&world);
+        let items: Vec<Option<&'static str>> = query.iter().map(|name| name.map(|n| n.0)).collect();
+        assert_eq!(items, [Some("tagged"), None]);
+
+        assert_eq!(
+            query.get(with_tag).expect("with_tag matches").map(|n| n.0),
+            Some("tagged")
+        );
+    }
+
+    #[test]
+    fn optional_write_mutates_only_present_components() {
+        let mut world = World::new();
+        let tagged = world.spawn(Active(false));
+        let bare = world.spawn(Name("no-active"));
+
+        {
+            let mut query = Query::<Option<&'static mut Active>>::new(&world);
+            for mut active in query.iter_mut().flatten() {
+                active.0 = true;
+            }
+        }
+
+        assert!(world.get::<Active>(tagged).expect("tagged has it").0);
+        assert!(world.get::<Active>(bare).is_none());
     }
 }

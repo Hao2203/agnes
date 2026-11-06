@@ -4,7 +4,7 @@
 //! sees. [`Turn::prompt`](crate::turn::Turn::prompt) is the standard
 //! projection of the turn's state; [`Prompt`] is only the resulting data.
 
-use crate::config::ModelName;
+use crate::config::{ModelName, Thinking};
 use crate::content::Content;
 use crate::message::{Message, TokenUsage, ToolCall};
 use crate::tool::ToolSpec;
@@ -23,10 +23,12 @@ pub struct Prompt {
 }
 
 /// The concrete request the seam carries: the semantic [`Prompt`] plus the
-/// model name the host wires in.
+/// request parameters the host wires in.
 #[derive(Debug, Clone)]
 pub struct LlmRequest {
     pub model: ModelName,
+    /// Whether the model should reason and how hard; `Off` sends no parameter.
+    pub thinking: Thinking,
     pub prompt: Prompt,
 }
 

@@ -5,11 +5,31 @@ use crate::entity::Entity;
 
 /// Marker trait for values that can be attached to an [`Entity`].
 ///
-/// Every `Any + Send + Sync` type implements it. Resources use a separate
-/// type namespace, so the same type can be both a component and a resource.
+/// **Opt-in on purpose.** Component types must implement this trait
+/// explicitly — usually through the [`component!`] macro. A blanket impl for
+/// every `Any + Send + Sync` type would also cover tuples, and then
+/// `spawn((A, B, C))` compiles while silently storing the whole tuple as one
+/// opaque component value instead of three components. With explicit impls
+/// that call is a type error; bundles go through [`spawn_bundle`].
+///
+/// Resources use a separate type namespace, so the same type can be both a
+/// component and a resource.
+///
+/// [`component!`]: crate::component
+/// [`spawn_bundle`]: crate::World::spawn_bundle
 pub trait Component: Any + Send + Sync {}
 
-impl<T: Any + Send + Sync> Component for T {}
+/// Implements [`Component`] for a list of types.
+///
+/// ```ignore
+/// agnes_ecs::component!(Health, Position, Sprite);
+/// ```
+#[macro_export]
+macro_rules! component {
+    ($($component:ty),+ $(,)?) => {
+        $(impl $crate::Component for $component {})+
+    };
+}
 
 pub(crate) trait ErasedStorage: Any + Send {
     fn as_any(&self) -> &dyn Any;

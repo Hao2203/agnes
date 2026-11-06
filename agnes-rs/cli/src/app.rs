@@ -12,6 +12,7 @@ use std::time::Duration;
 use agnes_agent::StandardRequestBuilder;
 use agnes_agent::activity::ActivityPlugin;
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
+use agnes_agent::model::ModelPlugin;
 use agnes_agent::permission::{PermissionRules, Rule};
 use agnes_agent::runtime::{
     ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnFinished, TurnRequested,
@@ -24,7 +25,7 @@ use agnes_core::header::{Environment, Header};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::AgentConfig;
 use agnes_ecs::{
-    App, CancelToken, MessageReader, MessageWriter, Query, Res, RuntimeSender, Update,
+    App, CancelToken, Entity, MessageReader, MessageWriter, Query, Res, RuntimeSender, Update, With,
 };
 use agnes_io::tool::ToolRegistry;
 use agnes_plugin_async::TokioPlugin;
@@ -32,6 +33,7 @@ use agnes_plugin_http::HttpPlugin;
 use agnes_plugin_openai::OpenAiPlugin;
 use agnes_plugin_session::SessionPlugin;
 use agnes_plugin_session_file::SessionFilePlugin;
+use agnes_record::AgentRoot;
 use agnes_session_file::{Opened, SessionFile};
 use agnes_transport_reqwest::ReqwestTransport;
 use anyhow::{Context, Result, bail};
@@ -57,21 +59,27 @@ struct HostConfig {
     system_prompt: SystemPrompt,
 }
 
-/// 把用户输入路由进管线：没有活跃 turn 时开新 turn，否则交给注入管线。
+/// 把用户输入路由进管线：目标 agent 没有活跃 turn 时开新 turn，否则交给
+/// 注入管线。
 ///
-/// `turns` 只匹配带 [`ActiveTurn`] 标记的 turn 实体，不会把世界里的其他实体
-/// 误当成活跃 turn。
+/// `turns` 只匹配带 [`ActiveTurn`] 标记的 turn 实体，不会把世界里的其他
+/// 实体误当成活跃 turn。本轮宿主只装配一个 agent；多会话入口留待后续。
 fn dispatch_lines(
     mut lines: MessageReader<TaskLine>,
     turns: Query<&ActiveTurn>,
+    roots: Query<Entity, With<AgentRoot>>,
     registry: Res<ToolRegistry>,
     config: Res<HostConfig>,
     mut turn_requests: MessageWriter<TurnRequested>,
     mut injections: MessageWriter<UserMessage>,
 ) {
+    let Some(agent) = roots.iter().next() else {
+        return;
+    };
     for line in lines.read() {
         if turns.is_empty() {
             turn_requests.write(TurnRequested {
+                agent,
                 config: AgentConfig {
                     header: session_header(&config.system_prompt, &registry),
                     goal: Some(line.content.clone()),
@@ -80,6 +88,7 @@ fn dispatch_lines(
             });
         } else {
             injections.write(UserMessage {
+                agent,
                 content: line.content.clone(),
             });
         }
@@ -149,14 +158,15 @@ fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<App> {
             resolve_api_key(cli.api_key.clone())?,
         ))
         .add_plugin(ToolsPlugin::empty().with_tools(builtin_tools(root, cli.allow_shell)))
-        .add_plugin(ActivityPlugin::new(cli.model.clone()))
+        .add_plugin(ActivityPlugin)
+        .add_plugin(ModelPlugin::new(cli.model.clone(), cli.think))
         .insert_resource(rules)
         .insert_resource(HostConfig {
             budget: cli.max_steps,
             system_prompt: SystemPrompt::new(SYSTEM_PROMPT),
         })
         .insert_resource(RequestBuilderResource::new(Box::new(
-            StandardRequestBuilder::new(cli.model.clone()),
+            StandardRequestBuilder,
         )))
         .insert_resource(Arc::clone(&input))
         .add_systems(Update, dispatch_lines)
@@ -222,6 +232,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
     renderer.status(Status {
         model: cli.model.to_string(),
+        thinking: cli.think,
         ..Status::default()
     });
 
@@ -250,7 +261,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         false => (None, None),
     };
 
-    let app = build_app(
+    let mut app = build_app(
         app,
         &cli,
         HostAssembly {
@@ -262,11 +273,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             single_shot,
         },
     )?;
+    // 宿主任务（/model、Ctrl-C）的目标 agent：装配即已存在的唯一根实体。
+    input.set_agent(agnes_agent::agent_root(app.world_mut()));
 
     // TUI 的备用屏幕没有终端回滚；把恢复出的会话历史铺进消息区，供滚动查看。
-    if tui && let Some(log) = app.world().resource::<agnes_record::Log>() {
-        for line in crate::render::history_lines(&log) {
-            renderer.line(line);
+    if tui {
+        let agent = agnes_agent::agent_root(app.world_mut());
+        if let Some(log) = app.world().get::<agnes_record::Log>(agent) {
+            for line in crate::render::history_lines(&log) {
+                renderer.line(line);
+            }
         }
     }
 
@@ -301,8 +317,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             None
         }
     };
-    let stdin_task = (needs_line_reader && !tui)
-        .then(|| input::spawn_stdin_reader(Arc::clone(&input), Arc::clone(&channels)));
+    let stdin_task = (needs_line_reader && !tui).then(|| {
+        input::spawn_stdin_reader(Arc::clone(&input), Arc::clone(&channels), renderer.clone())
+    });
 
     if let Some(goal) = goal {
         channels

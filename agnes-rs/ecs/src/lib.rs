@@ -101,3 +101,6 @@ pub use system::{
 };
 pub use system_param::{ParamError, SystemParam};
 pub use world::{Bundle, World};
+
+// The runtime's own component vocabulary.
+component!(CancelToken);

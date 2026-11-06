@@ -7,14 +7,16 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agnes_core::config::{ModelName, StepBudget, SystemPrompt};
+use agnes_core::config::{ModelName, ReasoningEffort, StepBudget, SystemPrompt, Thinking};
 use agnes_core::content::Content;
 use agnes_core::header::{Environment, Header};
 use agnes_core::llm::{LlmResponse, StopReason};
 use agnes_core::message::{TokenUsage, ToolArguments, ToolCall, ToolCallId, ToolOutput};
 use agnes_core::tool::{JsonSchema, ToolError, ToolName, ToolSpec};
 use agnes_core::turn::{AgentConfig, Outcome};
-use agnes_ecs::{App, MessageReader, MessageWriter, Query, Res, ResMut, RuntimeSender, Update};
+use agnes_ecs::{
+    App, Entity, MessageReader, MessageWriter, Query, Res, ResMut, RuntimeSender, Update,
+};
 use agnes_io::http::TransportError;
 use agnes_io::llm::{LlmCall, LlmCancel, LlmError, LlmProvider, LlmReply};
 use agnes_io::tool::Tool;
@@ -27,9 +29,17 @@ use super::messages::{ApprovalDecided, InterruptTurn, TurnFinished, TurnRequeste
 use super::{ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin};
 use crate::StandardRequestBuilder;
 use crate::approval::ApprovalChannel;
+use crate::model::{ModelPlugin, SetModel, SetThinking};
 use crate::permission::{PermissionRules, Rule};
 
 const MODEL: &str = "test-model";
+
+/// The agent root the plugins attached the session state to.
+fn agent(app: &App) -> Entity {
+    app.world()
+        .entity_with::<agnes_record::AgentRoot>()
+        .expect("agent root exists")
+}
 
 fn capture(app: &App) -> Capture {
     app.world()
@@ -95,6 +105,7 @@ struct ProviderState {
     replies: Mutex<VecDeque<Result<LlmResponse, LlmError>>>,
     calls: AtomicUsize,
     cancels: AtomicUsize,
+    last: Arc<Mutex<Option<(String, Thinking)>>>,
     muted: bool,
 }
 
@@ -120,6 +131,10 @@ impl ProviderState {
     fn cancels(&self) -> usize {
         self.cancels.load(Ordering::SeqCst)
     }
+
+    fn last_handle(&self) -> Arc<Mutex<Option<(String, Thinking)>>> {
+        Arc::clone(&self.last)
+    }
 }
 
 fn answer_calls(
@@ -129,6 +144,10 @@ fn answer_calls(
 ) {
     for call in calls.read() {
         provider.calls.fetch_add(1, Ordering::SeqCst);
+        *provider.last.lock().expect("last lock") = Some((
+            call.request.model.as_str().to_owned(),
+            call.request.thinking,
+        ));
         if provider.muted {
             continue;
         }
@@ -223,18 +242,22 @@ fn config(goal: &str) -> AgentConfig {
 
 fn app(provider: ProviderState) -> App {
     let mut app = App::new();
-    app.add_plugin(AgentPlugin)
-        .insert_resource(provider)
-        .insert_resource(LlmProvider)
-        .insert_resource(RequestBuilderResource::new(Box::new(
-            StandardRequestBuilder::new(ModelName::from_str(MODEL).expect("static name is valid")),
-        )))
-        .insert_resource(Capture::default())
-        .add_systems(Update, capture_finished)
-        .add_systems(Update, capture_run_events)
-        .add_systems(Update, answer_calls)
-        .add_systems(Update, count_cancels)
-        .add_plugin(TokioPlugin);
+    app.add_plugin(ModelPlugin::new(
+        ModelName::from_str(MODEL).expect("static name is valid"),
+        Thinking::Off,
+    ))
+    .add_plugin(AgentPlugin)
+    .insert_resource(provider)
+    .insert_resource(LlmProvider)
+    .insert_resource(RequestBuilderResource::new(Box::new(
+        StandardRequestBuilder,
+    )))
+    .insert_resource(Capture::default())
+    .add_systems(Update, capture_finished)
+    .add_systems(Update, capture_run_events)
+    .add_systems(Update, answer_calls)
+    .add_systems(Update, count_cancels)
+    .add_plugin(TokioPlugin);
     app
 }
 
@@ -266,9 +289,12 @@ async fn drive(mut app: App, seed: impl FnOnce(&RuntimeSender)) -> Capture {
 
 #[tokio::test]
 async fn a_turn_completes_with_a_final_answer() {
-    let capture = drive(app(ProviderState::default()), |sender| {
+    let app = app(ProviderState::default());
+    let agent = agent(&app);
+    let capture = drive(app, |sender| {
         sender
             .send_message(TurnRequested {
+                agent,
                 config: config("hello"),
             })
             .expect("runtime is alive");
@@ -287,6 +313,42 @@ async fn a_turn_completes_with_a_final_answer() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn a_model_switch_changes_the_next_request() {
+    let provider = ProviderState::default();
+    let last = provider.last_handle();
+    let mut app = app(provider);
+    let agent = agent(&app);
+    app.world_mut().send_message(SetModel {
+        agent,
+        model: ModelName::from_str("other-model").expect("static name is valid"),
+    });
+    app.world_mut().send_message(SetThinking {
+        agent,
+        thinking: Thinking::On(ReasoningEffort::Low),
+    });
+    app.pump().expect("settings apply");
+
+    let capture = drive(app, |sender| {
+        sender
+            .send_message(TurnRequested {
+                agent,
+                config: config("hello"),
+            })
+            .expect("runtime is alive");
+    })
+    .await;
+
+    assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
+    let (model, thinking) = last
+        .lock()
+        .expect("last lock")
+        .clone()
+        .expect("a request was sent");
+    assert_eq!(model, "other-model");
+    assert_eq!(thinking, Thinking::On(ReasoningEffort::Low));
 }
 
 #[derive(Default)]
@@ -308,9 +370,11 @@ async fn the_active_turn_marker_tracks_the_turn_lifecycle() {
     let mut app = app(ProviderState::muted());
     app.insert_resource(ActiveFlag::default());
     app.add_systems(Update, track_active);
+    let agent = agent(&app);
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            agent,
             config: config("hold"),
         })
         .expect("runtime is alive");
@@ -322,7 +386,7 @@ async fn the_active_turn_marker_tracks_the_turn_lifecycle() {
     );
 
     sender
-        .send_message(InterruptTurn)
+        .send_message(InterruptTurn { agent })
         .expect("runtime is alive");
     app.pump().expect("schedule runs");
     assert!(
@@ -334,10 +398,12 @@ async fn the_active_turn_marker_tracks_the_turn_lifecycle() {
 #[tokio::test]
 async fn queued_turn_requests_run_one_after_another() {
     let mut app = app(ProviderState::default());
+    let agent = agent(&app);
     let sender = app.runtime_sender();
     for goal in ["first", "second"] {
         sender
             .send_message(TurnRequested {
+                agent,
                 config: config(goal),
             })
             .expect("runtime is alive");
@@ -357,13 +423,68 @@ async fn queued_turn_requests_run_one_after_another() {
     panic!("both turns did not finish");
 }
 
+#[derive(Default)]
+struct ActiveCount(usize);
+
+fn track_active_count(turns: Query<&ActiveTurn>, mut count: ResMut<ActiveCount>) {
+    count.0 = turns.iter().count();
+}
+
+#[tokio::test]
+async fn each_agent_runs_its_own_turn_concurrently() {
+    let mut app = app(ProviderState::muted());
+    app.insert_resource(ActiveCount::default());
+    app.add_systems(Update, track_active_count);
+
+    // 第二个 agent 根实体：按 AgentPlugin 的兜底流程挂上每会话状态。
+    let first = agent(&app);
+    let second = {
+        let root = app.world_mut().spawn(agnes_record::AgentRoot);
+        let world = app.world_mut();
+        world.insert(root, agnes_record::Log::default());
+        world.insert(root, super::PendingTurns::default());
+        world.insert(root, super::PendingUserMessages::default());
+        world.insert(
+            root,
+            crate::model::ModelSettings::new(
+                ModelName::from_str(MODEL).expect("static name is valid"),
+                Thinking::Off,
+            ),
+        );
+        root
+    };
+
+    let sender = app.runtime_sender();
+    for agent in [first, second] {
+        sender
+            .send_message(TurnRequested {
+                agent,
+                config: config("hold"),
+            })
+            .expect("runtime is alive");
+    }
+    app.pump().expect("schedule runs");
+
+    let count = app
+        .world()
+        .resource::<ActiveCount>()
+        .expect("count is installed")
+        .0;
+    assert_eq!(
+        count, 2,
+        "each agent runs its own turn; neither queues behind the other"
+    );
+}
+
 #[tokio::test]
 async fn a_tool_round_runs_the_tool_and_completes() {
     let mut app = app(ProviderState::with_replies(vec![Ok(tool_response())]));
     app.add_plugin(ToolsPlugin::new(Arc::new(EchoTool::new())));
+    let agent = agent(&app);
     let capture = drive(app, |sender| {
         sender
             .send_message(TurnRequested {
+                agent,
                 config: config("use the tool"),
             })
             .expect("runtime is alive");
@@ -398,9 +519,11 @@ async fn a_denied_tool_settles_with_a_synthetic_failure() {
         deny: vec![Rule::Prefix("echo".into())],
         ask: vec![],
     });
+    let agent = agent(&app);
     let capture = drive(app, |sender| {
         sender
             .send_message(TurnRequested {
+                agent,
                 config: config("use the tool"),
             })
             .expect("runtime is alive");
@@ -429,9 +552,11 @@ async fn an_asked_tool_runs_after_the_host_answers() {
     let (channel, _receiver) = ApprovalChannel::channel(None);
     app.insert_resource(channel);
 
+    let agent = agent(&app);
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            agent,
             config: config("use the tool"),
         })
         .expect("runtime is alive");
@@ -476,9 +601,11 @@ async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
     let mut app = app(ProviderState::with_replies(vec![Ok(tool_response())]));
     app.add_plugin(ToolsPlugin::new(Arc::new(SlowTool::new())));
 
+    let agent = agent(&app);
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            agent,
             config: config("use the tool"),
         })
         .expect("runtime is alive");
@@ -496,7 +623,7 @@ async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
         });
         if tool_started {
             sender
-                .send_message(InterruptTurn)
+                .send_message(InterruptTurn { agent })
                 .expect("runtime is alive");
         }
         if capture(&app).finished.len() == 1 {
@@ -522,9 +649,11 @@ async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
 #[tokio::test]
 async fn an_interrupt_mid_call_cancels_the_model_request() {
     let mut app = app(ProviderState::muted());
+    let agent = agent(&app);
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            agent,
             config: config("hello"),
         })
         .expect("runtime is alive");
@@ -533,7 +662,7 @@ async fn an_interrupt_mid_call_cancels_the_model_request() {
         app.pump().expect("schedule runs");
         if provider_calls(&app) == 1 {
             sender
-                .send_message(InterruptTurn)
+                .send_message(InterruptTurn { agent })
                 .expect("runtime is alive");
         }
         if capture(&app).finished.len() == 1 {
@@ -556,10 +685,12 @@ async fn a_failing_model_fails_the_turn_and_the_app_survives() {
         Err(LlmError::Transport(TransportError::Timeout)),
         Err(LlmError::Transport(TransportError::Timeout)),
     ]));
+    let agent = agent(&app);
     let sender = app.runtime_sender();
     for _ in 0..2 {
         sender
             .send_message(TurnRequested {
+                agent,
                 config: config("hello"),
             })
             .expect("runtime is alive");
@@ -589,14 +720,19 @@ async fn a_failing_model_fails_the_turn_and_the_app_survives() {
 #[tokio::test]
 async fn a_session_failure_fails_the_turn_and_the_app_survives() {
     let mut app = app(ProviderState::default());
-    app.insert_resource(agnes_record::Durability {
-        sent_seq: 1,
-        flushed_seq: 1,
-        failed: Some("disk full".into()),
-    });
+    let agent = agent(&app);
+    app.world_mut().insert(
+        agent,
+        agnes_record::Durability {
+            sent_seq: 1,
+            flushed_seq: 1,
+            failed: Some("disk full".into()),
+        },
+    );
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            agent,
             config: config("hello"),
         })
         .expect("runtime is alive");
@@ -608,6 +744,7 @@ async fn a_session_failure_fails_the_turn_and_the_app_survives() {
             // 应用存活：下一个 turn 不再发请求，同样立即失败收场。
             sender
                 .send_message(TurnRequested {
+                    agent,
                     config: config("again"),
                 })
                 .expect("runtime is alive");
@@ -628,14 +765,19 @@ async fn a_session_failure_fails_the_turn_and_the_app_survives() {
 #[tokio::test]
 async fn the_durability_gate_holds_the_request_back() {
     let mut app = app(ProviderState::default());
-    app.insert_resource(agnes_record::Durability {
-        sent_seq: 5,
-        flushed_seq: 0,
-        failed: None,
-    });
+    let agent = agent(&app);
+    app.world_mut().insert(
+        agent,
+        agnes_record::Durability {
+            sent_seq: 5,
+            flushed_seq: 0,
+            failed: None,
+        },
+    );
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            agent,
             config: config("hello"),
         })
         .expect("runtime is alive");

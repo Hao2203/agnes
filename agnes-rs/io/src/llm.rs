@@ -4,7 +4,7 @@
 use std::fmt;
 
 use crate::http::TransportError;
-use agnes_core::config::ConfigError;
+use agnes_core::config::{ConfigError, ModelName};
 use agnes_core::llm::{LlmRequest, LlmResponse};
 use agnes_core::message::TokenUsage;
 
@@ -133,6 +133,9 @@ pub enum LlmStreamUpdate {
     Started,
     /// Assistant text produced by this update.
     Delta { text: String },
+    /// Reasoning text produced by this update. Observation only: the final
+    /// [`LlmReply`] carries the answer, not the reasoning.
+    Reasoning { text: String },
     /// The provider reported token usage for the whole response.
     Usage { usage: TokenUsage },
 }
@@ -143,6 +146,17 @@ pub enum LlmStreamUpdate {
 #[derive(Clone, Copy, Debug)]
 pub struct LlmCancel {
     pub id: LlmCallId,
+}
+
+/// Asks the provider plugin for its available models; it answers with one
+/// [`ModelsListed`]. Repeated requests while one is in flight are ignored.
+#[derive(Debug)]
+pub struct ListModels;
+
+/// The outcome of one model-list query.
+#[derive(Debug)]
+pub struct ModelsListed {
+    pub result: Result<Vec<ModelName>, LlmError>,
 }
 
 /// Marks that a provider plugin is installed.

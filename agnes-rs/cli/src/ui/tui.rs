@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
+use agnes_core::config::{ModelName, ReasoningEffort, Thinking};
 use agnes_ecs::{CancelToken, RuntimeSender};
 use crossterm::cursor;
 use crossterm::event::{
@@ -26,7 +27,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
@@ -114,33 +115,35 @@ pub(crate) fn run(
                     dirty = true;
                 }
                 Ok(Event::Mouse(mouse)) => {
-                    let changed = match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            state.scroll_up(3);
-                            true
-                        }
-                        MouseEventKind::ScrollDown => {
-                            state.scroll_down(3);
-                            true
-                        }
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            state.begin_selection(mouse.column, mouse.row);
-                            true
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            state.update_selection(mouse.column, mouse.row);
-                            true
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            if let Some(text) = state.finish_selection() {
-                                copy_to_clipboard(&text);
+                    if state.overlay.is_none() {
+                        let changed = match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                state.scroll_up(3);
+                                true
                             }
-                            true
+                            MouseEventKind::ScrollDown => {
+                                state.scroll_down(3);
+                                true
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                state.begin_selection(mouse.column, mouse.row);
+                                true
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                state.update_selection(mouse.column, mouse.row);
+                                true
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if let Some(text) = state.finish_selection() {
+                                    copy_to_clipboard(&text);
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            dirty = true;
                         }
-                        _ => false,
-                    };
-                    if changed {
-                        dirty = true;
                     }
                 }
                 Ok(Event::Resize(_, _)) => dirty = true,
@@ -259,16 +262,86 @@ struct DisplayLine {
     rows: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayKind {
+    Models,
+    Thinking,
+}
+
+struct PickerItem {
+    label: String,
+    action: PickerAction,
+}
+
+impl PickerItem {
+    fn model(model: ModelName) -> Self {
+        Self {
+            label: model.to_string(),
+            action: PickerAction::Model(model),
+        }
+    }
+
+    fn thinking(thinking: Thinking) -> Self {
+        Self {
+            label: thinking.to_string(),
+            action: PickerAction::Thinking(thinking),
+        }
+    }
+}
+
+/// A transient picker owned by the TUI thread. It is not ECS state: only the
+/// model list and the active settings live in the world.
+struct Overlay {
+    kind: OverlayKind,
+    items: Vec<PickerItem>,
+    selected: usize,
+    loading: bool,
+    error: Option<String>,
+}
+
+impl Overlay {
+    fn title(&self) -> &'static str {
+        match self.kind {
+            OverlayKind::Models => "models",
+            OverlayKind::Thinking => "thinking",
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        if self.selected + 1 < self.items.len() {
+            self.selected += 1;
+        }
+    }
+
+    fn confirm(&self) -> Option<PickerAction> {
+        Some(self.items.get(self.selected)?.action.clone())
+    }
+}
+
+/// 确认选择器后要下发的宿主意图，与条目一一对应。
+#[derive(Clone)]
+enum PickerAction {
+    Model(ModelName),
+    Thinking(Thinking),
+}
+
 struct TuiState {
     transcript: Vec<DisplayLine>,
     total_rows: usize,
     width: u16,
     streaming: String,
+    reasoning: String,
     input: String,
     cursor: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     status: Status,
+    last_models: Vec<ModelName>,
+    overlay: Option<Overlay>,
     approval: Option<String>,
     follow: bool,
     scroll: u16,
@@ -288,11 +361,14 @@ impl Default for TuiState {
             total_rows: 0,
             width: 0,
             streaming: String::new(),
+            reasoning: String::new(),
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
             history_index: None,
             status: Status::default(),
+            last_models: Vec::new(),
+            overlay: None,
             approval: None,
             follow: true,
             scroll: 0,
@@ -308,21 +384,92 @@ impl Default for TuiState {
 }
 
 impl TuiState {
+    /// Opens the model picker with the cached list and asks for a refresh.
+    fn open_models(&mut self) {
+        let selected = self
+            .last_models
+            .iter()
+            .position(|model| model.as_str() == self.status.model)
+            .unwrap_or(0);
+        self.overlay = Some(Overlay {
+            kind: OverlayKind::Models,
+            items: self
+                .last_models
+                .iter()
+                .cloned()
+                .map(PickerItem::model)
+                .collect(),
+            selected,
+            loading: true,
+            error: None,
+        });
+    }
+
+    fn open_thinking(&mut self) {
+        let levels = [
+            Thinking::Off,
+            Thinking::On(ReasoningEffort::Low),
+            Thinking::On(ReasoningEffort::Medium),
+            Thinking::On(ReasoningEffort::High),
+        ];
+        let selected = levels
+            .iter()
+            .position(|level| *level == self.status.thinking)
+            .unwrap_or(0);
+        self.overlay = Some(Overlay {
+            kind: OverlayKind::Thinking,
+            items: levels.into_iter().map(PickerItem::thinking).collect(),
+            selected,
+            loading: false,
+            error: None,
+        });
+    }
+
+    /// Closes the picker and returns the chosen action; empty pickers stay
+    /// open so Enter during loading is a no-op.
+    fn confirm_overlay(&mut self) -> Option<PickerAction> {
+        let action = self.overlay.as_ref()?.confirm()?;
+        self.overlay = None;
+        Some(action)
+    }
+
+    fn flush_reasoning(&mut self) {
+        if self.reasoning.is_empty() {
+            return;
+        }
+        let reasoning = std::mem::take(&mut self.reasoning);
+        for line in reasoning.trim_end_matches('\n').split('\n') {
+            if !line.is_empty() {
+                self.push_text(&format!("· {line}"), Some(reasoning_style()));
+            }
+        }
+    }
+
     fn apply(&mut self, command: UiCommand) {
         match command {
-            UiCommand::Line(text) => self.push_text(&text, None),
+            UiCommand::Line(text) => {
+                self.flush_reasoning();
+                self.push_text(&text, None);
+            }
             UiCommand::Prompt(_) => {
+                self.flush_reasoning();
                 self.status.running = false;
                 self.status.streaming = false;
                 self.streaming.clear();
                 self.selection = None;
             }
             UiCommand::StreamStart => {
+                self.flush_reasoning();
                 self.streaming.clear();
                 self.status.streaming = true;
                 self.selection = None;
             }
+            UiCommand::ReasoningDelta(text) => {
+                self.reasoning.push_str(&text);
+                self.selection = None;
+            }
             UiCommand::StreamDelta(text) => {
+                self.flush_reasoning();
                 if !self.status.streaming {
                     self.streaming.clear();
                     self.status.streaming = true;
@@ -331,16 +478,19 @@ impl TuiState {
                 self.selection = None;
             }
             UiCommand::StreamEnd => {
+                self.flush_reasoning();
                 self.status.streaming = false;
                 self.streaming.clear();
                 self.selection = None;
             }
             UiCommand::CommitAssistant(text) => {
+                self.flush_reasoning();
                 self.status.streaming = false;
                 self.streaming.clear();
                 self.push_text(&text, None);
             }
             UiCommand::StepStats { step, usage } => {
+                self.flush_reasoning();
                 self.status.step = step;
                 self.status.usage = usage;
                 self.status.streaming = false;
@@ -348,6 +498,38 @@ impl TuiState {
                 self.selection = None;
             }
             UiCommand::Status(status) => self.status = status,
+            UiCommand::Models { current, models } => {
+                self.last_models = models.clone();
+                if let Some(overlay) = &mut self.overlay
+                    && overlay.kind == OverlayKind::Models
+                {
+                    let previous = overlay
+                        .items
+                        .get(overlay.selected)
+                        .map(|item| item.label.clone());
+                    overlay.items = models.iter().cloned().map(PickerItem::model).collect();
+                    overlay.loading = false;
+                    overlay.error = None;
+                    overlay.selected = previous
+                        .and_then(|label| overlay.items.iter().position(|item| item.label == label))
+                        .or_else(|| models.iter().position(|model| *model == current))
+                        .unwrap_or(0);
+                }
+            }
+            UiCommand::ModelsFailed(error) => {
+                if let Some(overlay) = &mut self.overlay
+                    && overlay.kind == OverlayKind::Models
+                {
+                    overlay.loading = false;
+                    overlay.error = Some(error);
+                } else {
+                    // 选择器已关闭也要让失败可见：失败原样回到界面。
+                    self.push_text(
+                        &format!("error: cannot list models: {error}"),
+                        Some(error_style()),
+                    );
+                }
+            }
             UiCommand::Approval(prompt) => self.approval = prompt,
             UiCommand::Flush | UiCommand::Shutdown => {}
         }
@@ -604,10 +786,39 @@ impl TuiState {
             Some(InputLine::Task(content)) => {
                 let _ = host.sender.send_message(TaskLine { content });
             }
+            Some(InputLine::ListModels) => {
+                self.open_models();
+                let _ = host.sender.send_message(agnes_io::llm::ListModels);
+            }
+            Some(InputLine::SetModel(model)) => {
+                if let Some(agent) = host.input.agent() {
+                    let _ = host
+                        .sender
+                        .send_message(agnes_agent::model::SetModel { agent, model });
+                }
+            }
+            Some(InputLine::OpenThinking) => self.open_thinking(),
+            Some(InputLine::SetThinking(thinking)) => {
+                if let Some(agent) = host.input.agent() {
+                    let _ = host
+                        .sender
+                        .send_message(agnes_agent::model::SetThinking { agent, thinking });
+                }
+            }
+            Some(InputLine::BadArguments(command)) => {
+                self.push_text(
+                    &format!("invalid arguments: {command}"),
+                    Some(error_style()),
+                );
+            }
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent, host: &mut TuiHost, pending_reset: &mut bool) -> Flow {
+        if self.overlay.is_some() {
+            self.handle_overlay_key(key, host);
+            return Flow::Continue;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => {
@@ -616,9 +827,11 @@ impl TuiState {
                     return Flow::Continue;
                 }
                 if *host.running.borrow_and_update() || self.status.running {
-                    let _ = host
-                        .sender
-                        .send_message(agnes_agent::runtime::InterruptTurn);
+                    if let Some(agent) = host.input.agent() {
+                        let _ = host
+                            .sender
+                            .send_message(agnes_agent::runtime::InterruptTurn { agent });
+                    }
                 } else {
                     host.shutdown.cancel();
                     return Flow::Exit;
@@ -664,6 +877,44 @@ impl TuiState {
         Flow::Continue
     }
 
+    /// Keys while a picker is open: navigation, confirm, cancel. Ctrl-C and
+    /// Ctrl-D close the picker instead of interrupting or exiting.
+    fn handle_overlay_key(&mut self, key: KeyEvent, host: &mut TuiHost) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.overlay = None,
+            KeyCode::Up => {
+                if let Some(overlay) = &mut self.overlay {
+                    overlay.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(overlay) = &mut self.overlay {
+                    overlay.move_down();
+                }
+            }
+            KeyCode::Enter => match self.confirm_overlay() {
+                Some(PickerAction::Model(model)) => {
+                    if let Some(agent) = host.input.agent() {
+                        let _ = host
+                            .sender
+                            .send_message(agnes_agent::model::SetModel { agent, model });
+                    }
+                }
+                Some(PickerAction::Thinking(thinking)) => {
+                    if let Some(agent) = host.input.agent() {
+                        let _ = host
+                            .sender
+                            .send_message(agnes_agent::model::SetThinking { agent, thinking });
+                    }
+                }
+                None => {}
+            },
+            KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.overlay = None,
+            _ => {}
+        }
+    }
+
     /// Recomputes the cached row count of every transcript line. Runs only
     /// when the viewport width changes (first frame, resize).
     fn recompute_rows(&mut self, width: u16) {
@@ -680,12 +931,20 @@ impl TuiState {
     /// appended to the last one. Rebuilt per frame — the tail changes with
     /// every delta, so caching it would never hit.
     fn tail_lines(&self) -> Vec<(Line<'static>, usize)> {
-        if !self.status.streaming && self.streaming.is_empty() {
+        if !self.status.streaming && self.streaming.is_empty() && self.reasoning.is_empty() {
             return Vec::new();
+        }
+        let mut lines = Vec::new();
+        if !self.reasoning.is_empty() {
+            for part in self.reasoning.split('\n') {
+                let line = Line::from(Span::styled(format!("· {part}"), reasoning_style()));
+                let rows = rows_of(&line, self.width);
+                lines.push((line, rows));
+            }
         }
         let mut parts: Vec<&str> = self.streaming.split('\n').collect();
         let last = parts.pop().unwrap_or_default();
-        let mut lines = Vec::with_capacity(parts.len() + 1);
+        lines.reserve(parts.len() + 1);
         for part in parts {
             let line = Line::from(part.to_owned());
             let rows = rows_of(&line, self.width);
@@ -742,7 +1001,13 @@ impl TuiState {
     }
 
     fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> std::io::Result<()> {
+        if self.overlay.is_some() {
+            terminal.hide_cursor()?;
+        }
         terminal.draw(|frame| self.render(frame))?;
+        if self.overlay.is_none() {
+            terminal.show_cursor()?;
+        }
         Ok(())
     }
 
@@ -811,16 +1076,81 @@ impl TuiState {
             Paragraph::new(self.input.as_str()).block(input_block),
             chunks[2],
         );
-        let cursor_width = UnicodeWidthStr::width(&self.input[..self.cursor]);
-        frame.set_cursor_position((
-            chunks[2].x + 1 + u16::try_from(cursor_width).unwrap_or(u16::MAX),
-            chunks[2].y + 1,
-        ));
+        if self.overlay.is_none() {
+            let cursor_width = UnicodeWidthStr::width(&self.input[..self.cursor]);
+            frame.set_cursor_position((
+                chunks[2].x + 1 + u16::try_from(cursor_width).unwrap_or(u16::MAX),
+                chunks[2].y + 1,
+            ));
+        }
 
         frame.render_widget(
             Paragraph::new(status_line(&self.status, self.spinner, self.hidden_below))
                 .style(Style::new().bg(Color::Black)),
             chunks[3],
+        );
+        self.render_overlay(frame, area);
+    }
+
+    /// Draws the picker centered above the transcript, clearing what it covers.
+    fn render_overlay(&self, frame: &mut Frame, area: Rect) {
+        let Some(overlay) = &self.overlay else {
+            return;
+        };
+        let width = area.width.saturating_sub(4).clamp(24, 64).min(area.width);
+        let rows = u16::try_from(overlay.items.len().clamp(1, 10)).unwrap_or(10);
+        let status_rows = u16::from(overlay.loading) + u16::from(overlay.error.is_some());
+        let height = rows
+            .saturating_add(3)
+            .saturating_add(status_rows)
+            .min(area.height);
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        let popup = Rect::new(x, y, width, height);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(error) = &overlay.error {
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::new().fg(Color::Red),
+            )));
+        }
+        if overlay.loading {
+            lines.push(Line::from(Span::styled(
+                "loading models…",
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+        if overlay.items.is_empty() && !overlay.loading && overlay.error.is_none() {
+            lines.push(Line::from(Span::styled(
+                "no models",
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+        let visible = usize::from(rows);
+        let start = overlay.selected.saturating_sub(visible.saturating_sub(1));
+        for (index, item) in overlay.items.iter().enumerate().skip(start).take(visible) {
+            let selected = index == overlay.selected;
+            let style = if selected {
+                Style::new().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            let marker = if selected { "▸ " } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{marker}{}", item.label),
+                style,
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "↑/↓ select · Enter confirm · Esc cancel",
+            Style::new().fg(Color::DarkGray),
+        )));
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(format!(" {} ", overlay.title()))),
+            popup,
         );
     }
 }
@@ -855,6 +1185,16 @@ fn line_style(line: &str) -> Style {
     }
 }
 
+fn reasoning_style() -> Style {
+    Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
+}
+
+fn error_style() -> Style {
+    Style::new().fg(Color::Red)
+}
+
 fn user_style() -> Style {
     Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
 }
@@ -883,8 +1223,26 @@ fn status_line(status: &Status, spinner: usize, hidden_below: u16) -> Line<'stat
             status.model.clone(),
             Style::new().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  step {step}"), Style::new().fg(Color::DarkGray)),
     ];
+    if let Some(effort) = status.thinking.effort() {
+        spans.push(Span::styled(
+            format!("  think {effort}"),
+            Style::new().fg(Color::Magenta),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("  step {step}"),
+        Style::new().fg(Color::DarkGray),
+    ));
+    if status.streaming && status.live_reasoning_chars > 0 {
+        spans.push(Span::styled(
+            format!(
+                "  think ~{} tok",
+                estimate_tokens(status.live_reasoning_chars)
+            ),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     if status.streaming && status.usage.input == 0 && status.usage.output == 0 {
         spans.push(Span::styled(
             format!("  out ~{} tok", estimate_tokens(status.live_chars)),
@@ -970,6 +1328,10 @@ mod tests {
 
     fn state() -> TuiState {
         TuiState::default()
+    }
+
+    fn model_name(name: &str) -> ModelName {
+        name.parse().expect("static model name is valid")
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {
@@ -1176,6 +1538,110 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains("live"))
         );
+    }
+
+    #[test]
+    fn models_fill_the_picker_and_are_cached() {
+        let mut state = state();
+        state.status.model = "b".to_owned();
+        state.open_models();
+        assert!(state.overlay.as_ref().expect("picker").loading);
+
+        state.apply(UiCommand::Models {
+            current: model_name("b"),
+            models: vec![model_name("a"), model_name("b")],
+        });
+
+        let overlay = state.overlay.as_ref().expect("picker");
+        assert!(!overlay.loading);
+        assert_eq!(overlay.items.len(), 2);
+        assert_eq!(overlay.selected, 1);
+        assert_eq!(state.last_models.len(), 2);
+
+        // A refresh must not steal a selection the user already moved.
+        state.overlay.as_mut().expect("picker").selected = 0;
+        state.apply(UiCommand::Models {
+            current: model_name("b"),
+            models: vec![model_name("a"), model_name("b")],
+        });
+        assert_eq!(state.overlay.as_ref().expect("picker").selected, 0);
+    }
+
+    #[test]
+    fn the_picker_returns_the_selected_action() {
+        let mut state = state();
+        state.open_thinking();
+        state.overlay.as_mut().expect("picker").selected = 3;
+
+        assert!(matches!(
+            state.confirm_overlay(),
+            Some(PickerAction::Thinking(Thinking::On(ReasoningEffort::High)))
+        ));
+        assert!(state.overlay.is_none());
+
+        // An empty picker stays open so Enter during loading is a no-op.
+        state.open_models();
+        assert!(state.confirm_overlay().is_none());
+        assert!(state.overlay.is_some());
+    }
+
+    #[test]
+    fn reasoning_is_flushed_before_the_answer() {
+        let mut state = state();
+        state.apply(UiCommand::StreamStart);
+        state.apply(UiCommand::ReasoningDelta("hmm".to_owned()));
+        state.apply(UiCommand::StreamDelta("hi".to_owned()));
+
+        assert!(state.reasoning.is_empty());
+        assert_eq!(state.streaming, "hi");
+        let transcript: Vec<String> = state
+            .transcript
+            .iter()
+            .map(|entry| {
+                entry
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            transcript.iter().any(|line| line.contains("hmm")),
+            "reasoning reached the transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_thinking_level() {
+        let status = Status {
+            model: "m".to_owned(),
+            thinking: Thinking::On(ReasoningEffort::High),
+            ..Status::default()
+        };
+        let text: String = status_line(&status, 0, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("think high"), "{text}");
+    }
+
+    #[test]
+    fn the_picker_renders_over_the_transcript() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = state();
+        state.status.model = "b".to_owned();
+        state.open_models();
+        state.apply(UiCommand::Models {
+            current: model_name("b"),
+            models: vec![model_name("a"), model_name("b")],
+        });
+
+        terminal.draw(|frame| state.render(frame)).unwrap();
+        let screen = screen(&terminal);
+        assert!(screen.contains("models"), "{screen}");
+        assert!(screen.contains("▸ b"), "{screen}");
     }
 
     #[test]

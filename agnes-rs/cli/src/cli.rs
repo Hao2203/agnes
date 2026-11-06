@@ -3,12 +3,13 @@
 use std::path::PathBuf;
 
 use agnes_agent::permission::Rule;
-use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget};
+use agnes_core::config::{ApiKey, BaseUrl, ModelName, StepBudget, Thinking};
 use clap::{Parser, Subcommand};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_MAX_STEPS: &str = "32";
+pub const DEFAULT_THINKING: &str = "off";
 
 /// A terminal AI agent (OpenAI-compatible APIs).
 #[derive(Debug, Parser)]
@@ -36,6 +37,10 @@ pub struct Cli {
     /// Maximum number of model round trips (steps) per task
     #[arg(long, global = true, default_value = DEFAULT_MAX_STEPS)]
     pub max_steps: StepBudget,
+
+    /// Thinking mode: off, low, medium, or high (sent as reasoning_effort)
+    #[arg(long, global = true, default_value = DEFAULT_THINKING, value_name = "LEVEL")]
+    pub think: Thinking,
 
     /// Offer the run_shell tool to the model
     #[arg(long, global = true)]
@@ -66,6 +71,7 @@ pub enum Command {
         task: Option<String>,
     },
     /// Interactive session: one agent task per line, full session memory,
+    /// `/model` picks a model, `/think` picks the thinking level,
     /// `/new` resets the context, `exit` leaves
     Chat,
 }
@@ -80,7 +86,19 @@ mod tests {
         assert_eq!(cli.model.as_str(), DEFAULT_MODEL);
         assert_eq!(cli.base_url.as_str(), "https://api.openai.com/v1/");
         assert_eq!(cli.max_steps.to_string(), DEFAULT_MAX_STEPS);
+        assert_eq!(cli.think, Thinking::Off);
         assert!(matches!(cli.command, Some(Command::Chat)));
+    }
+
+    #[test]
+    fn the_think_flag_accepts_levels_and_rejects_garbage() {
+        let cli = Cli::parse_from(["agnes", "chat", "--think", "high"]);
+        assert_eq!(
+            cli.think,
+            Thinking::On(agnes_core::config::ReasoningEffort::High)
+        );
+        assert!(Cli::try_parse_from(["agnes", "chat", "--think", "loud"]).is_err());
+        assert!(Cli::try_parse_from(["agnes", "chat", "--think", "HIGH"]).is_err());
     }
 
     #[test]

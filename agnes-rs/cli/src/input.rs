@@ -9,12 +9,15 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use agnes_core::config::{ModelName, Thinking};
 use agnes_core::content::Content;
+use agnes_ecs::Entity;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::app::HostChannels;
+use crate::render::Renderer;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -28,16 +31,31 @@ pub(crate) enum Line {
     Reset,
     /// `exit`/`quit`, EOF, or Ctrl-C at the prompt.
     Exit,
+    /// `/model` — ask the provider for its model list.
+    ListModels,
+    /// `/model <name>` — switch to a named model.
+    SetModel(ModelName),
+    /// `/think` — open the thinking picker (TUI); plain prints usage.
+    OpenThinking,
+    /// `/think <off|low|medium|high>` — set the thinking level.
+    SetThinking(Thinking),
+    /// A recognized command with an invalid argument; echoed instead of
+    /// being sent to the model.
+    BadArguments(String),
 }
 
-/// Shared input state: answer mode for approval questions plus the run flag
-/// the signal handler and the stdin reader watch.
+/// Shared input state: answer mode for approval questions, the run flag
+/// the signal handler and the stdin reader watch, and the agent root the
+/// host tasks address their messages to.
 pub struct UserInput {
     /// 审批问询期间：读到的行不分类，原样进答覆队列。
     answering: AtomicBool,
     answers: Mutex<VecDeque<String>>,
     answer_wake: Notify,
     running: watch::Sender<bool>,
+    /// 目标 agent 根实体：装配完成后由 `run()` 绑定；宿主任务发送
+    /// SetModel / SetThinking / InterruptTurn 前从这里取。
+    agent: Mutex<Option<Entity>>,
 }
 
 impl UserInput {
@@ -48,6 +66,7 @@ impl UserInput {
             answers: Mutex::new(VecDeque::new()),
             answer_wake: Notify::new(),
             running,
+            agent: Mutex::new(None),
         })
     }
 
@@ -59,6 +78,17 @@ impl UserInput {
     /// Marks a turn as in flight (or finished); called by the host systems.
     pub fn set_running(&self, running: bool) {
         let _ = self.running.send_replace(running);
+    }
+
+    /// Binds the agent root the host tasks address; called once after the
+    /// app is assembled.
+    pub fn set_agent(&self, agent: Entity) {
+        *lock(&self.agent) = Some(agent);
+    }
+
+    /// The bound agent root, if assembly has finished.
+    pub(crate) fn agent(&self) -> Option<Entity> {
+        *lock(&self.agent)
     }
 
     /// Enters answer mode **before** the question is printed, closing the
@@ -105,7 +135,11 @@ impl Drop for AnswerMode<'_> {
 
 /// Reads stdin line by line in the background, turning every line into an
 /// ECS message, until EOF — which shuts the runtime down like `exit` does.
-pub fn spawn_stdin_reader(input: Arc<UserInput>, channels: Arc<HostChannels>) -> JoinHandle<()> {
+pub fn spawn_stdin_reader(
+    input: Arc<UserInput>,
+    channels: Arc<HostChannels>,
+    renderer: Renderer,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut running = input.running_handle();
         let mut pending_reset = false;
@@ -150,6 +184,37 @@ pub fn spawn_stdin_reader(input: Arc<UserInput>, channels: Arc<HostChannels>) ->
                                 Some(Line::Task(content)) => {
                                     let _ = channels.sender.send_message(TaskLine { content });
                                 }
+                                Some(Line::ListModels) => {
+                                    renderer.line("(fetching models…)");
+                                    let _ =
+                                        channels.sender.send_message(agnes_io::llm::ListModels);
+                                }
+                                Some(Line::SetModel(model)) => {
+                                    if let Some(agent) = input.agent() {
+                                        let _ = channels
+                                            .sender
+                                            .send_message(agnes_agent::model::SetModel {
+                                                agent,
+                                                model,
+                                            });
+                                    }
+                                }
+                                Some(Line::OpenThinking) => {
+                                    renderer.line("thinking: /think off|low|medium|high");
+                                }
+                                Some(Line::SetThinking(thinking)) => {
+                                    if let Some(agent) = input.agent() {
+                                        let _ = channels
+                                            .sender
+                                            .send_message(agnes_agent::model::SetThinking {
+                                                agent,
+                                                thinking,
+                                            });
+                                    }
+                                }
+                                Some(Line::BadArguments(command)) => {
+                                    renderer.line(format!("invalid arguments: {command}"));
+                                }
                             }
                         }
                         Ok(None) | Err(_) => {
@@ -176,9 +241,11 @@ pub fn spawn_ctrl_c(input: Arc<UserInput>, channels: Arc<HostChannels>) -> JoinH
                 return;
             }
             if *running.borrow_and_update() {
-                let _ = channels
-                    .sender
-                    .send_message(agnes_agent::runtime::InterruptTurn);
+                if let Some(agent) = input.agent() {
+                    let _ = channels
+                        .sender
+                        .send_message(agnes_agent::runtime::InterruptTurn { agent });
+                }
             } else {
                 if input.is_answering() {
                     input.push_answer(String::new());
@@ -193,12 +260,47 @@ pub fn spawn_ctrl_c(input: Arc<UserInput>, channels: Arc<HostChannels>) -> JoinH
 /// Maps one raw line to a [`Line`], or `None` for blank lines.
 pub(crate) fn classify(line: &str) -> Option<Line> {
     let trimmed = line.trim();
-    match trimmed {
-        "" => None,
-        "exit" | "quit" => Some(Line::Exit),
-        "/new" => Some(Line::Reset),
-        _ => Content::try_from(trimmed).ok().map(Line::Task),
+    if trimmed.is_empty() {
+        return None;
     }
+    if matches!(trimmed, "exit" | "quit") {
+        return Some(Line::Exit);
+    }
+    if trimmed == "/new" {
+        return Some(Line::Reset);
+    }
+    if let Some(argument) = command_argument(trimmed, "/model") {
+        return Some(match argument {
+            None => Line::ListModels,
+            Some(name) => match name.parse::<ModelName>() {
+                Ok(model) => Line::SetModel(model),
+                Err(_) => Line::BadArguments(trimmed.to_owned()),
+            },
+        });
+    }
+    if let Some(argument) = command_argument(trimmed, "/think") {
+        return Some(match argument {
+            None => Line::OpenThinking,
+            Some(level) => match level.parse::<Thinking>() {
+                Ok(thinking) => Line::SetThinking(thinking),
+                Err(_) => Line::BadArguments(trimmed.to_owned()),
+            },
+        });
+    }
+    // 其余行（含拼错的 `/xxx`）都是任务：会话中每一行都是一个任务。
+    Content::try_from(trimmed).ok().map(Line::Task)
+}
+
+/// Splits `line` into the argument of `command`, if the command matches.
+/// `Some(None)` means the command had no argument; `None` means the line is
+/// a different command (or a longer word starting with the same prefix).
+fn command_argument<'a>(line: &'a str, command: &str) -> Option<Option<&'a str>> {
+    let rest = line.strip_prefix(command)?;
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let argument = rest.strip_prefix(char::is_whitespace)?.trim();
+    Some((!argument.is_empty()).then_some(argument))
 }
 
 /// A task line from the host: routed to a new turn or, while a turn is
@@ -251,6 +353,32 @@ mod tests {
         assert!(matches!(classify("exit"), Some(Line::Exit)));
         assert!(matches!(classify("quit"), Some(Line::Exit)));
         assert!(matches!(classify("/new"), Some(Line::Reset)));
+        assert!(matches!(classify("/model"), Some(Line::ListModels)));
+        assert!(
+            matches!(classify("  /model  gpt-4o  "), Some(Line::SetModel(model)) if model.as_str() == "gpt-4o")
+        );
+        assert!(matches!(classify("/think"), Some(Line::OpenThinking)));
+        assert!(matches!(
+            classify("/think high"),
+            Some(Line::SetThinking(agnes_core::config::Thinking::On(
+                agnes_core::config::ReasoningEffort::High
+            )))
+        ));
+        assert!(matches!(
+            classify("/think off"),
+            Some(Line::SetThinking(agnes_core::config::Thinking::Off))
+        ));
+        assert!(matches!(
+            classify("/think loud"),
+            Some(Line::BadArguments(_))
+        ));
+        assert!(matches!(
+            classify("/think HIGH"),
+            Some(Line::BadArguments(_))
+        ));
+        // 拼错的命令不是命令：会话中每一行都是一个任务。
+        assert!(matches!(classify("/modelfoo"), Some(Line::Task(_))));
+        assert!(matches!(classify("/nope"), Some(Line::Task(_))));
         assert!(matches!(classify("do the thing"), Some(Line::Task(_))));
     }
 

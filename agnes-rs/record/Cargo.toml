@@ -8,6 +8,7 @@ description = "Agent run recording vocabulary: record events, host audit, sessio
 
 [dependencies]
 agnes-core.workspace = true
+agnes-ecs.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 cold-string.workspace = true

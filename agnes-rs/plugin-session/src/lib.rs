@@ -1,18 +1,21 @@
 //! Session state as an ECS plugin.
 //!
 //! [`SessionPlugin`] owns the session's state: the in-memory [`Log`], the
-//! [`Durability`] progress, the sequence numbers, and the rotation policy. It
-//! never touches storage itself — persistence is a separate plugin that mounts
-//! a [`SessionStoreResource`]; without one the session runs in memory-only
-//! mode (the `Log` still records, nothing is written, and the durability gate
-//! is always open).
+//! [`Durability`] progress, the sequence numbers, and the rotation policy. All
+//! of it hangs as components on the session's [`AgentRoot`] entity — one root
+//! per running agent — never in global resources. The plugin never touches
+//! storage itself — persistence is a separate plugin that mounts a
+//! [`SessionStoreResource`] component on the same root; without one the
+//! session runs in memory-only mode (the `Log` still records, nothing is
+//! written, and the durability gate is always open).
 //!
 //! The `session_pump` system forwards the run's [`RunEvent`] stream to an
 //! ordered writer task over a bounded channel — the system never awaits — and
 //! the writer calls the installed store, flushes per batch, and acknowledges
-//! progress through [`SessionFlushed`] messages. The [`Durability`] resource
-//! tells the agent runtime when everything sent so far is durable, restoring
-//! the driver's "flush before the request leaves" commit boundary.
+//! progress through [`SessionFlushed`] messages addressed to the agent root.
+//! The [`Durability`] component tells the agent runtime when everything sent
+//! so far is durable, restoring the driver's "flush before the request
+//! leaves" commit boundary.
 //!
 //! Failures are fail-closed: once the store reports a write failure the
 //! [`Durability::failed`] reason is set and never cleared; the run closes
@@ -33,7 +36,7 @@
 //! within the same tick.
 
 use agnes_ecs::{App, Plugin, Update};
-use agnes_record::{Durability, Event, Log};
+use agnes_record::{AgentRoot, Durability, Event, Log};
 use jiff::Timestamp;
 
 mod systems;
@@ -73,10 +76,12 @@ pub struct SessionPump {
     sender: Option<async_channel::Sender<SessionCommand>>,
 }
 
+agnes_ecs::component!(SessionPump);
+
 /// The session's state: log, durability, and rotation policy.
 ///
-/// Without a [`SessionStoreResource`] the session is memory-only; with one,
-/// the writer persists through it.
+/// Without a [`SessionStoreResource`] component on the same root the session
+/// is memory-only; with one, the writer persists through it.
 pub struct SessionPlugin {
     events: Vec<Event>,
 }
@@ -116,6 +121,13 @@ pub enum SessionInitError {
     NoHeader,
 }
 
+/// The root entity the session state attaches to: the existing
+/// [`AgentRoot`] entity, or a fresh one when no plugin created it yet.
+fn session_root(app: &mut App) -> agnes_ecs::Entity {
+    let existing = app.world().entity_with::<AgentRoot>();
+    existing.unwrap_or_else(|| app.world_mut().spawn(AgentRoot))
+}
+
 impl Plugin for SessionPlugin {
     fn name(&self) -> &'static str {
         "agnes-session"
@@ -125,14 +137,19 @@ impl Plugin for SessionPlugin {
         // 恢复的历史事件已经在存储里 —— 耐久序号从它们之后起算。
         let restored =
             u64::try_from(self.events.len()).expect("the restored event count fits into u64");
-        app.insert_resource(Log::restore(self.events.clone()))
-            .insert_resource(SessionPump::default())
-            .insert_resource(Durability {
+        let root = session_root(app);
+        let world = app.world_mut();
+        world.insert(root, Log::restore(self.events.clone()));
+        world.insert(root, SessionPump::default());
+        world.insert(
+            root,
+            Durability {
                 sent_seq: restored,
                 flushed_seq: restored,
                 failed: None,
-            })
-            .add_systems(Update, systems::session_pump)
+            },
+        );
+        app.add_systems(Update, systems::session_pump)
             .add_systems(Update, systems::session_ack)
             .add_systems(Update, systems::session_rotate);
     }

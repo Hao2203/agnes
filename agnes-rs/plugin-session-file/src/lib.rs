@@ -2,9 +2,11 @@
 //!
 //! [`SessionFilePlugin`] mounts one opened [`SessionFile`] as the session's
 //! [`SessionStoreResource`] — the port that the state-side
-//! `agnes-plugin-session` drives. This crate owns everything file-shaped: the
-//! file handle, sibling naming for rotation, and reopening. The session
-//! plugin owns the state: the log, durability, ordering, and when to flush.
+//! `agnes-plugin-session` drives, attached as a component to the session's
+//! [`AgentRoot`] entity (absent means memory-only mode). This crate owns
+//! everything file-shaped: the file handle, sibling naming for rotation, and
+//! reopening. The session plugin owns the state: the log, durability,
+//! ordering, and when to flush.
 //!
 //! Rotation (`/new`) is a store operation: flush the current file, atomically
 //! claim the next free sibling (`session.jsonl` → `session.1.jsonl`, …), and
@@ -18,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use agnes_ecs::{App, Plugin};
 use agnes_record::{
-    Event, HostEvent, SessionError, SessionLog as _, SessionStore, SessionStoreResource,
+    AgentRoot, Event, HostEvent, SessionError, SessionLog as _, SessionStore, SessionStoreResource,
 };
 use agnes_session_file::{Opened, SessionFile};
 use async_trait::async_trait;
@@ -54,7 +56,12 @@ impl Plugin for SessionFilePlugin {
             .expect("session file mutex is poisoned")
             .take()
             .expect("session file plugin built twice");
-        app.insert_resource(SessionStoreResource::new(Arc::new(FileStore::new(file))));
+        let existing = app.world().entity_with::<AgentRoot>();
+        let root = existing.unwrap_or_else(|| app.world_mut().spawn(AgentRoot));
+        app.world_mut().insert(
+            root,
+            SessionStoreResource::new(Arc::new(FileStore::new(file))),
+        );
     }
 }
 
@@ -181,7 +188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_plugin_installs_the_store_resource() {
+    async fn the_plugin_installs_the_store_component() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("session.jsonl");
         let opened = SessionFile::open_or_create(&path)
@@ -191,8 +198,12 @@ mod tests {
         let mut app = App::new();
         app.add_plugin(SessionFilePlugin::new(opened.session));
 
+        let root = app
+            .world()
+            .entity_with::<AgentRoot>()
+            .expect("agent root is created");
         app.world()
-            .resource::<SessionStoreResource>()
-            .expect("store resource is installed");
+            .get::<SessionStoreResource>(root)
+            .expect("store component is installed");
     }
 }

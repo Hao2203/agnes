@@ -1,5 +1,6 @@
 //! Wire types for the OpenAI chat-completions API and mapping to core types.
 
+use agnes_core::config::ModelName;
 use agnes_core::content::Content;
 use agnes_core::llm::{LlmRequest, LlmResponse, StopReason};
 use agnes_core::message::{
@@ -22,6 +23,10 @@ pub struct ChatCompletionRequest {
     messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
+    /// Omitted entirely when thinking is off, so providers that reject the
+    /// field keep working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     stream: bool,
     stream_options: StreamOptions,
 }
@@ -47,6 +52,7 @@ impl ChatCompletionRequest {
                 .iter()
                 .map(WireTool::from_core)
                 .collect(),
+            reasoning_effort: request.thinking.effort().map(|effort| effort.as_str()),
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -300,6 +306,9 @@ fn optional_content(raw: Option<String>) -> Result<Option<Content>, LlmError> {
 pub enum StreamDelta {
     /// Assistant text produced by this update.
     Text(String),
+    /// Reasoning text produced by this update; never replayed into the
+    /// conversation.
+    Reasoning(String),
     /// The provider reported usage for the whole response.
     Usage(TokenUsage),
 }
@@ -459,6 +468,11 @@ impl OpenAiStreamDecoder {
             if let Some(reason) = choice.finish_reason {
                 self.finish_reason = Some(reason);
             }
+            if let Some(reasoning) = choice.delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                deltas.push(StreamDelta::Reasoning(reasoning));
+            }
             if let Some(content) = choice.delta.content
                 && !content.is_empty()
             {
@@ -521,6 +535,10 @@ struct WireChunkChoice {
 struct WireDelta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek uses `reasoning_content`; other compatible providers send
+    /// `reasoning`.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<WireToolCallDelta>,
 }
@@ -541,6 +559,38 @@ struct WireFunctionDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+/// `GET /models` response body. OpenAI wraps the list in `data`; some
+/// compatible servers return a bare array.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireModelList {
+    Wrapped { data: Vec<WireModel> },
+    Bare(Vec<WireModel>),
+}
+
+#[derive(Debug, Deserialize)]
+struct WireModel {
+    id: String,
+}
+
+/// Parses a model list into sorted, deduplicated names. Entries whose id is
+/// blank or not a valid model name are dropped; a body that is not a model
+/// list is a decode error.
+pub fn parse_model_list(body: &str) -> Result<Vec<ModelName>, LlmError> {
+    let parsed: WireModelList =
+        serde_json::from_str(body).map_err(|err| LlmError::Decode(err.into()))?;
+    let entries = match parsed {
+        WireModelList::Wrapped { data } | WireModelList::Bare(data) => data,
+    };
+    let mut models: Vec<ModelName> = entries
+        .into_iter()
+        .filter_map(|model| ModelName::from_str(&model.id).ok())
+        .collect();
+    models.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    models.dedup();
+    Ok(models)
 }
 
 /// Extracts a human-readable detail from an error body, tolerating arbitrary
@@ -586,7 +636,7 @@ pub fn extract_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::config::{ModelName, SystemPrompt};
+    use agnes_core::config::{ModelName, SystemPrompt, Thinking};
     use agnes_core::llm::{LlmRequest, Prompt};
     use agnes_core::message::{AssistantMessage, Message, ToolOutput};
 
@@ -598,6 +648,7 @@ mod tests {
     fn empty_request_serializes_without_tools() {
         let request = LlmRequest {
             model: ModelName::from_str("gpt-test").unwrap(),
+            thinking: Thinking::Off,
             prompt: Prompt {
                 input: vec![
                     Message::System {
@@ -665,6 +716,46 @@ mod tests {
                 output: 2
             }
         );
+    }
+
+    #[test]
+    fn reasoning_deltas_are_emitted_before_the_answer() {
+        let mut decoder = decoder();
+        let deltas = decoder
+            .feed(body(concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )))
+            .unwrap();
+        assert_eq!(
+            deltas,
+            vec![
+                StreamDelta::Reasoning("think".to_owned()),
+                StreamDelta::Text("answer".to_owned()),
+            ]
+        );
+        let response = decoder.finish().unwrap();
+        assert_eq!(
+            response.stop_reason,
+            StopReason::Completed {
+                content: content("answer")
+            },
+            "reasoning never becomes the answer"
+        );
+    }
+
+    #[test]
+    fn the_reasoning_alias_is_accepted() {
+        let mut decoder = decoder();
+        let deltas = decoder
+            .feed(body(concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hm\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )))
+            .unwrap();
+        assert_eq!(deltas[0], StreamDelta::Reasoning("hm".to_owned()));
     }
 
     #[test]

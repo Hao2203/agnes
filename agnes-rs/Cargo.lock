@@ -182,6 +182,7 @@ name = "agnes-record"
 version = "0.1.0"
 dependencies = [
  "agnes-core",
+ "agnes-ecs",
  "anyhow",
  "async-trait",
  "cold-string",
