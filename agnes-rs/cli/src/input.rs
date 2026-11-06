@@ -151,7 +151,9 @@ pub fn spawn_stdin_reader(
                 _ = running.changed(), if pending_reset => {
                     if !*running.borrow_and_update() {
                         pending_reset = false;
-                        let _ = channels.sender.send_message(agnes_plugin_session::RotateSession);
+                        let _ = channels.sender.send_message(agnes_plugin_session::RotateSession {
+                            agent: input.agent().expect("the host bound the agent"),
+                        });
                     }
                 }
                 line = read_line_lossy(&mut reader) => {
@@ -178,7 +180,11 @@ pub fn spawn_stdin_reader(
                                     } else {
                                         let _ = channels
                                             .sender
-                                            .send_message(agnes_plugin_session::RotateSession);
+                                            .send_message(agnes_plugin_session::RotateSession {
+                                                agent: input
+                                                    .agent()
+                                                    .expect("the host bound the agent"),
+                                            });
                                     }
                                 }
                                 Some(Line::Task(content)) => {

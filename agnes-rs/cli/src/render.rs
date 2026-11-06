@@ -9,6 +9,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
+use agnes_agent::AgentRoot;
 use agnes_agent::activity::{Activity, Phase};
 use agnes_agent::model::{ModelSettings, ModelSettingsChanged};
 use agnes_agent::runtime::{PendingUserMessages, TurnFinished};
@@ -17,11 +18,12 @@ use agnes_core::llm::StopKind;
 use agnes_core::message::{AssistantMessage, Message};
 use agnes_core::turn::Outcome;
 use agnes_ecs::{
-    App, CancelToken, MessageReader, Plugin, Query, Res, ResMut, RuntimeSender, Update, With,
+    App, CancelToken, Entity, MessageReader, Plugin, Query, Res, ResMut, RuntimeSender, Update,
+    With,
 };
 use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate, ModelsListed};
 use agnes_plugin_async::AsyncExecutor;
-use agnes_record::{AgentRoot, Event as RecordEvent, Log, RunEvent};
+use agnes_record::{Event as RecordEvent, Log, RunEvent, RunEventKind};
 use jiff::Timestamp;
 
 use crate::input::UserInput;
@@ -177,6 +179,8 @@ impl Drop for RendererInner {
 struct DisplayState {
     renderer: Renderer,
     sender: RuntimeSender,
+    /// 渲染器服务的 agent 根实体：装配时绑定，消息与快照都按它寻址。
+    agent: Entity,
     /// 单次运行模式：收场即退出，未生效的用户消息只打印提示。
     single_shot: bool,
     /// 有会话文件时，轮转反馈由 `SessionRotated`（新文件路径）给出；
@@ -202,6 +206,7 @@ struct ReportData {
 pub struct RendererPlugin {
     renderer: Renderer,
     sender: RuntimeSender,
+    agent: Entity,
     single_shot: bool,
     has_session: bool,
 }
@@ -210,12 +215,14 @@ impl RendererPlugin {
     pub fn new(
         renderer: Renderer,
         sender: RuntimeSender,
+        agent: Entity,
         single_shot: bool,
         has_session: bool,
     ) -> Self {
         Self {
             renderer,
             sender,
+            agent,
             single_shot,
             has_session,
         }
@@ -227,10 +234,21 @@ impl Plugin for RendererPlugin {
         "agnes-renderer"
     }
 
+    /// # Panics
+    ///
+    /// Panics when `agnes_plugin_session::SessionPlugin` has not been
+    /// registered before this plugin: its `session_ack` system must run
+    /// before the final report within the same tick.
     fn build(&self, app: &mut App) {
+        assert!(
+            app.is_plugin_added::<agnes_plugin_session::SessionPlugin>(),
+            "RendererPlugin requires SessionPlugin to be registered first: \
+             session_ack must run before the final report within the same tick"
+        );
         app.insert_resource(DisplayState {
             renderer: self.renderer.clone(),
             sender: self.sender.clone(),
+            agent: self.agent,
             single_shot: self.single_shot,
             has_session: self.has_session,
         })
@@ -246,6 +264,8 @@ impl Plugin for RendererPlugin {
 }
 
 /// 把模型增量投递到输出层，并刷新状态栏；统计本身由 `Activity` 负责。
+/// 增量流没有 agent 寻址（经在飞调用才能路由），本宿主只装配一个会话；
+/// 状态栏快照按绑定的 agent 读取。
 fn track_stream(
     mut events: MessageReader<LlmStreamEvent>,
     snapshot: Snapshot,
@@ -263,7 +283,7 @@ fn track_stream(
             LlmStreamUpdate::Usage { .. } => {}
         }
     }
-    if let Ok((activity, settings)) = snapshot.single() {
+    if let Some((activity, settings)) = snapshot.get(state.agent) {
         state.renderer.status(status_snapshot(&activity, &settings));
     }
 }
@@ -278,46 +298,49 @@ fn render_run_events(
         return;
     }
     for event in &events {
-        match event.as_ref() {
-            RunEvent::Started { tools, .. } => {
+        if event.agent != state.agent {
+            continue;
+        }
+        match &event.kind {
+            RunEventKind::Started { tools, .. } => {
                 let names: Vec<&str> = tools.iter().map(|tool| tool.as_str()).collect();
                 state.renderer.line(format!(
                     "* model {}, tools: [{}]",
                     snapshot
-                        .single()
+                        .get(state.agent)
                         .map(|(_, settings)| settings.model().to_string())
                         .unwrap_or_default(),
                     names.join(", ")
                 ));
             }
-            RunEvent::Recorded { event, .. } => render_recorded(event, &state),
-            RunEvent::ToolGated { denied, .. } => {
+            RunEventKind::Recorded { event, .. } => render_recorded(event, &state),
+            RunEventKind::ToolGated { denied, .. } => {
                 state
                     .renderer
                     .line(format!("  ⛔ denied by {}: {}", denied.by, denied.reason));
             }
             // The approver task owns the interactive prompt: it must enter
             // answer mode before the question is visible.
-            RunEvent::ApprovalRequested { .. } => {}
-            RunEvent::ApprovalResolved { outcome, .. } => {
+            RunEventKind::ApprovalRequested { .. } => {}
+            RunEventKind::ApprovalResolved { outcome, .. } => {
                 if !outcome.allows() {
                     state
                         .renderer
                         .line(format!("  ✗ not approved ({outcome:?})"));
                 }
             }
-            RunEvent::Aborted { by, reason, .. } => {
+            RunEventKind::Aborted { by, reason, .. } => {
                 state
                     .renderer
                     .line(format!("  ⛔ aborted by {by}: {reason}"));
             }
-            RunEvent::Finished { .. } | RunEvent::Failed { .. } => {
+            RunEventKind::Finished { .. } | RunEventKind::Failed { .. } => {
                 state.renderer.stream_end();
             }
             _ => {}
         }
     }
-    if let Ok((activity, settings)) = snapshot.single() {
+    if let Some((activity, settings)) = snapshot.get(state.agent) {
         state.renderer.status(status_snapshot(&activity, &settings));
     }
 }
@@ -328,7 +351,7 @@ fn render_model_list(
     snapshot: Snapshot,
     state: Res<DisplayState>,
 ) {
-    let Ok((_, settings)) = snapshot.single() else {
+    let Some((_, settings)) = snapshot.get(state.agent) else {
         return;
     };
     let current = settings.model().clone();
@@ -346,10 +369,14 @@ fn render_settings_changes(
     snapshot: Snapshot,
     state: Res<DisplayState>,
 ) {
-    if changed.read().is_empty() {
+    if !changed
+        .read()
+        .iter()
+        .any(|message| message.agent == state.agent)
+    {
         return;
     }
-    if let Ok((activity, settings)) = snapshot.single() {
+    if let Some((activity, settings)) = snapshot.get(state.agent) {
         state.renderer.line(format!(
             "(model {} · thinking {})",
             settings.model(),
@@ -402,6 +429,9 @@ fn render_rotations(
     state: Res<DisplayState>,
 ) {
     for message in rotations.read() {
+        if message.agent != state.agent {
+            continue;
+        }
         state.renderer.line(format!(
             "(session cleared — new file: {})",
             message.path.display()
@@ -420,7 +450,11 @@ fn rotate_feedback(
     if state.has_session {
         return;
     }
-    if !rotations.read().is_empty() {
+    if rotations
+        .read()
+        .iter()
+        .any(|rotation| rotation.agent == state.agent)
+    {
         state.renderer.line("(context cleared)");
         if !state.single_shot {
             state.renderer.prompt("agnes> ");
@@ -432,17 +466,23 @@ fn rotate_feedback(
 /// 单次运行模式随后请求退出。
 fn report_finished(
     executor: Res<AsyncExecutor>,
-    sessions: Query<(
-        &Log,
-        Option<&agnes_record::Durability>,
-        &mut PendingUserMessages,
-    )>,
+    sessions: Query<
+        (
+            &Log,
+            Option<&agnes_record::Durability>,
+            &mut PendingUserMessages,
+        ),
+        With<AgentRoot>,
+    >,
     mut finished: MessageReader<TurnFinished>,
     mut report: ResMut<PendingReport>,
     state: Res<DisplayState>,
 ) {
     if report.0.is_none()
-        && let Some(message) = finished.read().first()
+        && let Some(message) = finished
+            .read()
+            .iter()
+            .find(|message| message.agent == state.agent)
     {
         let data = match &message.result {
             Ok(result) => ReportData {
@@ -468,7 +508,7 @@ fn report_finished(
     let Some(data) = report.0.take() else {
         return;
     };
-    let Ok((log, durability, mut pending_msgs)) = sessions.single() else {
+    let Some((log, durability, mut pending_msgs)) = sessions.get(state.agent) else {
         report.0 = Some(data);
         return;
     };
@@ -597,26 +637,26 @@ fn recorded_text(event: &RecordEvent) -> Option<String> {
 
 #[cfg(test)]
 fn event_text(model: &ModelName, event: &RunEvent) -> Option<String> {
-    match event {
-        RunEvent::Started { tools, .. } => {
+    match &event.kind {
+        RunEventKind::Started { tools, .. } => {
             let names: Vec<&str> = tools.iter().map(|tool| tool.as_str()).collect();
             Some(format!("* model {model}, tools: [{}]", names.join(", ")))
         }
-        RunEvent::ToolGated { denied, .. } => {
+        RunEventKind::ToolGated { denied, .. } => {
             Some(format!("  ⛔ denied by {}: {}", denied.by, denied.reason))
         }
         // The approver task owns the interactive prompt: it must enter
         // answer mode before the question is visible.
-        RunEvent::ApprovalRequested { .. } => None,
-        RunEvent::ApprovalResolved { outcome, .. } => {
+        RunEventKind::ApprovalRequested { .. } => None,
+        RunEventKind::ApprovalResolved { outcome, .. } => {
             (!outcome.allows()).then(|| format!("  ✗ not approved ({outcome:?})"))
         }
-        RunEvent::Aborted { by, reason, .. } => Some(format!("  ⛔ aborted by {by}: {reason}")),
-        RunEvent::Recorded { event, .. } => recorded_text(event),
-        RunEvent::Finished { .. } => None,
+        RunEventKind::Aborted { by, reason, .. } => Some(format!("  ⛔ aborted by {by}: {reason}")),
+        RunEventKind::Recorded { event, .. } => recorded_text(event),
+        RunEventKind::Finished { .. } => None,
         // The failure is reported with the turn summary; observers still see
         // this event.
-        RunEvent::Failed { .. } => None,
+        RunEventKind::Failed { .. } => None,
         _ => None,
     }
 }
@@ -749,9 +789,12 @@ mod tests {
 
     #[test]
     fn recorded_wraps_event_text() {
-        let event = RunEvent::Recorded {
-            at: Timestamp::now(),
-            event: RecordEvent::TurnStart,
+        let event = RunEvent {
+            agent: agnes_ecs::Entity::PLACEHOLDER,
+            kind: RunEventKind::Recorded {
+                at: Timestamp::now(),
+                event: RecordEvent::TurnStart,
+            },
         };
         assert_eq!(event_text(&model(), &event).as_deref(), Some("─ turn ─"));
     }

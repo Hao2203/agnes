@@ -1,14 +1,15 @@
 //! 会话系统的三件事：转发、确认、轮转。状态全部挂在各 agent 的
-//! [`AgentRoot`] 实体上，系统按实体迭代；当前宿主只装一个 agent，多 agent
-//! 时每个根实体的队列与耐久进度天然互相隔离。
+//! 会话根实体上（宿主经 `session_state` 挂载），系统按实体迭代与按
+//! 消息里的 `agent` 字段寻址；多 agent 时每个会话的队列与耐久进度
+//! 天然互相隔离。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agnes_ecs::{Entity, MessageReader, Query, Res, RuntimeSender, With};
+use agnes_ecs::{Entity, MessageReader, Query, Res, RuntimeSender};
 use agnes_plugin_async::AsyncExecutor;
 use agnes_record::{
-    AgentRoot, Durability, HostEvent, Log, RotateSession, RunEvent, SessionStore,
+    Durability, HostEvent, Log, RotateSession, RunEvent, RunEventKind, SessionStore,
     SessionStoreResource,
 };
 
@@ -38,39 +39,48 @@ pub struct SessionRotated {
     pub path: PathBuf,
 }
 
-/// Forwards session-relevant [`RunEvent`]s to each session's writer task and
-/// starts the task lazily on the first run with a store installed.
+/// Forwards each session's own [`RunEvent`]s to its writer task and starts
+/// the task lazily on the first run with a store installed.
 ///
 /// Never awaits: the system only enqueues commands onto a bounded channel.
 /// Run events and rotation requests are drained on every tick even when no
 /// store is installed, so the message bus never piles up behind this reader.
-/// The run-event stream itself is global this round (one agent per app);
-/// addressing it per agent is part of the multi-agent follow-up.
+/// [`RunEvent`]s address their agent, so every session only ever sees its
+/// own stream — with several agents in one world the ledgers stay separate.
+/// 会话的标识是本 crate 自己的 [`SessionPump`] 组件（宿主经
+/// `session_state` 挂载），不依赖任何 agent 侧的标记。
 pub fn session_pump(
     executor: Res<AsyncExecutor>,
-    mut sessions: Query<
-        (
-            Entity,
-            &mut SessionPump,
-            &mut Durability,
-            Option<&SessionStoreResource>,
-        ),
-        With<AgentRoot>,
-    >,
+    mut sessions: Query<(
+        Entity,
+        &mut SessionPump,
+        &mut Durability,
+        Option<&SessionStoreResource>,
+    )>,
     mut run_events: MessageReader<RunEvent>,
     mut rotations: MessageReader<RotateSession>,
 ) {
     let events = run_events.read();
     let rotations = rotations.read();
     for (agent, mut pump, mut durability, store) in sessions.iter_mut() {
+        let own_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.agent == agent)
+            .cloned()
+            .collect();
+        let own_rotations: Vec<_> = rotations
+            .iter()
+            .filter(|rotation| rotation.agent == agent)
+            .cloned()
+            .collect();
         pump_session(
             agent,
             &executor,
             &mut pump,
             &mut durability,
             store.as_deref(),
-            &events,
-            &rotations,
+            &own_events,
+            &own_rotations,
         );
     }
 }
@@ -146,13 +156,13 @@ fn pump_session(
 /// produce nothing and do not consume a sequence number.
 fn translate(next_seq: &mut u64, run_event: &RunEvent) -> Option<SessionCommand> {
     let seq = next_seq.checked_add(1)?;
-    let command = match run_event {
-        RunEvent::Recorded { at, event } => SessionCommand::Append {
+    let command = match &run_event.kind {
+        RunEventKind::Recorded { at, event } => SessionCommand::Append {
             seq,
             at: *at,
             event: event.clone(),
         },
-        RunEvent::ApprovalRequested { at, call } => SessionCommand::AppendHost {
+        RunEventKind::ApprovalRequested { at, call } => SessionCommand::AppendHost {
             seq,
             at: *at,
             event: HostEvent::ApprovalRequested {
@@ -160,7 +170,7 @@ fn translate(next_seq: &mut u64, run_event: &RunEvent) -> Option<SessionCommand>
                 tool: call.name.clone(),
             },
         },
-        RunEvent::ApprovalResolved {
+        RunEventKind::ApprovalResolved {
             at,
             call_id,
             outcome,
@@ -172,7 +182,7 @@ fn translate(next_seq: &mut u64, run_event: &RunEvent) -> Option<SessionCommand>
                 outcome: *outcome,
             },
         },
-        RunEvent::Aborted { at, by, reason } => SessionCommand::AppendHost {
+        RunEventKind::Aborted { at, by, reason } => SessionCommand::AppendHost {
             seq,
             at: *at,
             event: HostEvent::Aborted {
@@ -180,7 +190,7 @@ fn translate(next_seq: &mut u64, run_event: &RunEvent) -> Option<SessionCommand>
                 reason: reason.clone(),
             },
         },
-        RunEvent::Failed { at, cause } => SessionCommand::AppendHost {
+        RunEventKind::Failed { at, cause } => SessionCommand::AppendHost {
             seq,
             at: *at,
             event: HostEvent::Failed {
@@ -202,46 +212,39 @@ fn fail(durability: &mut Durability, cause: impl std::fmt::Display) {
 }
 
 /// Applies writer acknowledgements and failures to each session's
-/// [`Durability`], routed by the agent root the writer belongs to.
+/// [`Durability`], routed by the agent the writer belongs to.
 pub fn session_ack(
-    mut sessions: Query<(Entity, &mut Durability), With<AgentRoot>>,
+    mut sessions: Query<&mut Durability>,
     mut flushed: MessageReader<SessionFlushed>,
     mut failures: MessageReader<SessionWriteFailed>,
 ) {
     for message in flushed.read() {
-        let Some((_, mut durability)) = sessions
-            .iter_mut()
-            .find(|(entity, _)| *entity == message.agent)
-        else {
+        let Some(mut durability) = sessions.get_mut(message.agent) else {
             continue;
         };
         durability.flushed_seq = durability.flushed_seq.max(message.seq);
     }
     for message in failures.read() {
-        let Some((_, mut durability)) = sessions
-            .iter_mut()
-            .find(|(entity, _)| *entity == message.agent)
-        else {
+        let Some(mut durability) = sessions.get_mut(message.agent) else {
             continue;
         };
         fail(&mut durability, &message.cause);
     }
 }
 
-/// Clears the in-memory log and the durability baseline when the host rotates
-/// the session; a persistence store opens the next storage and reports it as
-/// [`SessionRotated`].
+/// Clears the targeted session's in-memory log and durability baseline when
+/// the host rotates it; a persistence store opens the next storage and
+/// reports it as [`SessionRotated`]. Other agents' sessions are untouched.
 pub fn session_rotate(
-    mut sessions: Query<(&mut Log, &mut Durability), With<AgentRoot>>,
+    mut sessions: Query<(&mut Log, &mut Durability)>,
     mut requests: MessageReader<RotateSession>,
 ) {
-    if requests.read().is_empty() {
-        return;
-    }
-    for (mut log, mut durability) in sessions.iter_mut() {
-        log.reset();
-        durability.sent_seq = 0;
-        durability.flushed_seq = 0;
+    for request in requests.read() {
+        if let Some((mut log, mut durability)) = sessions.get_mut(request.agent) {
+            log.reset();
+            durability.sent_seq = 0;
+            durability.flushed_seq = 0;
+        }
     }
 }
 
@@ -476,7 +479,7 @@ mod tests {
     fn a_write_failure_marks_the_session_failed_and_stops_the_pump() {
         let mut app = App::new();
         app.add_plugin(agnes_plugin_async::TokioPlugin);
-        let root = app.world_mut().spawn(AgentRoot);
+        let root = app.world_mut().spawn_empty();
         app.world_mut().insert(
             root,
             Durability {
@@ -509,9 +512,12 @@ mod tests {
 
         // fail-closed：之后的事件不再转发，序号不再前进。
         sender
-            .send_message(RunEvent::Recorded {
-                at: Timestamp::now(),
-                event: Event::TurnStart,
+            .send_message(RunEvent {
+                agent: root,
+                kind: RunEventKind::Recorded {
+                    at: Timestamp::now(),
+                    event: Event::TurnStart,
+                },
             })
             .expect("runtime is alive");
         app.pump().expect("schedule runs");

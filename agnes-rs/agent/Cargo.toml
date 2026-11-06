@@ -9,6 +9,7 @@ license.workspace = true
 agnes-core.workspace = true
 agnes-ecs.workspace = true
 agnes-plugin-async = { workspace = true, features = ["tokio"] }
+agnes-plugin-session.workspace = true
 agnes-io.workspace = true
 agnes-record.workspace = true
 agnes-util.workspace = true

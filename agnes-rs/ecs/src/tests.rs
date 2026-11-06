@@ -576,6 +576,38 @@ fn a_duplicate_plugin_panics() {
 }
 
 #[test]
+fn is_plugin_added_reports_registered_plugins() {
+    let mut app = App::new();
+    assert!(!app.is_plugin_added::<CounterPlugin>());
+    app.add_plugin(CounterPlugin);
+    assert!(app.is_plugin_added::<CounterPlugin>());
+}
+
+struct DependentPlugin;
+
+impl Plugin for DependentPlugin {
+    fn build(&self, app: &mut App) {
+        assert!(
+            app.is_plugin_added::<CounterPlugin>(),
+            "DependentPlugin requires CounterPlugin to be registered first"
+        );
+    }
+}
+
+#[test]
+fn a_plugin_asserts_its_dependency_satisfied_by_an_earlier_plugin() {
+    let mut app = App::new();
+    app.add_plugin(CounterPlugin).add_plugin(DependentPlugin);
+}
+
+#[test]
+#[should_panic(expected = "requires CounterPlugin")]
+fn a_plugin_asserts_a_missing_dependency_at_build_time() {
+    let mut app = App::new();
+    app.add_plugin(DependentPlugin);
+}
+
+#[test]
 fn a_schedule_access_conflict_is_reported_from_app() {
     let mut app = App::new();
     let error = app

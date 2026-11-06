@@ -4,10 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ECS plugin that mounts an opened SessionFile as the session store port."
+description = "SessionStore adapter that backs one opened SessionFile."
 
 [dependencies]
-agnes-ecs.workspace = true
 agnes-record.workspace = true
 agnes-session-file.workspace = true
 async-trait.workspace = true

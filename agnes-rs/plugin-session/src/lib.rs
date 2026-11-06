@@ -1,13 +1,14 @@
-//! Session state as an ECS plugin.
+//! Session systems as an ECS plugin.
 //!
-//! [`SessionPlugin`] owns the session's state: the in-memory [`Log`], the
-//! [`Durability`] progress, the sequence numbers, and the rotation policy. All
-//! of it hangs as components on the session's [`AgentRoot`] entity — one root
-//! per running agent — never in global resources. The plugin never touches
-//! storage itself — persistence is a separate plugin that mounts a
-//! [`SessionStoreResource`] component on the same root; without one the
-//! session runs in memory-only mode (the `Log` still records, nothing is
-//! written, and the durability gate is always open).
+//! [`SessionPlugin`] registers the session's systems: the in-memory [`Log`],
+//! the [`Durability`] progress, and the rotation policy all hang as components
+//! on the session's root entity — one root per running agent — never
+//! in global resources. The host spawns the root and attaches the state with
+//! [`session_state`] before adding this plugin; the plugin never touches
+//! storage itself — persistence is a [`SessionStoreResource`] component the
+//! host attaches on the same root; without one the session runs in memory-only
+//! mode (the `Log` still records, nothing is written, and the durability gate
+//! is always open).
 //!
 //! The `session_pump` system forwards the run's [`RunEvent`] stream to an
 //! ordered writer task over a bounded channel — the system never awaits — and
@@ -33,10 +34,10 @@
 //! **before** `agnes_agent::runtime::AgentPlugin` and the renderer plugin:
 //! its `session_ack` system must run first in a tick so a flush
 //! acknowledgement is visible to the durability gate and the final report
-//! within the same tick.
+//! within the same tick. Both plugins assert this dependency at build time.
 
 use agnes_ecs::{App, Plugin, Update};
-use agnes_record::{AgentRoot, Durability, Event, Log};
+use agnes_record::{Durability, Event, Log};
 use jiff::Timestamp;
 
 mod systems;
@@ -78,39 +79,36 @@ pub struct SessionPump {
 
 agnes_ecs::component!(SessionPump);
 
-/// The session's state: log, durability, and rotation policy.
+/// The session's state for one agent root: log, pump, and durability.
 ///
-/// Without a [`SessionStoreResource`] component on the same root the session
-/// is memory-only; with one, the writer persists through it.
-pub struct SessionPlugin {
-    events: Vec<Event>,
-}
-
-impl Default for SessionPlugin {
-    fn default() -> Self {
-        Self::new()
+/// The host spawns the root and attaches this bundle before adding
+/// [`SessionPlugin`]. Without a [`SessionStoreResource`] component on the same
+/// root the session is memory-only; with one, the writer persists through it.
+///
+/// # Errors
+///
+/// Returns [`SessionInitError::NoHeader`] when the history has records but no
+/// [`Event::Header`] — a session that cannot be continued.
+///
+/// # Panics
+///
+/// The restored event count must fit into `u64` — unreachable on every
+/// supported target, where `usize` is at most 64 bits.
+pub fn session_state(events: &[Event]) -> Result<(Log, SessionPump, Durability), SessionInitError> {
+    if !events.is_empty() && !events.iter().any(|event| matches!(event, Event::Header(_))) {
+        return Err(SessionInitError::NoHeader);
     }
-}
-
-impl SessionPlugin {
-    /// Creates a memory-only session: state without persistence.
-    pub fn new() -> Self {
-        Self { events: Vec::new() }
-    }
-
-    /// Resumes from restored history (seeds the [`Log`] and the durability
-    /// baseline).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionInitError::NoHeader`] when the history has records
-    /// but no [`Event::Header`] — a session that cannot be continued.
-    pub fn resumed(events: Vec<Event>) -> Result<Self, SessionInitError> {
-        if events.is_empty() || events.iter().any(|event| matches!(event, Event::Header(_))) {
-            return Ok(Self { events });
-        }
-        Err(SessionInitError::NoHeader)
-    }
+    // 恢复的历史事件已经在存储里 —— 耐久序号从它们之后起算。
+    let restored = u64::try_from(events.len()).expect("the restored event count fits into u64");
+    Ok((
+        Log::restore(events.to_vec()),
+        SessionPump::default(),
+        Durability {
+            sent_seq: restored,
+            flushed_seq: restored,
+            failed: None,
+        },
+    ))
 }
 
 /// A session could not be initialized.
@@ -121,12 +119,9 @@ pub enum SessionInitError {
     NoHeader,
 }
 
-/// The root entity the session state attaches to: the existing
-/// [`AgentRoot`] entity, or a fresh one when no plugin created it yet.
-fn session_root(app: &mut App) -> agnes_ecs::Entity {
-    let existing = app.world().entity_with::<AgentRoot>();
-    existing.unwrap_or_else(|| app.world_mut().spawn(AgentRoot))
-}
+/// Registers the session systems; state comes from [`session_state`].
+#[derive(Default)]
+pub struct SessionPlugin;
 
 impl Plugin for SessionPlugin {
     fn name(&self) -> &'static str {
@@ -134,21 +129,6 @@ impl Plugin for SessionPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        // 恢复的历史事件已经在存储里 —— 耐久序号从它们之后起算。
-        let restored =
-            u64::try_from(self.events.len()).expect("the restored event count fits into u64");
-        let root = session_root(app);
-        let world = app.world_mut();
-        world.insert(root, Log::restore(self.events.clone()));
-        world.insert(root, SessionPump::default());
-        world.insert(
-            root,
-            Durability {
-                sent_seq: restored,
-                flushed_seq: restored,
-                failed: None,
-            },
-        );
         app.add_systems(Update, systems::session_pump)
             .add_systems(Update, systems::session_ack)
             .add_systems(Update, systems::session_rotate);

@@ -2,20 +2,21 @@
 //!
 //! [`Activity`] 是派生状态，不是会话日志的一部分：它从不落盘、不可恢复，
 //! 只从 [`RunEvent`] 与 [`LlmStreamEvent`] 投影而来。它以组件形式挂在
-//! agent 根实体上，每个 agent 一份快照。权威用量仍在 `MessageEnd.usage`
-//! 与 `TurnResult.usage`；流尾的 `Usage` 只是让界面提前看到同一个值。
+//! agent 根实体上，每个 agent 一份快照，由宿主挂载（`Activity::default()`）。
+//! 权威用量仍在 `MessageEnd.usage` 与 `TurnResult.usage`；流尾的 `Usage`
+//! 只是让界面提前看到同一个值。
 //!
-//! [`ActivityPlugin`] 把它装进 ECS；界面（CLI、未来的 GUI/web）只读快照，
-//! 不重复计数。会话插件仍然只管日志与耐久，不持有任何实时状态。
+//! [`ActivityPlugin`] 只注册投影系统；界面（CLI、未来的 GUI/web）只读
+//! 快照，不重复计数。会话插件仍然只管日志与耐久，不持有任何实时状态。
 
 use std::time::{Duration, Instant};
 
 use agnes_core::message::TokenUsage;
 use agnes_ecs::{App, MessageReader, Plugin, Query, Update};
 use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate};
-use agnes_record::{Event as RecordEvent, RotateSession, RunEvent};
+use agnes_record::{Event as RecordEvent, RotateSession, RunEvent, RunEventKind};
 
-use crate::runtime::agent_root;
+use crate::runtime::{InFlightCall, TurnOwner};
 
 agnes_ecs::component!(Activity);
 
@@ -164,7 +165,8 @@ impl Activity {
     }
 }
 
-/// 安装 [`Activity`] 并把运行期消息投影进去。
+/// 注册活动投影系统：把运行期消息投影到宿主挂载的 [`Activity`] 上。
+#[derive(Default)]
 pub struct ActivityPlugin;
 
 impl Plugin for ActivityPlugin {
@@ -173,38 +175,47 @@ impl Plugin for ActivityPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        let root = agent_root(app.world_mut());
-        app.world_mut().insert(root, Activity::default());
         app.add_systems(Update, track_run_events)
             .add_systems(Update, track_stream)
             .add_systems(Update, track_rotation);
     }
 }
 
-/// 运行事件流是全局广播（本轮每 app 一个 agent）；投影到所有 agent 的
-/// 快照上，多 agent 时改为按目标路由。
+/// 运行事件按 `agent` 路由到所属 agent 的快照；每个 agent 只看到自己的
+/// 事件流。
 fn track_run_events(mut events: MessageReader<RunEvent>, mut activities: Query<&mut Activity>) {
     for event in events.read() {
-        for mut activity in activities.iter_mut() {
-            match event.as_ref() {
-                RunEvent::Started { .. } => activity.begin_turn(),
-                RunEvent::Recorded { event, .. } => activity.record(event),
-                RunEvent::Finished { .. } | RunEvent::Failed { .. } => activity.end_turn(),
-                _ => {}
-            }
+        let Some(mut activity) = activities.get_mut(event.agent) else {
+            continue;
+        };
+        match &event.kind {
+            RunEventKind::Started { .. } => activity.begin_turn(),
+            RunEventKind::Recorded { event, .. } => activity.record(event),
+            RunEventKind::Finished { .. } | RunEventKind::Failed { .. } => activity.end_turn(),
+            _ => {}
         }
     }
 }
 
-fn track_stream(mut events: MessageReader<LlmStreamEvent>, mut activities: Query<&mut Activity>) {
+/// 流式事件按在飞调用路由回所属 agent 的快照；调用已收场时迟到的增量
+/// 直接丢弃（权威用量随 `MessageEnd` 走）。
+fn track_stream(
+    mut events: MessageReader<LlmStreamEvent>,
+    mut activities: Query<&mut Activity>,
+    calls: Query<(&InFlightCall, &TurnOwner)>,
+) {
     for event in events.read() {
-        for mut activity in activities.iter_mut() {
-            match &event.update {
-                LlmStreamUpdate::Started => activity.stream_started(),
-                LlmStreamUpdate::Delta { text } => activity.stream_delta(text),
-                LlmStreamUpdate::Reasoning { text } => activity.stream_reasoning(text),
-                LlmStreamUpdate::Usage { usage } => activity.note_usage(*usage),
-            }
+        let Some((_, owner)) = calls.iter().find(|(call, _)| call.id == event.id) else {
+            continue;
+        };
+        let Some(mut activity) = activities.get_mut(owner.0) else {
+            continue;
+        };
+        match &event.update {
+            LlmStreamUpdate::Started => activity.stream_started(),
+            LlmStreamUpdate::Delta { text } => activity.stream_delta(text),
+            LlmStreamUpdate::Reasoning { text } => activity.stream_reasoning(text),
+            LlmStreamUpdate::Usage { usage } => activity.note_usage(*usage),
         }
     }
 }
@@ -213,11 +224,10 @@ fn track_rotation(
     mut rotations: MessageReader<RotateSession>,
     mut activities: Query<&mut Activity>,
 ) {
-    if rotations.read().is_empty() {
-        return;
-    }
-    for mut activity in activities.iter_mut() {
-        activity.reset_session();
+    for rotation in rotations.read() {
+        if let Some(mut activity) = activities.get_mut(rotation.agent) {
+            activity.reset_session();
+        }
     }
 }
 
@@ -237,13 +247,16 @@ mod tests {
 
     fn app() -> App {
         let mut app = App::new();
+        // 宿主装配：根实体与快照组件先建，插件只注册系统。
+        app.world_mut()
+            .spawn_bundle((crate::AgentRoot, Activity::default()));
         app.add_plugin(ActivityPlugin);
         app
     }
 
     fn root(app: &App) -> agnes_ecs::Entity {
         app.world()
-            .entity_with::<agnes_record::AgentRoot>()
+            .entity_with::<crate::AgentRoot>()
             .expect("agent root exists")
     }
 
@@ -254,18 +267,24 @@ mod tests {
             .clone()
     }
 
-    fn started() -> RunEvent {
-        RunEvent::Started {
-            at: Timestamp::now(),
-            goal: None,
-            tools: Vec::new(),
+    fn started(agent: agnes_ecs::Entity) -> RunEvent {
+        RunEvent {
+            agent,
+            kind: RunEventKind::Started {
+                at: Timestamp::now(),
+                goal: None,
+                tools: Vec::new(),
+            },
         }
     }
 
-    fn recorded(event: RecordEvent) -> RunEvent {
-        RunEvent::Recorded {
-            at: Timestamp::now(),
-            event,
+    fn recorded(agent: agnes_ecs::Entity, event: RecordEvent) -> RunEvent {
+        RunEvent {
+            agent,
+            kind: RunEventKind::Recorded {
+                at: Timestamp::now(),
+                event,
+            },
         }
     }
 
@@ -276,10 +295,23 @@ mod tests {
         }
     }
 
+    /// 在飞调用实体：流式事件经它路由回所属 agent 的快照。
+    fn install_stream_call(app: &mut App) {
+        let agent = root(app);
+        app.world_mut().spawn_bundle((
+            InFlightCall {
+                id: LlmCallId::new(1),
+                model: model(),
+            },
+            TurnOwner(agent),
+        ));
+    }
+
     #[test]
     fn a_run_moves_through_running_and_streaming() {
         let mut app = app();
-        app.world_mut().send_message(started());
+        let agent = root(&app);
+        app.world_mut().send_message(started(agent));
         app.pump().expect("schedule runs");
         {
             let activity = activity(&app);
@@ -288,10 +320,13 @@ mod tests {
             assert_eq!(activity.step(), 0);
         }
 
-        app.world_mut()
-            .send_message(recorded(RecordEvent::MessageStart {
+        install_stream_call(&mut app);
+        app.world_mut().send_message(recorded(
+            agent,
+            RecordEvent::MessageStart {
                 step: StepNumber::FIRST,
-            }));
+            },
+        ));
         app.world_mut().send_message(stream(LlmStreamUpdate::Delta {
             text: "hello".to_owned(),
         }));
@@ -303,8 +338,9 @@ mod tests {
             assert_eq!(activity.live_output_chars(), 5);
         }
 
-        app.world_mut()
-            .send_message(recorded(RecordEvent::MessageEnd {
+        app.world_mut().send_message(recorded(
+            agent,
+            RecordEvent::MessageEnd {
                 step: StepNumber::FIRST,
                 model: model(),
                 stop: StopKind::Completed,
@@ -312,7 +348,8 @@ mod tests {
                     input: 3,
                     output: 2,
                 },
-            }));
+            },
+        ));
         app.pump().expect("schedule runs");
         {
             let activity = activity(&app);
@@ -334,9 +371,12 @@ mod tests {
             assert_eq!(activity.live_output_chars(), 0);
         }
 
-        app.world_mut().send_message(RunEvent::Finished {
-            at: Timestamp::now(),
-            outcome: agnes_core::turn::Outcome::Answered,
+        app.world_mut().send_message(RunEvent {
+            agent,
+            kind: RunEventKind::Finished {
+                at: Timestamp::now(),
+                outcome: agnes_core::turn::Outcome::Answered,
+            },
         });
         app.pump().expect("schedule runs");
         {
@@ -349,7 +389,9 @@ mod tests {
     #[test]
     fn the_stream_tail_usage_is_visible_before_the_message_ends() {
         let mut app = app();
-        app.world_mut().send_message(started());
+        let agent = root(&app);
+        install_stream_call(&mut app);
+        app.world_mut().send_message(started(agent));
         app.world_mut()
             .send_message(stream(LlmStreamUpdate::Started));
         app.world_mut().send_message(stream(LlmStreamUpdate::Usage {
@@ -374,6 +416,8 @@ mod tests {
     #[test]
     fn reasoning_chars_are_counted_and_cleared_with_the_step() {
         let mut app = app();
+        let agent = root(&app);
+        install_stream_call(&mut app);
         app.world_mut()
             .send_message(stream(LlmStreamUpdate::Reasoning {
                 text: "think".to_owned(),
@@ -396,8 +440,9 @@ mod tests {
             assert_eq!(activity.live_output_chars(), 6);
         }
 
-        app.world_mut()
-            .send_message(recorded(RecordEvent::MessageEnd {
+        app.world_mut().send_message(recorded(
+            agent,
+            RecordEvent::MessageEnd {
                 step: StepNumber::FIRST,
                 model: model(),
                 stop: StopKind::Completed,
@@ -405,7 +450,8 @@ mod tests {
                     input: 3,
                     output: 2,
                 },
-            }));
+            },
+        ));
         app.pump().expect("schedule runs");
         assert_eq!(activity(&app).live_reasoning_chars(), 0);
     }
@@ -413,9 +459,11 @@ mod tests {
     #[test]
     fn rotation_clears_the_session_total() {
         let mut app = app();
-        app.world_mut().send_message(started());
-        app.world_mut()
-            .send_message(recorded(RecordEvent::MessageEnd {
+        let agent = root(&app);
+        app.world_mut().send_message(started(agent));
+        app.world_mut().send_message(recorded(
+            agent,
+            RecordEvent::MessageEnd {
                 step: StepNumber::FIRST,
                 model: model(),
                 stop: StopKind::Completed,
@@ -423,7 +471,8 @@ mod tests {
                     input: 9,
                     output: 5,
                 },
-            }));
+            },
+        ));
         app.pump().expect("schedule runs");
         assert_eq!(
             activity(&app).session_usage(),
@@ -433,8 +482,34 @@ mod tests {
             }
         );
 
-        app.world_mut().send_message(RotateSession);
+        app.world_mut().send_message(RotateSession { agent });
         app.pump().expect("schedule runs");
         assert_eq!(activity(&app).session_usage(), TokenUsage::default());
+    }
+
+    #[test]
+    fn foreign_events_do_not_touch_the_snapshot() {
+        let mut app = App::new();
+        // 本 agent 的根实体 + 一个别的 agent 的根实体；事件都发给对方。
+        app.world_mut()
+            .spawn_bundle((crate::AgentRoot, Activity::default()));
+        app.add_plugin(ActivityPlugin);
+        let other = app.world_mut().spawn(crate::AgentRoot);
+
+        app.world_mut().send_message(started(other));
+        app.world_mut().send_message(RunEvent {
+            agent: other,
+            kind: RunEventKind::Finished {
+                at: Timestamp::now(),
+                outcome: agnes_core::turn::Outcome::Answered,
+            },
+        });
+        app.pump().expect("schedule runs");
+
+        assert_eq!(
+            activity(&app).phase(),
+            Phase::Idle,
+            "foreign events are ignored"
+        );
     }
 }

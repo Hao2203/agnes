@@ -26,7 +26,7 @@ use agnes_io::llm::{LlmCall, LlmCancel, LlmError, LlmProvider, LlmReply};
 use agnes_io::tool::ToolRegistry;
 use agnes_plugin_async::AsyncExecutor;
 use agnes_record::{
-    AgentRoot, ApprovalOutcome, Durability, Event as RecordEvent, Log, RunEvent, StepOutcome,
+    ApprovalOutcome, Durability, Event as RecordEvent, Log, RunEvent, RunEventKind, StepOutcome,
 };
 use jiff::Timestamp;
 
@@ -39,6 +39,7 @@ use super::state::{
     ActiveTurn, CallPhase, InFlightCall, LlmCallSeq, PendingTurns, PendingUserMessages, Staged,
     ToolCallEntry, TurnClock, TurnFailed, TurnOwner, TurnPhase,
 };
+use crate::AgentRoot;
 use crate::approval::{ApprovalChannel, ApprovalRequest};
 use crate::model::ModelSettings;
 use crate::permission::PermissionRules;
@@ -58,7 +59,10 @@ fn record(recorder: &mut Recorder, agent: Entity, event: RecordEvent) {
         .get_mut(agent)
         .expect("the turn's owner has a session log");
     let event = log.record(event).clone();
-    recorder.1.write(RunEvent::Recorded { at, event });
+    recorder.1.write(RunEvent {
+        agent,
+        kind: RunEventKind::Recorded { at, event },
+    });
 }
 
 /// 自 `before` 起新增的会话消息逐条入账。
@@ -105,13 +109,21 @@ fn deny_reason(rules: Option<&PermissionRules>, name: &ToolName) -> Option<Strin
 }
 
 /// 拒绝一次调用：门禁事件先落账，机器随后收到合成的失败结果。
-fn deny_entry(run_events: &mut MessageWriter<RunEvent>, entry: &mut ToolCallEntry, reason: String) {
-    run_events.write(RunEvent::ToolGated {
-        at: Timestamp::now(),
-        call: entry.call.clone(),
-        denied: agnes_record::Denied {
-            by: POLICY_DENIER.into(),
-            reason: reason.clone(),
+fn deny_entry(
+    run_events: &mut MessageWriter<RunEvent>,
+    agent: Entity,
+    entry: &mut ToolCallEntry,
+    reason: String,
+) {
+    run_events.write(RunEvent {
+        agent,
+        kind: RunEventKind::ToolGated {
+            at: Timestamp::now(),
+            call: entry.call.clone(),
+            denied: agnes_record::Denied {
+                by: POLICY_DENIER.into(),
+                reason: reason.clone(),
+            },
         },
     });
     entry.phase = CallPhase::Denied(ToolOutput::error(reason));
@@ -180,15 +192,18 @@ fn spawn_turn(
         .collect();
     let turn = Turn::with_messages(config.header.clone(), config.budget, messages);
     let started_at = Timestamp::now();
-    recorder.1.write(RunEvent::Started {
-        at: started_at,
-        goal: config.goal.clone(),
-        tools: config
-            .header
-            .environment()
-            .tools()
-            .map(|spec| spec.name().clone())
-            .collect(),
+    recorder.1.write(RunEvent {
+        agent,
+        kind: RunEventKind::Started {
+            at: started_at,
+            goal: config.goal.clone(),
+            tools: config
+                .header
+                .environment()
+                .tools()
+                .map(|spec| spec.name().clone())
+                .collect(),
+        },
     });
     record(recorder, agent, RecordEvent::Header(turn.header().clone()));
     let staged = match config.goal.clone() {
@@ -284,9 +299,12 @@ pub fn fail_on_session_failure(
             if owner.0 != root || phase.0.is_none() {
                 continue;
             }
-            run_events.write(RunEvent::Failed {
-                at: Timestamp::now(),
-                cause: cause.clone(),
+            run_events.write(RunEvent {
+                agent: root,
+                kind: RunEventKind::Failed {
+                    at: Timestamp::now(),
+                    cause: cause.clone(),
+                },
             });
             phase.0 = None;
             commands.entity(entity).insert(TurnFailed {
@@ -314,7 +332,7 @@ pub fn require_provider(provider: Option<Res<LlmProvider>>) -> Result<(), BoxErr
 pub fn issue_model_call(
     requests: Res<RequestBuilderResource>,
     mut seq: ResMut<LlmCallSeq>,
-    sessions: Query<(Entity, &ModelSettings, Option<&Durability>)>,
+    sessions: Query<(Entity, &ModelSettings, Option<&Durability>), With<AgentRoot>>,
     mut phases: Query<(Entity, &TurnOwner, &mut TurnPhase)>,
     mut recorder: Recorder,
     mut outgoing: MessageWriter<LlmCall>,
@@ -400,13 +418,16 @@ pub fn process_llm_reply(
                             },
                         );
                         for (index, call) in turn.calls().enumerate() {
-                            commands.spawn_bundle((ToolCallEntry {
-                                turn: entity,
-                                step,
-                                index,
-                                call: call.clone(),
-                                phase: CallPhase::Pending,
-                            },));
+                            commands.spawn_bundle((
+                                ToolCallEntry {
+                                    turn: entity,
+                                    step,
+                                    index,
+                                    call: call.clone(),
+                                    phase: CallPhase::Pending,
+                                },
+                                TurnOwner(agent_root),
+                            ));
                         }
                         Some(Staged::AwaitingTools(turn))
                     }
@@ -450,9 +471,12 @@ pub fn process_llm_reply(
             }
             (Some(Staged::AwaitingModel(_)), Err(error)) => {
                 let cause = error.to_string();
-                recorder.1.write(RunEvent::Failed {
-                    at: Timestamp::now(),
-                    cause: cause.clone(),
+                recorder.1.write(RunEvent {
+                    agent: agent_root,
+                    kind: RunEventKind::Failed {
+                        at: Timestamp::now(),
+                        cause: cause.clone(),
+                    },
                 });
                 commands.entity(entity).insert(TurnFailed { cause });
                 None
@@ -468,15 +492,15 @@ pub fn process_llm_reply(
 pub fn gate_tool_calls(
     rules: Option<Res<PermissionRules>>,
     approvals: Option<Res<ApprovalChannel>>,
-    mut entries: Query<&mut ToolCallEntry>,
+    mut entries: Query<(&mut ToolCallEntry, &TurnOwner)>,
     mut run_events: MessageWriter<RunEvent>,
 ) {
-    for mut entry in entries.iter_mut() {
+    for (mut entry, owner) in entries.iter_mut() {
         if !matches!(entry.phase, CallPhase::Pending) {
             continue;
         }
         if let Some(reason) = deny_reason(rules.as_deref(), &entry.call.name) {
-            deny_entry(&mut run_events, &mut entry, reason);
+            deny_entry(&mut run_events, owner.0, &mut entry, reason);
             continue;
         }
         let asks = rules
@@ -489,10 +513,13 @@ pub fn gate_tool_calls(
         }
         let Some(channel) = approvals.as_ref() else {
             // 没接审批口 = 没有答覆者 = 拒绝（fail-closed）。
-            run_events.write(RunEvent::ApprovalResolved {
-                at: Timestamp::now(),
-                call_id: entry.call.id.clone(),
-                outcome: ApprovalOutcome::Unavailable,
+            run_events.write(RunEvent {
+                agent: owner.0,
+                kind: RunEventKind::ApprovalResolved {
+                    at: Timestamp::now(),
+                    call_id: entry.call.id.clone(),
+                    outcome: ApprovalOutcome::Unavailable,
+                },
             });
             entry.phase = CallPhase::Denied(ToolOutput::error(
                 "tool requires an approval, but no approval channel is wired",
@@ -500,9 +527,12 @@ pub fn gate_tool_calls(
             continue;
         };
         // 先发问询事件再递送：审计里不会出现“没有问询的落定”。
-        run_events.write(RunEvent::ApprovalRequested {
-            at: Timestamp::now(),
-            call: entry.call.clone(),
+        run_events.write(RunEvent {
+            agent: owner.0,
+            kind: RunEventKind::ApprovalRequested {
+                at: Timestamp::now(),
+                call: entry.call.clone(),
+            },
         });
         let request = ApprovalRequest {
             call_id: entry.call.id.clone(),
@@ -510,10 +540,13 @@ pub fn gate_tool_calls(
             arguments: entry.call.arguments.clone(),
         };
         if let Err(err) = channel.send(request) {
-            run_events.write(RunEvent::ApprovalResolved {
-                at: Timestamp::now(),
-                call_id: entry.call.id.clone(),
-                outcome: ApprovalOutcome::Unavailable,
+            run_events.write(RunEvent {
+                agent: owner.0,
+                kind: RunEventKind::ApprovalResolved {
+                    at: Timestamp::now(),
+                    call_id: entry.call.id.clone(),
+                    outcome: ApprovalOutcome::Unavailable,
+                },
             });
             entry.phase = CallPhase::Denied(ToolOutput::error(format!(
                 "the approval channel is unavailable: {err}"
@@ -531,10 +564,10 @@ pub fn gate_tool_calls(
 pub fn resolve_approvals(
     mut decided: MessageReader<ApprovalDecided>,
     rules: Option<Res<PermissionRules>>,
-    mut entries: Query<&mut ToolCallEntry>,
+    mut entries: Query<(&mut ToolCallEntry, &TurnOwner)>,
     mut run_events: MessageWriter<RunEvent>,
 ) {
-    for mut entry in entries.iter_mut() {
+    for (mut entry, owner) in entries.iter_mut() {
         let CallPhase::Asked { deadline } = &entry.phase else {
             continue;
         };
@@ -542,36 +575,45 @@ pub fn resolve_approvals(
             .map(|deadline| Instant::now() >= deadline)
             .unwrap_or(false);
         if expired {
-            run_events.write(RunEvent::ApprovalResolved {
-                at: Timestamp::now(),
-                call_id: entry.call.id.clone(),
-                outcome: ApprovalOutcome::Unavailable,
+            run_events.write(RunEvent {
+                agent: owner.0,
+                kind: RunEventKind::ApprovalResolved {
+                    at: Timestamp::now(),
+                    call_id: entry.call.id.clone(),
+                    outcome: ApprovalOutcome::Unavailable,
+                },
             });
             entry.phase = CallPhase::Denied(ToolOutput::error("the approval timed out"));
         }
     }
     for decision in decided.read() {
-        let Some(mut entry) = entries.iter_mut().find(|entry| {
+        let Some((mut entry, owner)) = entries.iter_mut().find(|(entry, _)| {
             entry.call.id == decision.call_id && matches!(entry.phase, CallPhase::Asked { .. })
         }) else {
             continue;
         };
         if !decision.approved {
-            run_events.write(RunEvent::ApprovalResolved {
-                at: Timestamp::now(),
-                call_id: entry.call.id.clone(),
-                outcome: ApprovalOutcome::Rejected,
+            run_events.write(RunEvent {
+                agent: owner.0,
+                kind: RunEventKind::ApprovalResolved {
+                    at: Timestamp::now(),
+                    call_id: entry.call.id.clone(),
+                    outcome: ApprovalOutcome::Rejected,
+                },
             });
             entry.phase = CallPhase::Denied(ToolOutput::error("the approval was refused"));
             continue;
         }
-        run_events.write(RunEvent::ApprovalResolved {
-            at: Timestamp::now(),
-            call_id: entry.call.id.clone(),
-            outcome: ApprovalOutcome::AllowedOnce,
+        run_events.write(RunEvent {
+            agent: owner.0,
+            kind: RunEventKind::ApprovalResolved {
+                at: Timestamp::now(),
+                call_id: entry.call.id.clone(),
+                outcome: ApprovalOutcome::AllowedOnce,
+            },
         });
         if let Some(reason) = deny_reason(rules.as_deref(), &entry.call.name) {
-            deny_entry(&mut run_events, &mut entry, reason);
+            deny_entry(&mut run_events, owner.0, &mut entry, reason);
             continue;
         }
         entry.phase = CallPhase::Allowed;
@@ -738,7 +780,7 @@ pub fn handle_interrupt(
         &TurnClock,
         Option<&mut InFlightCall>,
     )>,
-    mut entries: Query<&mut ToolCallEntry>,
+    mut entries: Query<(&mut ToolCallEntry, &TurnOwner)>,
     mut recorder: Recorder,
     mut cancels: MessageWriter<LlmCancel>,
 ) {
@@ -816,12 +858,15 @@ pub fn handle_interrupt(
         interrupted.push(entity);
     }
     // 挂起的审批问询按取消落定（与旧驱动的打断路径一致）。
-    for mut entry in entries.iter_mut() {
+    for (mut entry, owner) in entries.iter_mut() {
         if matches!(entry.phase, CallPhase::Asked { .. }) && interrupted.contains(&entry.turn) {
-            recorder.1.write(RunEvent::ApprovalResolved {
-                at: Timestamp::now(),
-                call_id: entry.call.id.clone(),
-                outcome: ApprovalOutcome::Cancelled,
+            recorder.1.write(RunEvent {
+                agent: owner.0,
+                kind: RunEventKind::ApprovalResolved {
+                    at: Timestamp::now(),
+                    call_id: entry.call.id.clone(),
+                    outcome: ApprovalOutcome::Cancelled,
+                },
             });
             entry.phase = CallPhase::Settled;
         }
@@ -847,9 +892,12 @@ pub fn close_turn(
                     continue;
                 };
                 let result: TurnResult = turn.into_result();
-                run_events.write(RunEvent::Finished {
-                    at: Timestamp::now(),
-                    outcome: result.outcome,
+                run_events.write(RunEvent {
+                    agent: owner.0,
+                    kind: RunEventKind::Finished {
+                        at: Timestamp::now(),
+                        outcome: result.outcome,
+                    },
                 });
                 finished.write(TurnFinished {
                     agent: owner.0,

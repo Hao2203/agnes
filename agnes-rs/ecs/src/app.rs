@@ -70,6 +70,15 @@ impl App {
         self
     }
 
+    /// Whether a plugin of type `P` has already been installed.
+    ///
+    /// Plugins call this inside [`Plugin::build`] to assert their own
+    /// dependencies: registration order is also per-tick system order, so
+    /// "added before me" is both a capability and an ordering requirement.
+    pub fn is_plugin_added<P: Plugin>(&self) -> bool {
+        self.plugins.contains(&TypeId::of::<P>())
+    }
+
     /// Adds a system to the labeled schedule.
     ///
     /// # Panics

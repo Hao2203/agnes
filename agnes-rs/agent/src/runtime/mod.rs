@@ -2,28 +2,33 @@
 //!
 //! 机器（[`agnes_core::agent`]）是唯一真相；本模块的系统只是解释阶段
 //! 提示、做 IO、记事件。每会话状态以组件形式挂在 agent 根实体
-//! （[`AgentRoot`] 标记，[`agent_root`] 可以 find-or-create）上，一个世界
-//! 可以同时运行多个 agent。外部装配约定：
+//! （[`AgentRoot`] 标记）上，一个世界可以同时运行多个 agent；根实体与
+//! 状态由宿主创建并保管句柄（`agnes_plugin_session::session_state`，
+//! 加 [`PendingTurns`] / [`PendingUserMessages`] /
+//! [`ModelSettings`](crate::model::ModelSettings)），本 crate 的插件不
+//! spawn 实体、不挂组件。外部装配约定 —— 强依赖在 build 内断言，注册
+//! 顺序即每 tick 系统顺序：
 //!
+//! - `agnes_plugin_session::SessionPlugin`：**先于本插件**（断言）。其
+//!   `session_ack` 系统必须在同一 tick 内先于耐久门禁运行；
+//! - [`ModelPlugin`](crate::model::ModelPlugin)：**先于本插件**（断言）。
+//!   `apply_settings` 在同一 tick 内先于模型调用生效；设置组件由宿主挂；
+//! - [`ToolsPlugin`]：**先于本插件**（断言）。工具表由它填充；
 //! - `agnes_io::llm::LlmProvider`：provider 插件安装（如
-//!   `agnes-plugin-openai`）；`require_provider` 每 tick 检查，缺失时
-//!   调度当 tick 即报错，不会让调用消失在消息总线里。运行时不碰
-//!   网络：它写 `LlmCall` / `LlmCancel` 消息，读 `LlmReply` 消息；
+//!   `agnes-plugin-openai`）。可替换依赖不断言：`require_provider` 每
+//!   tick 检查，缺失时调度当 tick 即报错，不会让调用消失在消息总线里。
+//!   运行时不碰网络：它写 `LlmCall` / `LlmCancel` 消息，读 `LlmReply`
+//!   消息；
 //! - [`RequestBuilderResource`]：宿主安装（提示词投影在这里决定）；
-//! - [`ModelSettings`](crate::model::ModelSettings)：当前模型与思考设置，
-//!   `ModelPlugin` 把它挂到 agent 根实体上（必须先于本插件注册：缺失时
-//!   debug 构建在注册期断言报错，release 构建由 `issue_model_call` 的
-//!   查询参数每 tick 失败）；
-//! - [`ToolsPlugin`] / `agnes_io::tool::ToolRegistry`：工具表；
 //! - `crate::approval::ApprovalChannel`：审批口（配 `ask` 规则时必需，
 //!   缺失即 fail-closed 拒绝）；
 //! - `crate::permission::PermissionRules`：权限规则（缺省全部放行）；
-//! - `agnes_record::Durability`：会话耐久进度（`agnes-plugin-session`
-//!   挂到根实体上；缺省视为无会话、无需等待）；
-//! - `agnes_record::Log`：会话日志（根实体组件；本插件兜底初始化，装了
-//!   `agnes-plugin-session` 时由它安装恢复的历史并负责轮转重置）；
-//! - [`ActiveTurn`]：turn 实体上的零大小标记，宿主可 `Query<&ActiveTurn>`
-//!   判断是否有 turn 在飞（输入路由用）。
+//! - `agnes_record::Durability`：会话耐久进度（宿主经 `session_state`
+//!   挂到根实体上，`agnes-plugin-session` 的系统驱动它）；
+//! - `agnes_record::Log`：会话日志（根实体组件，宿主挂载）；
+//! - [`ActiveTurn`] / [`TurnOwner`]：turn 实体上的零大小标记与归属回指，
+//!   宿主可 `Query<(&ActiveTurn, &TurnOwner)>` 判断某个 agent 是否有
+//!   turn 在飞（输入路由用）。
 //!
 //! 宿主经 `RuntimeSender` 注入 [`TurnRequested`] / [`UserMessage`] /
 //! [`ApprovalDecided`] / [`InterruptTurn`]（前三者与打断都带目标 agent）；
@@ -40,30 +45,21 @@ pub use messages::{
     ApprovalDecided, InterruptTurn, ToolFinished, TurnFailure, TurnFinished, TurnRequested,
     UserMessage,
 };
-pub use state::{ActiveTurn, PendingTurns, PendingUserMessages};
+pub(crate) use state::InFlightCall;
+pub use state::{ActiveTurn, PendingTurns, PendingUserMessages, TurnOwner};
 
 use std::sync::Arc;
 
 use agnes_core::llm::LlmRequest;
 use agnes_core::turn::Turn;
-use agnes_ecs::{App, Entity, Plugin, Update, World};
+use agnes_ecs::{App, Plugin, Update};
 use agnes_io::tool::{Tool, ToolRegistry};
-use agnes_record::{AgentRoot, Log};
+use agnes_record::Log;
 
 use state::LlmCallSeq;
 
 use crate::RequestBuilder;
-use crate::model::ModelSettings;
-
-/// 该世界的 agent 根实体：已存在的 [`AgentRoot`] 实体，没有就 spawn 一个。
-///
-/// 插件在安装期用它把自己的每会话状态挂上去；宿主与测试用它拿到
-/// 消息里 `agent` 字段要填的实体。多 agent 宿主可以再 `world.spawn(AgentRoot)`
-/// 出更多根实体并重复挂载流程。
-pub fn agent_root(world: &mut World) -> Entity {
-    let existing = world.entity_with::<AgentRoot>();
-    existing.unwrap_or_else(|| world.spawn(AgentRoot))
-}
+use crate::model::{ModelPlugin, ModelSettings};
 
 /// 把 [`Turn`] 转换成本次请求的宿主转换者，作为资源安装。
 ///
@@ -82,9 +78,10 @@ impl RequestBuilderResource {
     }
 }
 
-/// 注册 agent 运行时：资源兜底 + 按序注册消息管线的全部系统。
+/// 注册 agent 运行时：按序注册消息管线的全部系统。
 ///
 /// 系统注册顺序即执行顺序；管线的一个 tick 对应旧驱动的一个检查点。
+/// 根实体与每会话状态由宿主装配，本插件不创建。
 pub struct AgentPlugin;
 
 impl Plugin for AgentPlugin {
@@ -92,27 +89,39 @@ impl Plugin for AgentPlugin {
         "agnes-agent"
     }
 
+    /// # Panics
+    ///
+    /// 注册期断言强依赖：[`SessionPlugin`](agnes_plugin_session::SessionPlugin)、
+    /// [`ModelPlugin`] 与 [`ToolsPlugin`] 必须先装，且宿主已把会话状态
+    /// （`Log`）与 [`ModelSettings`] 挂到某个 agent 根实体上。
     fn build(&self, app: &mut App) {
-        let root = agent_root(app.world_mut());
-        // 注册顺序契约：ModelPlugin 必须先装，根实体上才有 ModelSettings，
-        // 同一 tick 内设置先于模型调用生效。debug 构建在注册期即报错，
-        // 而不是让 `issue_model_call` 的查询参数每 tick 失败。
-        debug_assert!(
-            app.world().get::<ModelSettings>(root).is_some(),
-            "ModelPlugin must be registered before AgentPlugin"
+        assert!(
+            app.is_plugin_added::<agnes_plugin_session::SessionPlugin>(),
+            "AgentPlugin requires SessionPlugin to be registered first: \
+             its session_ack system must run before the durability gate \
+             within the same tick"
         );
-        // 兜底初始化：装了 agnes-plugin-session 时由它先行挂载恢复的
-        // 历史，这里只在缺失时补默认值。
-        let world = app.world_mut();
-        if !world.contains::<Log>(root) {
-            world.insert(root, Log::default());
-        }
-        if !world.contains::<PendingTurns>(root) {
-            world.insert(root, PendingTurns::default());
-        }
-        if !world.contains::<PendingUserMessages>(root) {
-            world.insert(root, PendingUserMessages::default());
-        }
+        assert!(
+            app.is_plugin_added::<ModelPlugin>(),
+            "AgentPlugin requires ModelPlugin to be registered first: \
+             apply_settings must run before the model call within the same tick"
+        );
+        assert!(
+            app.is_plugin_added::<ToolsPlugin>(),
+            "AgentPlugin requires ToolsPlugin to be registered first: \
+             the tool registry is filled there"
+        );
+        assert!(
+            app.world().entity_with::<Log>().is_some(),
+            "AgentPlugin requires the host to attach the session state \
+             (agnes_plugin_session::session_state) to the agent root \
+             before registering"
+        );
+        assert!(
+            app.world().entity_with::<ModelSettings>().is_some(),
+            "AgentPlugin requires ModelSettings on the agent root \
+             (ModelSettings::new) before registering"
+        );
         app.init_resource::<ToolRegistry>()
             .init_resource::<LlmCallSeq>()
             .add_systems(Update, systems::require_provider)

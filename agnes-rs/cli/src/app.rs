@@ -1,22 +1,24 @@
 //! 装配与运行：把各组件的 Plugin 装进一个 ECS App，宿主任务（stdin、
 //! Ctrl-C、审批）只经 `RuntimeSender` 注入消息。
 //!
-//! 每个组件 crate 导出一个 Plugin；本 crate 是唯一知道具体实现的装配点
-//! —— 换 HTTP 栈、换 provider、换持久化 = 换一行 `add_plugin`。
+//! 每个组件 crate 导出 Plugin 与状态构造器；本 crate 是唯一知道具体
+//! 实现的装配点 —— 宿主按需创建 agent 根实体并挂上每会话状态，插件只
+//! 注册系统；换 HTTP 栈、换 provider、换持久化 = 换一行装配代码。
 
 use std::io::{IsTerminal, Read};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agnes_agent::AgentRoot;
 use agnes_agent::StandardRequestBuilder;
-use agnes_agent::activity::ActivityPlugin;
+use agnes_agent::activity::{Activity, ActivityPlugin};
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
-use agnes_agent::model::ModelPlugin;
+use agnes_agent::model::{ModelPlugin, ModelSettings};
 use agnes_agent::permission::{PermissionRules, Rule};
 use agnes_agent::runtime::{
-    ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnFinished, TurnRequested,
-    UserMessage,
+    ActiveTurn, AgentPlugin, PendingTurns, PendingUserMessages, RequestBuilderResource,
+    ToolsPlugin, TurnFinished, TurnOwner, TurnRequested, UserMessage,
 };
 use agnes_agent::tools::builtin_tools;
 use agnes_core::config::{ApiKey, StepBudget, SystemPrompt};
@@ -25,15 +27,15 @@ use agnes_core::header::{Environment, Header};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::AgentConfig;
 use agnes_ecs::{
-    App, CancelToken, Entity, MessageReader, MessageWriter, Query, Res, RuntimeSender, Update, With,
+    App, CancelToken, Entity, MessageReader, MessageWriter, Query, Res, RuntimeSender, Update,
 };
 use agnes_io::tool::ToolRegistry;
 use agnes_plugin_async::TokioPlugin;
 use agnes_plugin_http::HttpPlugin;
 use agnes_plugin_openai::OpenAiPlugin;
-use agnes_plugin_session::SessionPlugin;
-use agnes_plugin_session_file::SessionFilePlugin;
-use agnes_record::AgentRoot;
+use agnes_plugin_session::{SessionPlugin, session_state};
+use agnes_plugin_session_file::FileStore;
+use agnes_record::{Event, Log, SessionStoreResource};
 use agnes_session_file::{Opened, SessionFile};
 use agnes_transport_reqwest::ReqwestTransport;
 use anyhow::{Context, Result, bail};
@@ -62,22 +64,23 @@ struct HostConfig {
 /// 把用户输入路由进管线：目标 agent 没有活跃 turn 时开新 turn，否则交给
 /// 注入管线。
 ///
-/// `turns` 只匹配带 [`ActiveTurn`] 标记的 turn 实体，不会把世界里的其他
-/// 实体误当成活跃 turn。本轮宿主只装配一个 agent；多会话入口留待后续。
+/// 目标 agent 是宿主装配时绑定的根实体句柄，而不是"世界里的第一个"；
+/// `turns` 只匹配带 [`ActiveTurn`] 标记、且归属该 agent 的 turn 实体。
 fn dispatch_lines(
     mut lines: MessageReader<TaskLine>,
-    turns: Query<&ActiveTurn>,
-    roots: Query<Entity, With<AgentRoot>>,
+    turns: Query<(&ActiveTurn, &TurnOwner)>,
+    input: Res<Arc<UserInput>>,
     registry: Res<ToolRegistry>,
     config: Res<HostConfig>,
     mut turn_requests: MessageWriter<TurnRequested>,
     mut injections: MessageWriter<UserMessage>,
 ) {
-    let Some(agent) = roots.iter().next() else {
+    let Some(agent) = input.agent() else {
         return;
     };
+    let busy = turns.iter().any(|(_, owner)| owner.0 == agent);
     for line in lines.read() {
-        if turns.is_empty() {
+        if !busy {
             turn_requests.write(TurnRequested {
                 agent,
                 config: AgentConfig {
@@ -96,33 +99,32 @@ fn dispatch_lines(
 }
 
 /// turn 在飞时维护输入侧的 running 旗标，Ctrl-C 与 stdin 路由都看它。
+/// 只跟踪绑定 agent 的 turn，别的 agent 收场不清这份旗标。
 fn track_running(
     mut requests: MessageReader<TurnRequested>,
     mut finished: MessageReader<TurnFinished>,
     input: Res<Arc<UserInput>>,
 ) {
-    if !requests.read().is_empty() {
+    let Some(agent) = input.agent() else {
+        return;
+    };
+    if requests.read().iter().any(|request| request.agent == agent) {
         input.set_running(true);
     }
-    if !finished.read().is_empty() {
+    if finished.read().iter().any(|message| message.agent == agent) {
         input.set_running(false);
     }
 }
 
-/// 会话侧装配：状态插件（带系统）+ 可选的持久化插件（不带系统）。
+/// 会话侧装配：恢复的历史事件 + 可选的持久化文件。
 struct SessionAssembly {
-    state: SessionPlugin,
-    file: Option<SessionFilePlugin>,
+    events: Vec<Event>,
+    file: Option<SessionFile>,
 }
 
 impl SessionAssembly {
-    fn new(state: SessionPlugin, file: Option<SessionFilePlugin>) -> Self {
-        Self { state, file }
-    }
-
-    /// 是否有持久化后端（决定 `/new` 的反馈文案）。
-    fn has_store(&self) -> bool {
-        self.file.is_some()
+    fn new(events: Vec<Event>, file: Option<SessionFile>) -> Self {
+        Self { events, file }
     }
 }
 
@@ -136,11 +138,14 @@ struct HostAssembly {
     single_shot: bool,
 }
 
-/// 把各组件的 Plugin 装配成一个 App。
+/// 把各组件的 Plugin 装配成一个 App，返回装配好的根实体句柄。
 ///
-/// 注册顺序即每 tick 的系统执行顺序；会话系统必须在渲染/agent 系统之前，
-/// 让落盘确认在同一 tick 内先于耐久门禁与收场报告更新。
-fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<App> {
+/// 宿主先创建 agent 根实体并挂上每会话状态（组件构造器来自各属主
+/// crate），再注册插件；插件不再 spawn 实体、不挂组件。插件间强依赖
+/// 由各自 build 内的断言强制；注册顺序仍即每 tick 的系统执行顺序 ——
+/// 会话系统必须先于渲染/agent 系统注册，让落盘确认在同一 tick 内先于
+/// 耐久门禁与收场报告更新。
+fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<(App, Entity)> {
     let HostAssembly {
         renderer,
         input,
@@ -149,8 +154,29 @@ fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<App> {
         session,
         single_shot,
     } = host;
+    let SessionAssembly { events, file } = session;
+    let has_session = file.is_some();
     let transport = Arc::new(ReqwestTransport::new(REQUEST_TIMEOUT)?);
     let root = std::env::current_dir().context("cannot determine the working directory")?;
+
+    // 根实体与每会话状态：宿主按需创建，一次 spawn 挂齐。
+    let (log, pump, durability) = session_state(&events).context("loading the session")?;
+    let agent = app.world_mut().spawn_bundle((
+        AgentRoot,
+        log,
+        pump,
+        durability,
+        ModelSettings::new(cli.model.clone(), cli.think),
+        Activity::default(),
+        PendingTurns::default(),
+        PendingUserMessages::default(),
+    ));
+    if let Some(file) = file {
+        app.world_mut().insert(
+            agent,
+            SessionStoreResource::new(Arc::new(FileStore::new(file))),
+        );
+    }
 
     app.add_plugin(HttpPlugin::new(transport))
         .add_plugin(OpenAiPlugin::new(
@@ -159,7 +185,7 @@ fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<App> {
         ))
         .add_plugin(ToolsPlugin::empty().with_tools(builtin_tools(root, cli.allow_shell)))
         .add_plugin(ActivityPlugin)
-        .add_plugin(ModelPlugin::new(cli.model.clone(), cli.think))
+        .add_plugin(ModelPlugin)
         .insert_resource(rules)
         .insert_resource(HostConfig {
             budget: cli.max_steps,
@@ -174,24 +200,18 @@ fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<App> {
     if let Some(approvals) = approvals {
         app.insert_resource(approvals);
     }
-    // 会话注册：状态插件带系统，必须排在渲染/agent 之前，让 session_ack
-    // 的落盘确认在同一 tick 内先于耐久门禁与收场报告生效。文件插件不带
-    // 系统，顺序无关。
-    let has_session = session.has_store();
-    if let Some(file) = session.file {
-        app.add_plugin(file);
-    }
-    app.add_plugin(session.state);
+    app.add_plugin(SessionPlugin);
     let sender = app.runtime_sender();
     app.add_plugin(RendererPlugin::new(
         renderer,
         sender,
+        agent,
         single_shot,
         has_session,
     ));
     app.add_plugin(AgentPlugin);
     app.add_plugin(TokioPlugin);
-    Ok(app)
+    Ok((app, agent))
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -236,21 +256,22 @@ pub async fn run(cli: Cli) -> Result<()> {
         ..Status::default()
     });
 
-    // 会话打开需要 await：在进 App 之前完成，恢复历史交给状态插件。
-    let mut session_plugin = SessionPlugin::new();
+    // 会话打开需要 await：在进 App 之前完成；恢复出的历史与文件句柄
+    // 交给装配（宿主自己挂状态与存储）。
+    let mut events = Vec::new();
     let mut session_file = None;
     if let Some(path) = &cli.session {
         let Opened {
             session,
-            events,
+            events: restored,
             notes,
             repairs,
         } = SessionFile::open_or_create(path.clone())
             .await
             .with_context(|| format!("opening session `{}`", path.display()))?;
         print_session_loaded(path, notes.len(), repairs.len(), false, &renderer);
-        session_plugin = SessionPlugin::resumed(events).context("loading the session")?;
-        session_file = Some(SessionFilePlugin::new(session));
+        events = restored;
+        session_file = Some(session);
     }
 
     let (approvals, questions) = match wires_ask {
@@ -261,7 +282,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         false => (None, None),
     };
 
-    let mut app = build_app(
+    let (app, agent) = build_app(
         app,
         &cli,
         HostAssembly {
@@ -269,20 +290,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             input: Arc::clone(&input),
             rules,
             approvals,
-            session: SessionAssembly::new(session_plugin, session_file),
+            session: SessionAssembly::new(events, session_file),
             single_shot,
         },
     )?;
-    // 宿主任务（/model、Ctrl-C）的目标 agent：装配即已存在的唯一根实体。
-    input.set_agent(agnes_agent::agent_root(app.world_mut()));
+    // 宿主任务（/model、Ctrl-C）的目标 agent：装配时创建并保管句柄。
+    input.set_agent(agent);
 
     // TUI 的备用屏幕没有终端回滚；把恢复出的会话历史铺进消息区，供滚动查看。
-    if tui {
-        let agent = agnes_agent::agent_root(app.world_mut());
-        if let Some(log) = app.world().get::<agnes_record::Log>(agent) {
-            for line in crate::render::history_lines(&log) {
-                renderer.line(line);
-            }
+    if tui && let Some(log) = app.world().get::<Log>(agent) {
+        for line in crate::render::history_lines(&log) {
+            renderer.line(line);
         }
     }
 

@@ -10,6 +10,7 @@ dependencies = [
  "agnes-ecs",
  "agnes-io",
  "agnes-plugin-async",
+ "agnes-plugin-session",
  "agnes-record",
  "agnes-util",
  "anyhow",
@@ -168,7 +169,6 @@ name = "agnes-plugin-session-file"
 version = "0.1.0"
 dependencies = [
  "agnes-core",
- "agnes-ecs",
  "agnes-record",
  "agnes-session-file",
  "async-trait",

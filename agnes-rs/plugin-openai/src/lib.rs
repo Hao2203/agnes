@@ -16,11 +16,10 @@
 //! keeps global keyed maps.
 //!
 //! Plugins apply immediately in registration order: add
-//! `agnes_plugin_http::HttpPlugin` **before** this plugin. The bridge submits
-//! through the installed [`HttpClient`] and panics without it — a missing
-//! HTTP capability fails loudly instead of letting requests vanish. To use a
-//! different provider, write a sibling plugin that speaks the same
-//! `LlmCall` / `LlmReply` vocabulary and installs [`LlmProvider`].
+//! `agnes_plugin_http::HttpPlugin` **before** this plugin — the dependency is
+//! asserted at build time. To use a different provider, write a sibling plugin
+//! that speaks the same `LlmCall` / `LlmReply` vocabulary and installs
+//! [`LlmProvider`].
 
 use agnes_core::config::{ApiKey, BaseUrl};
 use agnes_ecs::{
@@ -93,12 +92,13 @@ impl Plugin for OpenAiPlugin {
 
     /// # Panics
     ///
-    /// Panics when the HTTP capability is missing. Add
-    /// `agnes_plugin_http::HttpPlugin` before this plugin.
+    /// Panics when `agnes_plugin_http::HttpPlugin` has not been registered
+    /// before this plugin.
     fn build(&self, app: &mut App) {
-        app.world()
-            .resource::<HttpClient>()
-            .expect("http capability is installed; add `HttpPlugin` first");
+        assert!(
+            app.is_plugin_added::<agnes_plugin_http::HttpPlugin>(),
+            "OpenAiPlugin requires HttpPlugin to be registered first"
+        );
         let codec = OpenAiCodec::new(self.base_url.clone(), self.api_key.clone());
 
         app.insert_resource(codec)
@@ -577,14 +577,12 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_http_capability_fails_the_build() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut app = App::new();
-            app.add_plugin(OpenAiPlugin::new(
-                BaseUrl::from_str("https://api.example.com/v1").expect("static url is valid"),
-                ApiKey::from_str("sk-test").expect("static key is valid"),
-            ));
-        }));
-        assert!(result.is_err());
+    #[should_panic(expected = "OpenAiPlugin requires HttpPlugin to be registered first")]
+    fn a_missing_http_plugin_fails_the_build() {
+        let mut app = App::new();
+        app.add_plugin(OpenAiPlugin::new(
+            BaseUrl::from_str("https://api.example.com/v1").expect("static url is valid"),
+            ApiKey::from_str("sk-test").expect("static key is valid"),
+        ));
     }
 }

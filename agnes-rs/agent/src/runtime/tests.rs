@@ -21,23 +21,31 @@ use agnes_io::http::TransportError;
 use agnes_io::llm::{LlmCall, LlmCancel, LlmError, LlmProvider, LlmReply};
 use agnes_io::tool::Tool;
 use agnes_plugin_async::TokioPlugin;
-use agnes_record::RunEvent;
+use agnes_plugin_session::{SessionPlugin, session_state};
+use agnes_record::{
+    Durability, Event, HostEvent, RunEvent, RunEventKind, SessionError, SessionStore,
+    SessionStoreResource,
+};
 use agnes_util::NonEmpty;
 use async_trait::async_trait;
+use jiff::Timestamp;
 
 use super::messages::{ApprovalDecided, InterruptTurn, TurnFinished, TurnRequested};
-use super::{ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin};
+use super::{
+    ActiveTurn, AgentPlugin, PendingTurns, PendingUserMessages, RequestBuilderResource, ToolsPlugin,
+};
+use crate::AgentRoot;
 use crate::StandardRequestBuilder;
 use crate::approval::ApprovalChannel;
-use crate::model::{ModelPlugin, SetModel, SetThinking};
+use crate::model::{ModelPlugin, ModelSettings, SetModel, SetThinking};
 use crate::permission::{PermissionRules, Rule};
 
 const MODEL: &str = "test-model";
 
-/// The agent root the plugins attached the session state to.
+/// The host-spawned agent root.
 fn agent(app: &App) -> Entity {
     app.world()
-        .entity_with::<agnes_record::AgentRoot>()
+        .entity_with::<crate::AgentRoot>()
         .expect("agent root exists")
 }
 
@@ -240,24 +248,45 @@ fn config(goal: &str) -> AgentConfig {
     }
 }
 
-fn app(provider: ProviderState) -> App {
-    let mut app = App::new();
-    app.add_plugin(ModelPlugin::new(
-        ModelName::from_str(MODEL).expect("static name is valid"),
-        Thinking::Off,
+/// 宿主装配：spawn 一个带完整会话状态的 agent 根实体。
+fn spawn_agent(app: &mut App) -> Entity {
+    let (log, pump, durability) = session_state(&[]).expect("session state");
+    app.world_mut().spawn_bundle((
+        AgentRoot,
+        log,
+        pump,
+        durability,
+        ModelSettings::new(
+            ModelName::from_str(MODEL).expect("static name is valid"),
+            Thinking::Off,
+        ),
+        PendingTurns::default(),
+        PendingUserMessages::default(),
     ))
-    .add_plugin(AgentPlugin)
-    .insert_resource(provider)
-    .insert_resource(LlmProvider)
-    .insert_resource(RequestBuilderResource::new(Box::new(
-        StandardRequestBuilder,
-    )))
-    .insert_resource(Capture::default())
-    .add_systems(Update, capture_finished)
-    .add_systems(Update, capture_run_events)
-    .add_systems(Update, answer_calls)
-    .add_systems(Update, count_cancels)
-    .add_plugin(TokioPlugin);
+}
+
+fn app(provider: ProviderState) -> App {
+    app_with(provider, ToolsPlugin::empty())
+}
+
+fn app_with(provider: ProviderState, tools: ToolsPlugin) -> App {
+    let mut app = App::new();
+    spawn_agent(&mut app);
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ModelPlugin)
+        .add_plugin(tools)
+        .add_plugin(AgentPlugin)
+        .insert_resource(provider)
+        .insert_resource(LlmProvider)
+        .insert_resource(RequestBuilderResource::new(Box::new(
+            StandardRequestBuilder,
+        )))
+        .insert_resource(Capture::default())
+        .add_systems(Update, capture_finished)
+        .add_systems(Update, capture_run_events)
+        .add_systems(Update, answer_calls)
+        .add_systems(Update, count_cancels)
+        .add_plugin(TokioPlugin);
     app
 }
 
@@ -303,12 +332,12 @@ async fn a_turn_completes_with_a_final_answer() {
 
     assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
     assert!(matches!(
-        capture.run_events.first(),
-        Some(RunEvent::Started { .. })
+        capture.run_events.first().map(|event| &event.kind),
+        Some(RunEventKind::Started { .. })
     ));
     assert!(matches!(
-        capture.run_events.last(),
-        Some(RunEvent::Finished {
+        capture.run_events.last().map(|event| &event.kind),
+        Some(RunEventKind::Finished {
             outcome: Outcome::Answered,
             ..
         })
@@ -436,23 +465,9 @@ async fn each_agent_runs_its_own_turn_concurrently() {
     app.insert_resource(ActiveCount::default());
     app.add_systems(Update, track_active_count);
 
-    // 第二个 agent 根实体：按 AgentPlugin 的兜底流程挂上每会话状态。
+    // 第二个 agent 根实体：宿主按同样的流程 spawn 并挂上每会话状态。
     let first = agent(&app);
-    let second = {
-        let root = app.world_mut().spawn(agnes_record::AgentRoot);
-        let world = app.world_mut();
-        world.insert(root, agnes_record::Log::default());
-        world.insert(root, super::PendingTurns::default());
-        world.insert(root, super::PendingUserMessages::default());
-        world.insert(
-            root,
-            crate::model::ModelSettings::new(
-                ModelName::from_str(MODEL).expect("static name is valid"),
-                Thinking::Off,
-            ),
-        );
-        root
-    };
+    let second = spawn_agent(&mut app);
 
     let sender = app.runtime_sender();
     for agent in [first, second] {
@@ -478,8 +493,10 @@ async fn each_agent_runs_its_own_turn_concurrently() {
 
 #[tokio::test]
 async fn a_tool_round_runs_the_tool_and_completes() {
-    let mut app = app(ProviderState::with_replies(vec![Ok(tool_response())]));
-    app.add_plugin(ToolsPlugin::new(Arc::new(EchoTool::new())));
+    let app = app_with(
+        ProviderState::with_replies(vec![Ok(tool_response())]),
+        ToolsPlugin::new(Arc::new(EchoTool::new())),
+    );
     let agent = agent(&app);
     let capture = drive(app, |sender| {
         sender
@@ -497,11 +514,11 @@ async fn a_tool_round_runs_the_tool_and_completes() {
         .iter()
         .filter(|event| {
             matches!(
-                event,
-                RunEvent::Recorded {
+                &event.kind,
+                RunEventKind::Recorded {
                     event: agnes_record::Event::ToolExecutionStart { .. },
                     ..
-                } | RunEvent::Recorded {
+                } | RunEventKind::Recorded {
                     event: agnes_record::Event::ToolExecutionEnd { .. },
                     ..
                 }
@@ -513,8 +530,10 @@ async fn a_tool_round_runs_the_tool_and_completes() {
 
 #[tokio::test]
 async fn a_denied_tool_settles_with_a_synthetic_failure() {
-    let mut app = app(ProviderState::with_replies(vec![Ok(tool_response())]));
-    app.add_plugin(ToolsPlugin::new(Arc::new(EchoTool::new())));
+    let mut app = app_with(
+        ProviderState::with_replies(vec![Ok(tool_response())]),
+        ToolsPlugin::new(Arc::new(EchoTool::new())),
+    );
     app.insert_resource(PermissionRules {
         deny: vec![Rule::Prefix("echo".into())],
         ask: vec![],
@@ -535,14 +554,16 @@ async fn a_denied_tool_settles_with_a_synthetic_failure() {
         capture
             .run_events
             .iter()
-            .any(|event| matches!(event, RunEvent::ToolGated { .. }))
+            .any(|event| matches!(&event.kind, RunEventKind::ToolGated { .. }))
     );
 }
 
 #[tokio::test]
 async fn an_asked_tool_runs_after_the_host_answers() {
-    let mut app = app(ProviderState::with_replies(vec![Ok(tool_response())]));
-    app.add_plugin(ToolsPlugin::new(Arc::new(EchoTool::new())));
+    let mut app = app_with(
+        ProviderState::with_replies(vec![Ok(tool_response())]),
+        ToolsPlugin::new(Arc::new(EchoTool::new())),
+    );
     app.insert_resource(PermissionRules {
         deny: vec![],
         ask: vec![Rule::Name(
@@ -568,7 +589,7 @@ async fn an_asked_tool_runs_after_the_host_answers() {
             && capture(&app)
                 .run_events
                 .iter()
-                .any(|event| matches!(event, RunEvent::ApprovalRequested { .. }))
+                .any(|event| matches!(&event.kind, RunEventKind::ApprovalRequested { .. }))
         {
             sender
                 .send_message(ApprovalDecided {
@@ -583,8 +604,8 @@ async fn an_asked_tool_runs_after_the_host_answers() {
             assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
             assert!(approved);
             assert!(capture.run_events.iter().any(|event| matches!(
-                event,
-                RunEvent::ApprovalResolved {
+                &event.kind,
+                RunEventKind::ApprovalResolved {
                     outcome: agnes_record::ApprovalOutcome::AllowedOnce,
                     ..
                 }
@@ -598,8 +619,10 @@ async fn an_asked_tool_runs_after_the_host_answers() {
 
 #[tokio::test]
 async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
-    let mut app = app(ProviderState::with_replies(vec![Ok(tool_response())]));
-    app.add_plugin(ToolsPlugin::new(Arc::new(SlowTool::new())));
+    let mut app = app_with(
+        ProviderState::with_replies(vec![Ok(tool_response())]),
+        ToolsPlugin::new(Arc::new(SlowTool::new())),
+    );
 
     let agent = agent(&app);
     let sender = app.runtime_sender();
@@ -614,8 +637,8 @@ async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
         app.pump().expect("schedule runs");
         let tool_started = capture(&app).run_events.iter().any(|event| {
             matches!(
-                event,
-                RunEvent::Recorded {
+                &event.kind,
+                RunEventKind::Recorded {
                     event: agnes_record::Event::ToolExecutionStart { .. },
                     ..
                 }
@@ -630,8 +653,8 @@ async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
             let capture = capture(&app);
             assert_eq!(capture.finished, vec![Ok(Outcome::Interrupted)]);
             assert!(capture.run_events.iter().any(|event| matches!(
-                event,
-                RunEvent::Recorded {
+                &event.kind,
+                RunEventKind::Recorded {
                     event: agnes_record::Event::StepEnd {
                         step: _,
                         outcome: agnes_record::StepOutcome::Interrupted,
@@ -708,7 +731,7 @@ async fn a_failing_model_fails_the_turn_and_the_app_survives() {
                 capture
                     .run_events
                     .iter()
-                    .any(|event| matches!(event, RunEvent::Failed { .. }))
+                    .any(|event| matches!(&event.kind, RunEventKind::Failed { .. }))
             );
             return;
         }
@@ -762,13 +785,40 @@ async fn a_session_failure_fails_the_turn_and_the_app_survives() {
     panic!("the first turn did not finish");
 }
 
+/// 永不确认 flush 的存储：落盘前耐久门禁永远等不到 ack。
+struct StuckStore;
+
+#[async_trait]
+impl SessionStore for StuckStore {
+    async fn append(&self, _at: Timestamp, _event: &Event) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    async fn append_host(&self, _at: Timestamp, _event: &HostEvent) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), SessionError> {
+        std::future::pending().await
+    }
+
+    async fn rotate(&self) -> Result<std::path::PathBuf, SessionError> {
+        Ok(std::path::PathBuf::from("never"))
+    }
+}
+
 #[tokio::test]
 async fn the_durability_gate_holds_the_request_back() {
     let mut app = app(ProviderState::default());
     let agent = agent(&app);
+    // 存储在但 flush 永不返回：sent_seq 随日志前进，flushed_seq 停在原地。
+    let stuck: Arc<dyn SessionStore> = Arc::new(StuckStore);
+    app.world_mut()
+        .insert(agent, SessionStoreResource::new(stuck));
+    // 预置一笔未确认的账：门禁从第一个 tick 起就是关的。
     app.world_mut().insert(
         agent,
-        agnes_record::Durability {
+        Durability {
             sent_seq: 5,
             flushed_seq: 0,
             failed: None,
@@ -789,4 +839,57 @@ async fn the_durability_gate_holds_the_request_back() {
     // 没有落盘确认前，模型调用不发生，turn 永远停在待调用阶段。
     assert!(capture(&app).finished.is_empty());
     assert_eq!(provider_calls(&app), 0, "no call is issued");
+}
+
+#[test]
+#[should_panic(expected = "AgentPlugin requires SessionPlugin")]
+fn agent_plugin_requires_session_plugin_first() {
+    let mut app = App::new();
+    spawn_agent(&mut app);
+    app.add_plugin(ModelPlugin)
+        .add_plugin(ToolsPlugin::empty())
+        .add_plugin(AgentPlugin);
+}
+
+#[test]
+#[should_panic(expected = "AgentPlugin requires ModelPlugin")]
+fn agent_plugin_requires_model_plugin_first() {
+    let mut app = App::new();
+    spawn_agent(&mut app);
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ToolsPlugin::empty())
+        .add_plugin(AgentPlugin);
+}
+
+#[test]
+#[should_panic(expected = "AgentPlugin requires ToolsPlugin")]
+fn agent_plugin_requires_tools_plugin_first() {
+    let mut app = App::new();
+    spawn_agent(&mut app);
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ModelPlugin)
+        .add_plugin(AgentPlugin);
+}
+
+#[test]
+#[should_panic(expected = "attach the session state")]
+fn agent_plugin_requires_the_host_to_attach_the_session_state() {
+    let mut app = App::new();
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ModelPlugin)
+        .add_plugin(ToolsPlugin::empty())
+        .add_plugin(AgentPlugin);
+}
+
+#[test]
+#[should_panic(expected = "requires ModelSettings")]
+fn agent_plugin_requires_model_settings_on_the_root() {
+    let mut app = App::new();
+    let (log, pump, durability) = session_state(&[]).expect("session state");
+    app.world_mut()
+        .spawn_bundle((AgentRoot, log, pump, durability));
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ModelPlugin)
+        .add_plugin(ToolsPlugin::empty())
+        .add_plugin(AgentPlugin);
 }

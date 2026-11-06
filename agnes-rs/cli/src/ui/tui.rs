@@ -98,7 +98,9 @@ pub(crate) fn run(
                 pending_reset = false;
                 let _ = host
                     .sender
-                    .send_message(agnes_plugin_session::RotateSession);
+                    .send_message(agnes_plugin_session::RotateSession {
+                        agent: host.input.agent().expect("the host bound the agent"),
+                    });
             }
         }
 
@@ -780,7 +782,9 @@ impl TuiState {
                 } else {
                     let _ = host
                         .sender
-                        .send_message(agnes_plugin_session::RotateSession);
+                        .send_message(agnes_plugin_session::RotateSession {
+                            agent: host.input.agent().expect("the host bound the agent"),
+                        });
                 }
             }
             Some(InputLine::Task(content)) => {

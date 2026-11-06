@@ -3,12 +3,11 @@
 //! [`ModelSettings`] 是唯一真相，以组件形式挂在 agent 根实体上，只有
 //! [`ModelPlugin`] 的 `apply_settings` 系统会写它；其余系统与界面都只读。
 //! 切换在下一份请求生效：模型名随 `LlmCall` 一起离开，因此 in-flight
-//! 调用不会被改到。多个 agent 各自持有自己的设置。
+//! 调用不会被改到。多个 agent 各自持有自己的设置。组件由宿主在根实体
+//! 上挂载（[`ModelSettings::new`]）；插件只注册投影系统。
 
 use agnes_core::config::{ModelName, Thinking};
 use agnes_ecs::{App, Entity, MessageReader, MessageWriter, Plugin, Query, Update};
-
-use crate::runtime::agent_root;
 
 agnes_ecs::component!(ModelSettings);
 
@@ -55,21 +54,12 @@ pub struct ModelSettingsChanged {
     pub agent: Entity,
 }
 
-/// 安装 [`ModelSettings`] 并把宿主意图投影进去。
+/// 注册设置投影系统：读宿主意图，写 [`ModelSettings`]。
 ///
-/// 必须在 `AgentPlugin` 之前注册：同一个 tick 内设置先于模型调用生效。
-pub struct ModelPlugin {
-    initial: ModelSettings,
-}
-
-impl ModelPlugin {
-    /// Creates the plugin with the startup settings.
-    pub fn new(model: ModelName, thinking: Thinking) -> Self {
-        Self {
-            initial: ModelSettings::new(model, thinking),
-        }
-    }
-}
+/// 必须先于 `AgentPlugin` 注册（由它断言）：同一个 tick 内设置先于模型
+/// 调用生效。设置组件由宿主挂载，本插件不创建。
+#[derive(Default)]
+pub struct ModelPlugin;
 
 impl Plugin for ModelPlugin {
     fn name(&self) -> &'static str {
@@ -77,8 +67,6 @@ impl Plugin for ModelPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        let root = agent_root(app.world_mut());
-        app.world_mut().insert(root, self.initial.clone());
         app.add_systems(Update, apply_settings);
     }
 }
@@ -143,7 +131,12 @@ mod tests {
 
     fn app() -> App {
         let mut app = App::new();
-        app.add_plugin(ModelPlugin::new(model("a"), Thinking::Off))
+        // 宿主装配：根实体与设置组件先建，插件只注册系统。
+        app.world_mut().spawn_bundle((
+            crate::AgentRoot,
+            ModelSettings::new(model("a"), Thinking::Off),
+        ));
+        app.add_plugin(ModelPlugin)
             .insert_resource(Captured::default())
             .add_systems(Update, capture);
         app
@@ -151,7 +144,7 @@ mod tests {
 
     fn agent(app: &App) -> Entity {
         app.world()
-            .entity_with::<agnes_record::AgentRoot>()
+            .entity_with::<crate::AgentRoot>()
             .expect("agent root exists")
     }
 
@@ -207,13 +200,5 @@ mod tests {
 
         assert_eq!(captured(&app).changes, 0);
         assert_eq!(settings(&app), ("a".to_owned(), Thinking::Off));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "ModelPlugin must be registered before AgentPlugin")]
-    fn agent_plugin_panics_when_registered_without_model_plugin() {
-        let mut app = App::new();
-        app.add_plugin(crate::AgentPlugin);
     }
 }

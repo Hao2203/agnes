@@ -1,79 +1,34 @@
-//! Session persistence as an ECS plugin.
+//! Session file persistence: the [`SessionStore`] adapter for one
+//! [`SessionFile`].
 //!
-//! [`SessionFilePlugin`] mounts one opened [`SessionFile`] as the session's
-//! [`SessionStoreResource`] — the port that the state-side
-//! `agnes-plugin-session` drives, attached as a component to the session's
-//! [`AgentRoot`] entity (absent means memory-only mode). This crate owns
-//! everything file-shaped: the file handle, sibling naming for rotation, and
-//! reopening. The session plugin owns the state: the log, durability,
-//! ordering, and when to flush.
+//! [`FileStore`] is the port implementation the session plugin's writer task
+//! drives; the host wraps it in a [`SessionStoreResource`] and attaches it as
+//! a component to its session's root entity (absent means memory-only
+//! mode). This crate owns everything file-shaped: the file handle, sibling
+//! naming for rotation, and reopening. The session plugin owns the state: the
+//! log, durability, ordering, and when to flush.
 //!
 //! Rotation (`/new`) is a store operation: flush the current file, atomically
 //! claim the next free sibling (`session.jsonl` → `session.1.jsonl`, …), and
 //! open it.
-//!
-//! The plugin registers no systems, so its registration order relative to the
-//! session plugin does not matter — only that it is added before the app runs.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-use agnes_ecs::{App, Plugin};
-use agnes_record::{
-    AgentRoot, Event, HostEvent, SessionError, SessionLog as _, SessionStore, SessionStoreResource,
-};
+use agnes_record::{Event, HostEvent, SessionError, SessionLog as _, SessionStore};
 use agnes_session_file::{Opened, SessionFile};
 use async_trait::async_trait;
 use jiff::Timestamp;
 
-/// Mounts one opened session file as the session store.
-pub struct SessionFilePlugin {
-    file: Mutex<Option<SessionFile>>,
-}
-
-impl SessionFilePlugin {
-    /// Creates the plugin from an opened session file.
-    pub fn new(file: SessionFile) -> Self {
-        Self {
-            file: Mutex::new(Some(file)),
-        }
-    }
-}
-
-impl Plugin for SessionFilePlugin {
-    fn name(&self) -> &'static str {
-        "agnes-session-file"
-    }
-
-    /// # Panics
-    ///
-    /// Panics when built twice; `add_plugin` already rejects a duplicate
-    /// plugin of the same type, so this only guards direct misuse.
-    fn build(&self, app: &mut App) {
-        let file = self
-            .file
-            .lock()
-            .expect("session file mutex is poisoned")
-            .take()
-            .expect("session file plugin built twice");
-        let existing = app.world().entity_with::<AgentRoot>();
-        let root = existing.unwrap_or_else(|| app.world_mut().spawn(AgentRoot));
-        app.world_mut().insert(
-            root,
-            SessionStoreResource::new(Arc::new(FileStore::new(file))),
-        );
-    }
-}
-
 /// One session file behind a lock. The session plugin's writer task calls
 /// sequentially, so the lock never contends; it exists because the port takes
 /// `&self` while the format adapter needs `&mut`.
-struct FileStore {
+pub struct FileStore {
     file: tokio::sync::Mutex<SessionFile>,
 }
 
 impl FileStore {
-    fn new(file: SessionFile) -> Self {
+    /// Wraps an opened session file as a session store.
+    pub fn new(file: SessionFile) -> Self {
         Self {
             file: tokio::sync::Mutex::new(file),
         }
@@ -185,25 +140,5 @@ mod tests {
         let second = std::fs::read_to_string(&next).expect("read second file");
         assert_eq!(first.lines().count(), 2, "meta line plus one record");
         assert_eq!(second.lines().count(), 2, "meta line plus one record");
-    }
-
-    #[tokio::test]
-    async fn the_plugin_installs_the_store_component() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("session.jsonl");
-        let opened = SessionFile::open_or_create(&path)
-            .await
-            .expect("open session");
-
-        let mut app = App::new();
-        app.add_plugin(SessionFilePlugin::new(opened.session));
-
-        let root = app
-            .world()
-            .entity_with::<AgentRoot>()
-            .expect("agent root is created");
-        app.world()
-            .get::<SessionStoreResource>(root)
-            .expect("store component is installed");
     }
 }

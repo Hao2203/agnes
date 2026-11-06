@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::event::{Event, HostEvent};
+use agnes_ecs::Entity;
 use async_trait::async_trait;
 use jiff::Timestamp;
 
@@ -110,14 +111,18 @@ impl Durability {
     }
 }
 
-/// The host asked to rotate the session (`/new`): drop the in-memory
+/// The host asked to rotate one agent's session (`/new`): drop the in-memory
 /// context and, where a session file exists, continue in a fresh one.
 ///
-/// The runtime resets its [`Log`](crate::Log); a persistence plugin clears
-/// its durability baseline and swaps files. Hosts inject this through
-/// `RuntimeSender`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RotateSession;
+/// The runtime resets the target agent's [`Log`](crate::Log); a persistence
+/// store clears its durability baseline and swaps files. Hosts inject this
+/// through `RuntimeSender`. The message addresses exactly one agent — with
+/// several agents in one world only the target session rotates.
+#[derive(Clone, Copy, Debug)]
+pub struct RotateSession {
+    /// 要轮转的 agent 根实体。
+    pub agent: Entity,
+}
 
 #[cfg(test)]
 mod tests {
