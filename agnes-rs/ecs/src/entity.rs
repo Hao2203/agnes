@@ -143,6 +143,29 @@ impl EntityAllocator {
         entities
     }
 
+    /// Returns the next alive entity at or after `cursor`, advancing the
+    /// cursor past every visited slot.
+    ///
+    /// The caller re-borrows the allocator for every call, so the borrow is
+    /// never held across a loop body (which may reserve entities).
+    pub(crate) fn next_alive(&self, cursor: &mut usize) -> Option<Entity> {
+        while let Some(slot) = self.slots.get(*cursor) {
+            let index = *cursor;
+            *cursor += 1;
+            if slot.state != SlotState::Alive {
+                continue;
+            }
+            let index = u32::try_from(index).expect("entity slot index fits in u32");
+            return Some(Entity::new(index, slot.generation));
+        }
+        None
+    }
+
+    /// The number of entity slots, live or not.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub(crate) fn alive_len(&self) -> usize {
         self.slots
             .iter()

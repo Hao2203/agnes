@@ -2,16 +2,34 @@
 //!
 //! 机器（[`agnes_core::agent`]）是唯一真相；本模块的系统只是解释阶段
 //! 提示、做 IO、记事件。每会话状态以组件形式挂在 agent 根实体
-//! （[`AgentRoot`] 标记）上，一个世界可以同时运行多个 agent；根实体与
-//! 状态由宿主创建并保管句柄（`agnes_plugin_session::session_state`，
-//! 加 [`PendingTurns`] / [`PendingUserMessages`] /
-//! [`ModelSettings`](crate::model::ModelSettings)），本 crate 的插件不
-//! spawn 实体、不挂组件。外部装配约定 —— 强依赖在 build 内断言，注册
-//! 顺序即每 tick 系统顺序：
+//! （[`AgentRoot`](crate::AgentRoot) 标记）上，一个世界可以同时运行多个
+//! agent；根实体与状态由宿主创建并保管句柄
+//! （`agnes_plugin_session::session_state`，加 [`PendingTurns`] /
+//! [`PendingUserMessages`] / [`ModelSettings`]），本 crate 的插件不
+//! spawn 实体、不挂组件。
+//!
+//! # 核心状态与能力组件
+//!
+//! 每个 agent 根实体分两层：
+//!
+//! - **核心状态（必须）**：`AgentRoot` + `agnes_record::Log` +
+//!   [`ModelSettings`] + [`PendingTurns`] +
+//!   [`PendingUserMessages`]。缺任一核心组件的 [`TurnRequested`] 不会
+//!   panic：`begin_turn` 立即以 [`TurnFinished`] 的 `Err(TurnFailure)`
+//!   交还宿主（并记一条 `RunEventKind::Failed`）。
+//! - **能力组件（可选，装了就生效）**：`Activity`（观测）、
+//!   `Durability` / `SessionPump` / `SessionStoreResource`（会话持久化）
+//!   等。能力系统按 `Query<..., With<能力组件>>` 或按实体路由，没有该
+//!   组件的 agent 自然跳过。
+//!
+//! 全局资源（`AsyncExecutor`、`ToolRegistry`、`LlmProvider` 等）是世界
+//! 级基础设施，不属于单个 agent 的能力装配。
+//!
+//! 外部装配约定 —— 强依赖在 build 内断言，注册顺序即每 tick 系统顺序：
 //!
 //! - `agnes_plugin_session::SessionPlugin`：**先于本插件**（断言）。其
 //!   `session_ack` 系统必须在同一 tick 内先于耐久门禁运行；
-//! - [`ModelPlugin`](crate::model::ModelPlugin)：**先于本插件**（断言）。
+//! - [`ModelPlugin`]：**先于本插件**（断言）。
 //!   `apply_settings` 在同一 tick 内先于模型调用生效；设置组件由宿主挂；
 //! - [`ToolsPlugin`]：**先于本插件**（断言）。工具表由它填充；
 //! - `agnes_io::llm::LlmProvider`：provider 插件安装（如
@@ -54,7 +72,6 @@ use agnes_core::llm::LlmRequest;
 use agnes_core::turn::Turn;
 use agnes_ecs::{App, Plugin, Update};
 use agnes_io::tool::{Tool, ToolRegistry};
-use agnes_record::Log;
 
 use state::LlmCallSeq;
 
@@ -92,8 +109,8 @@ impl Plugin for AgentPlugin {
     /// # Panics
     ///
     /// 注册期断言强依赖：[`SessionPlugin`](agnes_plugin_session::SessionPlugin)、
-    /// [`ModelPlugin`] 与 [`ToolsPlugin`] 必须先装，且宿主已把会话状态
-    /// （`Log`）与 [`ModelSettings`] 挂到某个 agent 根实体上。
+    /// [`ModelPlugin`] 与 [`ToolsPlugin`] 必须先装。根实体与核心状态由宿主
+    /// 装配，本插件不做全局检查：缺核心状态的 turn 请求以失败收场报告。
     fn build(&self, app: &mut App) {
         assert!(
             app.is_plugin_added::<agnes_plugin_session::SessionPlugin>(),
@@ -110,17 +127,6 @@ impl Plugin for AgentPlugin {
             app.is_plugin_added::<ToolsPlugin>(),
             "AgentPlugin requires ToolsPlugin to be registered first: \
              the tool registry is filled there"
-        );
-        assert!(
-            app.world().entity_with::<Log>().is_some(),
-            "AgentPlugin requires the host to attach the session state \
-             (agnes_plugin_session::session_state) to the agent root \
-             before registering"
-        );
-        assert!(
-            app.world().entity_with::<ModelSettings>().is_some(),
-            "AgentPlugin requires ModelSettings on the agent root \
-             (ModelSettings::new) before registering"
         );
         app.init_resource::<ToolRegistry>()
             .init_resource::<LlmCallSeq>()

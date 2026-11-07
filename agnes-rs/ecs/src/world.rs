@@ -251,6 +251,19 @@ impl World {
         self.entities.borrow().alive_entities()
     }
 
+    /// Advances `cursor` to the next alive entity.
+    ///
+    /// The allocator borrow is released before returning, so the loop body may
+    /// reserve entities through [`Commands`](crate::Commands).
+    pub(crate) fn next_alive(&self, cursor: &mut usize) -> Option<Entity> {
+        self.entities.borrow().next_alive(cursor)
+    }
+
+    /// The number of entity slots, live or not; an upper bound on iteration.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.entities.borrow().slot_count()
+    }
+
     /// Whether any live entity satisfies `predicate`.
     ///
     /// Short-circuits on the first match. The allocator borrow is held only

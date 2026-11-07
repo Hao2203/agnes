@@ -52,12 +52,16 @@ type Recorder<'w> = (Query<'w, &'static mut Log>, MessageWriter<'w, RunEvent>);
 
 /// 一条事件的两步落地：先入所属 agent 的日志，再发 [`RunEvent`]（会话
 /// 落盘与渲染各自消费）。
+///
+/// turn 只在核心状态齐备的 agent 上开局（`begin_turn` 校验），所以这里
+/// 的日志查找失败只可能是宿主在 turn 进行中摘掉了核心组件；记错误并跳过，
+/// 不让单个坏 agent 打崩整个调度。
 fn record(recorder: &mut Recorder, agent: Entity, event: RecordEvent) {
     let at = Timestamp::now();
-    let mut log = recorder
-        .0
-        .get_mut(agent)
-        .expect("the turn's owner has a session log");
+    let Some(mut log) = recorder.0.get_mut(agent) else {
+        log::error!("dropping {event:?}: agent {agent:?} has no session log");
+        return;
+    };
     let event = log.record(event).clone();
     recorder.1.write(RunEvent {
         agent,
@@ -134,62 +138,115 @@ fn new_messages(turn: &Turn, before: usize) -> Vec<Message> {
     turn.messages()[before..].to_vec()
 }
 
+/// 一个 agent 根实体缺核心状态时的失败原因。
+const CORE_STATE_MISSING: &str = "agent root is missing core state: attach AgentRoot, Log, \
+     ModelSettings, PendingTurns, and PendingUserMessages before requesting a turn";
+
+/// 一个无法开跑的 turn 请求：记失败事件并立即交出失败结果。
+fn fail_request(
+    recorder: &mut Recorder,
+    finished: &mut MessageWriter<TurnFinished>,
+    agent: Entity,
+    cause: &str,
+) {
+    let at = Timestamp::now();
+    recorder.1.write(RunEvent {
+        agent,
+        kind: RunEventKind::Failed {
+            at,
+            cause: cause.to_owned(),
+        },
+    });
+    finished.write(TurnFinished {
+        agent,
+        result: Err(TurnFailure {
+            cause: cause.to_owned(),
+        }),
+        started_at: at,
+        finished_at: at,
+    });
+}
+
 /// turn 开局：目标 agent 已有活跃 turn 就进它的队列，否则从它的日志重建
 /// turn、记开局事件并启动。
 ///
 /// 同一 agent 每 tick 只 spawn 一个 turn（spawn 是延迟应用的，本 tick 内
 /// 看不到），其余请求进该 agent 的 [`PendingTurns`]，收场后依次开跑；
-/// 不同 agent 的队列互不阻塞。
+/// 不同 agent 的队列互不阻塞。目标根实体缺核心状态时请求直接以失败收场，
+/// 不影响其他 agent。
 pub fn begin_turn(
     mut commands: Commands,
     mut requests: MessageReader<TurnRequested>,
     turns: Query<(Entity, &TurnOwner), With<ActiveTurn>>,
     mut queues: Query<(Entity, &mut PendingTurns)>,
+    core: Query<(&ModelSettings, &PendingUserMessages), With<AgentRoot>>,
     mut recorder: Recorder,
+    mut finished: MessageWriter<TurnFinished>,
 ) {
-    let mut spawned: Vec<Entity> = Vec::new();
+    // 本 tick 已忙的 agent：活跃 turn 的归属 + 本 tick 刚 spawn 的（Commands
+    // 延迟应用，查询看不到新实体）。查询快照只取一次，避免每个请求都重新
+    // 遍历实体并分配。
+    let mut busy: Vec<Entity> = turns.iter().map(|(_, owner)| owner.0).collect();
     for request in requests.read() {
         let agent = request.agent;
-        let busy = turns.iter().any(|(_, owner)| owner.0 == agent) || spawned.contains(&agent);
-        if busy {
-            queues
-                .get_mut(agent)
-                .expect("TurnRequested targets an agent root")
-                .1
-                .0
-                .push(Arc::clone(&request));
+        let core_ready = recorder.0.get(agent).is_some()
+            && core.get(agent).is_some()
+            && queues.get(agent).is_some();
+        if !core_ready {
+            fail_request(&mut recorder, &mut finished, agent, CORE_STATE_MISSING);
             continue;
         }
-        spawn_turn(&mut commands, &mut recorder, agent, &request.config);
-        spawned.push(agent);
+        if busy.contains(&agent) {
+            if let Some((_, mut pending)) = queues.get_mut(agent) {
+                pending.0.push(Arc::clone(&request));
+            } else {
+                fail_request(&mut recorder, &mut finished, agent, CORE_STATE_MISSING);
+            }
+            continue;
+        }
+        if !spawn_turn(&mut commands, &mut recorder, agent, &request.config) {
+            fail_request(&mut recorder, &mut finished, agent, CORE_STATE_MISSING);
+            continue;
+        }
+        busy.push(agent);
     }
     // 缓冲的请求：该 agent 没有活跃 turn 时开跑一个，下一个等收场后的 tick。
     for (agent, mut pending) in queues.iter_mut() {
-        let busy = turns.iter().any(|(_, owner)| owner.0 == agent) || spawned.contains(&agent);
-        if busy || pending.0.is_empty() {
+        if busy.contains(&agent) || pending.0.is_empty() {
+            continue;
+        }
+        if recorder.0.get(agent).is_none() || core.get(agent).is_none() {
+            // 核心状态在排队期间丢失：把积压请求全部以失败交还，避免饿死。
+            for _ in std::mem::take(&mut pending.0) {
+                fail_request(&mut recorder, &mut finished, agent, CORE_STATE_MISSING);
+            }
             continue;
         }
         let request = pending.0.remove(0);
-        spawn_turn(&mut commands, &mut recorder, agent, &request.config);
-        spawned.push(agent);
+        if !spawn_turn(&mut commands, &mut recorder, agent, &request.config) {
+            fail_request(&mut recorder, &mut finished, agent, CORE_STATE_MISSING);
+            continue;
+        }
+        busy.push(agent);
     }
 }
 
 /// spawn 一个 turn 实体：从所属 agent 的日志重建机器、记开局事件（header、
 /// goal 消息、turn 边界）并启动到待调用阶段。
+///
+/// 返回 `false` 表示目标根实体缺会话日志（核心状态不完整），调用方按失败
+/// 请求处理。
 fn spawn_turn(
     commands: &mut Commands,
     recorder: &mut Recorder,
     agent: Entity,
     config: &AgentConfig,
-) {
-    let messages: Vec<_> = recorder
-        .0
-        .get_mut(agent)
-        .expect("the agent root has a session log")
-        .messages()
-        .cloned()
-        .collect();
+) -> bool {
+    let Some(log) = recorder.0.get_mut(agent) else {
+        return false;
+    };
+    let messages: Vec<_> = log.messages().cloned().collect();
+    drop(log);
     let turn = Turn::with_messages(config.header.clone(), config.budget, messages);
     let started_at = Timestamp::now();
     recorder.1.write(RunEvent {
@@ -211,11 +268,11 @@ fn spawn_turn(
             record(
                 recorder,
                 agent,
-                RecordEvent::Message(Message::User { content: goal }),
+                RecordEvent::Message(Message::User {
+                    content: goal.clone(),
+                }),
             );
-            Staged::AwaitingCall(
-                Agent::with_goal(turn, config.goal.clone().expect("goal just read")).start(),
-            )
+            Staged::AwaitingCall(Agent::with_goal(turn, goal).start())
         }
         None => Staged::AwaitingCall(Agent::new(turn).start()),
     };
@@ -229,6 +286,7 @@ fn spawn_turn(
         TurnOwner(agent),
         ActiveTurn,
     ));
+    true
 }
 
 /// 注入排空：用户消息只在目标 agent 的待调用阶段并入会话，其余场合在该
@@ -241,12 +299,16 @@ pub fn inject_pending(
     mut recorder: Recorder,
 ) {
     for message in messages.read() {
-        queues
-            .get_mut(message.agent)
-            .expect("UserMessage targets an agent root")
-            .1
-            .0
-            .push(message.content.clone());
+        let Some((_, mut queue)) = queues.get_mut(message.agent) else {
+            // 核心状态不完整的 agent 没有待注入队列；消息无法投递，记错误
+            // 后丢弃，不让单个坏 agent 打崩调度。
+            log::error!(
+                "dropping UserMessage for agent {:?}: it has no PendingUserMessages",
+                message.agent
+            );
+            continue;
+        };
+        queue.0.push(message.content.clone());
     }
     for (_, owner, mut phase) in phases.iter_mut() {
         let Some(Staged::AwaitingCall(turn)) = phase.0.as_mut() else {
@@ -349,25 +411,40 @@ pub fn issue_model_call(
         }
         let staged = phase.0.take();
         let next = match staged {
-            Some(Staged::AwaitingCall(turn)) => {
-                let settings = sessions
-                    .get(owner.0)
-                    .expect("the agent root has model settings")
-                    .1;
-                let request = requests.build(turn.turn(), &settings);
-                let model = request.model.clone();
-                let turn = turn.call();
-                let step = turn.step();
-                record(&mut recorder, owner.0, RecordEvent::StepStart { step });
-                record(&mut recorder, owner.0, RecordEvent::MessageStart { step });
-                let id = seq.issue();
-                commands.entity(entity).insert(InFlightCall {
-                    id,
-                    model: model.clone(),
-                });
-                outgoing.write(LlmCall { id, request });
-                Some(Staged::AwaitingModel(turn))
-            }
+            Some(Staged::AwaitingCall(turn)) => match sessions.get(owner.0) {
+                Some((_, settings, _)) => {
+                    let request = requests.build(turn.turn(), &settings);
+                    let model = request.model.clone();
+                    let turn = turn.call();
+                    let step = turn.step();
+                    record(&mut recorder, owner.0, RecordEvent::StepStart { step });
+                    record(&mut recorder, owner.0, RecordEvent::MessageStart { step });
+                    let id = seq.issue();
+                    commands.entity(entity).insert(InFlightCall {
+                        id,
+                        model: model.clone(),
+                    });
+                    outgoing.write(LlmCall { id, request });
+                    Some(Staged::AwaitingModel(turn))
+                }
+                None => {
+                    // 核心状态在 turn 进行中被摘掉（宿主违反装配约定）：
+                    // 让这个 turn 失败收场，不影响其他 agent。
+                    let cause = format!(
+                        "agent {:?} is missing core state (ModelSettings) before the model call",
+                        owner.0
+                    );
+                    recorder.1.write(RunEvent {
+                        agent: owner.0,
+                        kind: RunEventKind::Failed {
+                            at: Timestamp::now(),
+                            cause: cause.clone(),
+                        },
+                    });
+                    commands.entity(entity).insert(TurnFailed { cause });
+                    None
+                }
+            },
             other => other,
         };
         phase.0 = next;
@@ -634,10 +711,14 @@ pub fn execute_tools(
         if !matches!(entry.phase, CallPhase::Allowed) {
             continue;
         }
-        let agent = owners
-            .get(entry.turn)
-            .expect("the tool call's turn has an owner")
-            .0;
+        let agent = match owners.get(entry.turn) {
+            Some(owner) => owner.0,
+            None => {
+                // turn 已收场；它的调用实体由 close_turn 清理，不再派发。
+                entry.phase = CallPhase::Settled;
+                continue;
+            }
+        };
         record(
             &mut recorder,
             agent,

@@ -46,7 +46,7 @@ pub struct TurnClock {
 
 /// turn 实体的归属：它属于哪个 agent 根实体。
 ///
-/// 对齐 [`ToolCallEntry::turn`] 的父回引模式：begin_turn 的每 agent 守卫、
+/// 对齐 `ToolCallEntry::turn` 的父回引模式：begin_turn 的每 agent 守卫、
 /// inject_pending 与 recorder 都靠它把 turn 路由回所属会话。
 pub struct TurnOwner(pub Entity);
 

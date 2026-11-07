@@ -191,8 +191,12 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
 
     /// Iterates all matching entities.
     ///
-    /// The iterator filters lazily: each entity costs one component-storage
-    /// lookup, and no snapshot of matching entities is built up front.
+    /// The iterator allocates nothing: it keeps a cursor into the entity
+    /// allocator and re-borrows the allocator only while advancing, then
+    /// filters lazily with one component-storage lookup per entity.
+    /// Entities reserved through [`Commands`](crate::Commands) from the loop
+    /// body are not alive yet and are skipped; the per-step borrow keeps that
+    /// safe.
     ///
     /// # Panics
     ///
@@ -201,7 +205,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     pub fn iter(&self) -> QueryIter<'w, D, F> {
         QueryIter {
             world: self.world,
-            entities: self.world.alive_entities().into_iter(),
+            cursor: 0,
             marker: PhantomData,
         }
     }
@@ -270,7 +274,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
 /// The iterator returned by [`Query::iter`] and [`Query::iter_mut`].
 pub struct QueryIter<'w, D: QueryData, F: QueryFilter> {
     world: &'w World,
-    entities: std::vec::IntoIter<Entity>,
+    cursor: usize,
     marker: PhantomData<(D, F)>,
 }
 
@@ -278,7 +282,7 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
     type Item = D::Item<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for entity in self.entities.by_ref() {
+        while let Some(entity) = self.world.next_alive(&mut self.cursor) {
             if let Some(item) = filtered_fetch::<D, F>(self.world, entity) {
                 return Some(item);
             }
@@ -287,7 +291,8 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.entities.size_hint()
+        let remaining = self.world.slot_count().saturating_sub(self.cursor);
+        (0, Some(remaining))
     }
 }
 

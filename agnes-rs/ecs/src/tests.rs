@@ -349,6 +349,38 @@ fn commands_spawn_is_invisible_until_applied() {
     assert_eq!(world.get::<Health>(entity).expect("health exists").0, 10);
 }
 
+fn spawn_one_per_entity(
+    mut commands: Commands,
+    query: Query<Entity>,
+    mut probe: ResMut<SpawnProbe>,
+) {
+    let mut seen = 0;
+    for _ in query.iter() {
+        seen += 1;
+        commands.spawn(Health(10));
+    }
+    probe.seen_during_system = seen;
+}
+
+#[test]
+fn commands_can_reserve_entities_while_a_query_is_iterating() {
+    let mut world = World::new();
+    world.insert_resource(SpawnProbe::default());
+    world.spawn(Health(1));
+    world.spawn(Health(2));
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(spawn_one_per_entity)
+        .expect("the system is valid");
+    schedule.run(&mut world).expect("run succeeds");
+
+    let probe = world.resource::<SpawnProbe>().expect("probe exists");
+    assert_eq!(probe.seen_during_system, 2, "reserved entities are skipped");
+    drop(probe);
+    assert_eq!(world.alive_len(), 4, "the deferred spawns were applied");
+}
+
 fn despawn_all(mut commands: Commands, query: Query<Entity>) {
     for entity in query.iter() {
         commands.entity(entity).despawn();

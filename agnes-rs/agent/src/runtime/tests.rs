@@ -30,7 +30,7 @@ use agnes_util::NonEmpty;
 use async_trait::async_trait;
 use jiff::Timestamp;
 
-use super::messages::{ApprovalDecided, InterruptTurn, TurnFinished, TurnRequested};
+use super::messages::{ApprovalDecided, InterruptTurn, TurnFinished, TurnRequested, UserMessage};
 use super::{
     ActiveTurn, AgentPlugin, PendingTurns, PendingUserMessages, RequestBuilderResource, ToolsPlugin,
 };
@@ -267,6 +267,23 @@ fn spawn_agent(app: &mut App) -> Entity {
 
 fn app(provider: ProviderState) -> App {
     app_with(provider, ToolsPlugin::empty())
+}
+
+/// 只装插件、不 spawn agent 根实体：用于装配校验测试。
+fn bare_app() -> App {
+    let mut app = App::new();
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ModelPlugin)
+        .add_plugin(ToolsPlugin::empty())
+        .add_plugin(AgentPlugin)
+        .insert_resource(LlmProvider)
+        .insert_resource(RequestBuilderResource::new(Box::new(
+            StandardRequestBuilder,
+        )))
+        .insert_resource(Capture::default())
+        .add_systems(Update, capture_finished)
+        .add_plugin(TokioPlugin);
+    app
 }
 
 fn app_with(provider: ProviderState, tools: ToolsPlugin) -> App {
@@ -872,24 +889,81 @@ fn agent_plugin_requires_tools_plugin_first() {
 }
 
 #[test]
-#[should_panic(expected = "attach the session state")]
-fn agent_plugin_requires_the_host_to_attach_the_session_state() {
-    let mut app = App::new();
-    app.add_plugin(SessionPlugin)
-        .add_plugin(ModelPlugin)
-        .add_plugin(ToolsPlugin::empty())
-        .add_plugin(AgentPlugin);
+fn agent_plugin_registers_without_an_agent_root() {
+    let _app = bare_app();
 }
 
 #[test]
-#[should_panic(expected = "requires ModelSettings")]
-fn agent_plugin_requires_model_settings_on_the_root() {
-    let mut app = App::new();
+fn a_turn_request_to_a_root_missing_model_settings_finishes_with_an_error() {
+    let mut app = bare_app();
     let (log, pump, durability) = session_state(&[]).expect("session state");
-    app.world_mut()
-        .spawn_bundle((AgentRoot, log, pump, durability));
-    app.add_plugin(SessionPlugin)
-        .add_plugin(ModelPlugin)
-        .add_plugin(ToolsPlugin::empty())
-        .add_plugin(AgentPlugin);
+    let incomplete = app.world_mut().spawn_bundle((
+        AgentRoot,
+        log,
+        pump,
+        durability,
+        PendingTurns::default(),
+        PendingUserMessages::default(),
+    ));
+    app.world_mut().send_message(TurnRequested {
+        agent: incomplete,
+        config: config("hello"),
+    });
+    app.pump().expect("the schedule runs without panicking");
+
+    let capture = capture(&app);
+    assert_eq!(capture.finished.len(), 1);
+    let Err(cause) = &capture.finished[0] else {
+        panic!("the turn must fail: {:?}", capture.finished);
+    };
+    assert!(cause.contains("core state"), "unexpected cause: {cause}");
+}
+
+#[tokio::test]
+async fn an_incomplete_agent_does_not_block_a_complete_one() {
+    let mut app = app(ProviderState::default());
+    let complete = agent(&app);
+    let incomplete = app.world_mut().spawn_bundle((
+        AgentRoot,
+        PendingTurns::default(),
+        PendingUserMessages::default(),
+    ));
+
+    app.world_mut().send_message(TurnRequested {
+        agent: incomplete,
+        config: config("bad"),
+    });
+    app.world_mut().send_message(TurnRequested {
+        agent: complete,
+        config: config("good"),
+    });
+
+    for _ in 0..256 {
+        app.pump().expect("schedule runs");
+        if capture(&app).finished.len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let capture = capture(&app);
+    assert_eq!(capture.finished.len(), 2);
+    assert!(
+        capture.finished[0].is_err(),
+        "the incomplete agent fails its turn"
+    );
+    assert_eq!(capture.finished[1], Ok(Outcome::Answered));
+}
+
+#[test]
+fn a_user_message_to_a_non_agent_entity_is_dropped_without_panicking() {
+    let mut app = app(ProviderState::default());
+    let stray = app.world_mut().spawn_empty();
+    app.world_mut().send_message(UserMessage {
+        agent: stray,
+        content: Content::try_from("hello").expect("static content is valid"),
+    });
+    app.pump().expect("the schedule runs");
+
+    assert!(capture(&app).finished.is_empty());
 }

@@ -7,6 +7,18 @@
 //! 保管句柄，插件与系统只按标记过滤、按消息里的 `agent: Entity` 寻址。
 //! 状态组件的构造器（`agnes_plugin_session::session_state`）与注册归
 //! 各属主 crate；本模块只拥有"这是一个会话"这个身份。
+//!
+//! # 核心状态与能力组件
+//!
+//! 每个根实体分两层：
+//!
+//! - **核心状态（必须）**：`AgentRoot` + `agnes_record::Log` +
+//!   [`ModelSettings`](crate::model::ModelSettings) + `PendingTurns` +
+//!   `PendingUserMessages`。宿主必须在发出 `TurnRequested` 前挂齐；缺任一
+//!   组件时请求以 `TurnFinished` 的失败结果收场，不会 panic。
+//! - **能力组件（可选，装了就生效）**：`Activity`（观测）、
+//!   `Durability` / `SessionPump` / `SessionStoreResource`（会话持久化）
+//!   等。装了就由对应系统按组件过滤消费；没装的 agent 自然跳过。
 
 /// 标记一个 agent 会话的根实体。
 ///

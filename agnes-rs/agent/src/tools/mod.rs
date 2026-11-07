@@ -28,7 +28,7 @@ pub(crate) fn parse_arguments<T: DeserializeOwned>(
 
 /// 文件工具包：以 `root` 为沙箱边界，`shell` 决定是否提供 `run_shell`。
 ///
-/// 交给 [`agnes_agent::runtime::ToolsPlugin`] 逐把注册。
+/// 交给 [`ToolsPlugin`](crate::runtime::ToolsPlugin) 逐把注册。
 pub fn builtin_tools(root: impl Into<PathBuf>, shell: bool) -> Vec<Arc<dyn Tool>> {
     let root = root.into();
     let mut tools: Vec<Arc<dyn Tool>> = vec![
