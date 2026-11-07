@@ -17,35 +17,33 @@ fn header() -> Event {
     ))
 }
 
-/// Spawns a session carrying `session_state(events)` — the host's job.
+/// Spawns a session carrying `session_state(events)` — the host's job. The log
+/// goes into the agent's core state, so this plugin-only fixture drops it.
 fn install(app: &mut App, events: &[Event]) -> Entity {
-    let (log, pump, durability) = session_state(events).expect("session state");
-    app.world_mut().spawn_bundle((log, pump, durability))
+    let SessionState {
+        pump, durability, ..
+    } = session_state(events).expect("session state");
+    app.world_mut().spawn_bundle((pump, durability))
 }
 
-fn root(app: &App) -> Entity {
+fn session_root(app: &App) -> Entity {
     app.world()
         .entity_with::<SessionPump>()
         .expect("session root")
 }
 
-fn log(app: &App) -> Log {
-    app.world()
-        .get::<Log>(root(app))
-        .expect("log component")
-        .clone()
-}
-
 fn durability(app: &App) -> Durability {
     app.world()
-        .get::<Durability>(root(app))
+        .get::<Durability>(session_root(app))
         .expect("durability component")
         .clone()
 }
 
 #[test]
 fn session_state_restores_the_log_and_durability_baseline() {
-    let (log, _pump, durability) = session_state(&[header()]).expect("state");
+    let SessionState {
+        log, durability, ..
+    } = session_state(&[header()]).expect("state");
 
     assert_eq!(log.events().len(), 1);
     assert!(log.header().is_some());
@@ -78,58 +76,43 @@ fn the_plugin_never_creates_a_session() {
 }
 
 #[test]
-fn a_rotation_resets_the_log_without_a_store() {
-    let mut app = App::new();
-    let agent = install(&mut app, &[]);
-    app.add_plugin(SessionPlugin).add_plugin(TokioPlugin);
-    app.world_mut()
-        .get_mut::<Log>(agent)
-        .expect("log component")
-        .record(Event::TurnStart);
-    assert_eq!(log(&app).events().len(), 1);
-
-    app.world_mut().send_message(RotateSession { agent });
-    app.pump().expect("schedule runs");
-
-    assert!(
-        log(&app).events().is_empty(),
-        "the in-memory context is cleared"
-    );
-    assert!(
-        durability(&app).is_durable(),
-        "memory-only sessions are always durable"
-    );
-}
-
-#[test]
-fn a_rotation_only_touches_the_targeted_session() {
+fn a_rotation_resets_only_the_targeted_sessions_durability() {
     let mut app = App::new();
     let first = install(&mut app, &[]);
     let second = install(&mut app, &[]);
     app.add_plugin(SessionPlugin).add_plugin(TokioPlugin);
     for agent in [first, second] {
-        app.world_mut()
-            .get_mut::<Log>(agent)
-            .expect("log component")
-            .record(Event::TurnStart);
+        let mut durability = app
+            .world_mut()
+            .get_mut::<Durability>(agent)
+            .expect("durability component");
+        durability.sent_seq = 3;
+        durability.flushed_seq = 3;
     }
 
     app.world_mut().send_message(RotateSession { agent: first });
     app.pump().expect("schedule runs");
 
-    assert!(
-        log(&app).events().is_empty(),
-        "the targeted session's log is cleared"
-    );
-    let untouched = app
+    let first = app
         .world()
-        .get::<Log>(second)
-        .expect("log component")
+        .get::<Durability>(first)
+        .expect("durability component")
+        .clone();
+    assert_eq!(first.sent_seq, 0);
+    assert_eq!(first.flushed_seq, 0, "the target's baseline is reset");
+    assert!(
+        first.is_durable(),
+        "the rotated memory-only session has nothing to wait for"
+    );
+
+    let second = app
+        .world()
+        .get::<Durability>(second)
+        .expect("durability component")
         .clone();
     assert_eq!(
-        untouched.events().len(),
-        1,
-        "the other session's log is untouched"
+        second.sent_seq, 3,
+        "the other session's ledger is untouched"
     );
 }
 

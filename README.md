@@ -27,7 +27,7 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
   日志单独推导
 - 插件即装配单元：HTTP 传输、模型 provider、会话系统、工具、权限与审批
   都是 ecs `Plugin`，注册顺序即每 tick 的系统执行顺序；插件不建实体、
-  不挂组件 —— 宿主按需 spawn agent 根实体并挂每会话状态，插件间强依赖
+  不挂组件 —— 宿主按需 spawn agent 实体并挂核心状态与输入队列，插件间强依赖
   在注册期断言（漏装/装错顺序当场报错）；拒绝单调（规则无法把拒绝变回
   放行），运行中输入排队，在 step 边界生效
 - 工具调用可走审批流：`allowed-once | rejected | cancelled | unavailable`，
@@ -182,20 +182,21 @@ agnes chat --session ./notes/session.jsonl
 | `agnes-plugin-async` | 异步任务执行：`TokioPlugin` / `ExecutorPlugin` 两个插件各自装 `AsyncExecutor`，任务直接交给具体运行时 |
 | `agnes-plugin-http` | ECS 原生 HTTP 能力：`HttpRequest` / `HttpResponse` / `HttpStreamRequest` / `HttpStreamEvent` / `HttpStreamEnd` / `HttpCancel` 消息、发号器 `HttpClient`、每请求一张在飞实体（标记 + id + 取消令牌）、关停时统一取消 |
 | `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成流式请求，SSE 增量解码并转发 `LlmStreamEvent`，流尾解码回 `LlmReply`；`ListModels` 走缓冲 HTTP 路径回答 `ModelsListed`；装 `LlmProvider` 标记 |
-| `agnes-plugin-session` | 会话系统与状态构造：`session_state(events)` 产出 `(Log, SessionPump, Durability)`（含恢复基线，由宿主挂到 agent 根实体）；`SessionPlugin` 只注册 `RunEvent` 转发、flush 确认与轮转系统；不碰文件 |
-| `agnes-plugin-session-file` | 会话持久化适配器：`FileStore` 把打开的 `SessionFile` 实现成 `SessionStore` 端口，宿主包成 `SessionStoreResource` 组件挂到根实体；拥有文件句柄、兄弟文件名与重开 |
-| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate、工具注册、权限规则与审批通道；注册期断言强依赖（Session/Model/Tools 先装、根状态已挂）。`ModelPlugin`：设置投影系统（`ModelSettings` 组件由宿主挂，唯一写者）。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时、流式思考字符数），只读、不落盘 |
+| `agnes-plugin-session` | 会话系统与状态构造：`session_state(events)` 产出 `SessionState { log, pump, durability }`（log 交给 `AgentCore::new`，pump + durability 挂到 agent 实体）；`SessionPlugin` 只注册 `RunEvent` 转发、flush 确认与耐久基线重置；不碰文件 |
+| `agnes-plugin-session-file` | 会话持久化适配器：`FileStore` 把打开的 `SessionFile` 实现成 `SessionStore` 端口，宿主包成 `SessionStoreResource` 组件挂到 agent 实体；拥有文件句柄、兄弟文件名与重开 |
+| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate、工具注册、权限规则与审批通道；注册期断言强依赖（Session/Model/Tools 先装）。核心状态是宿主挂载的 `AgentCore`（日志 + 模型设置）与 `Inbox`（排队的 turn 请求与待注入用户消息）。`ModelPlugin`：设置投影系统（`ModelSettings` 是 `AgentCore` 的字段，唯一写者）。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时、流式思考字符数），只读、不落盘 |
 | `agnes-cli` | 二进制 `agnes`：装配 `App`、stdin/审批/Ctrl-C 宿主任务、独立线程的 plain/ratatui 渲染与输入 |
 
 `agnes-transport-reqwest`、`agnes-llm-openai` 与 `agnes-session-file` 是纯
 适配器；`plugin-async` / `plugin-http` / `plugin-openai` / `plugin-session` /
 `plugin-session-file` 提供插件与适配器，`record` 持有词汇、`agent`
 持有管线，互不知晓对方。只有 `agnes-cli` 负责装配可运行的程序：宿主
-先 spawn 根实体并挂上每会话状态（`session_state`、`ModelSettings::new`、
-`Activity::default()` 与待处理队列），再注册插件。插件间强依赖由依赖方
+先 spawn agent 实体并挂上核心状态与输入队列（`AgentCore::new(log,
+settings)`、`Inbox::default()`）与能力组件（`Activity::default()`、
+`session_state` 的 pump + durability），再注册插件。插件间强依赖由依赖方
 在 build 内 `assert!(app.is_plugin_added::<…>())` 强制 —— `OpenAiPlugin`
 断言 `HttpPlugin`，`AgentPlugin` 断言 `SessionPlugin` / `ModelPlugin` /
-`ToolsPlugin` 及根状态已挂，`RendererPlugin` 断言 `SessionPlugin`；注册
+`ToolsPlugin`，`RendererPlugin` 断言 `SessionPlugin`；注册
 顺序即行为（SessionPlugin 的 `session_ack` 要在同一 tick 内先于耐久门禁
 与收场报告），断言同时把这条顺序钉死；`TokioPlugin` 是可替换依赖，
 只需在 `run_async` 之前加入（资源在每 tick 解析）。
@@ -221,12 +222,13 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
   一个 `Turn`（系统提示与工具环境、会话消息、用量、step 记账）；core
   不持有日志、不产出事件，`agnes-agent` 的系统管线读取 `Turn` 并铸造、
   记录事件。
-- **每会话状态 = 组件，能力 = 资源**：每个 agent 会话是带 `AgentRoot`
-  标记的根实体（标记归 `agnes-agent`，`RunEvent` 等消息里的
-  `agent: Entity` 以它为地址），`Log`、`Durability`、`ModelSettings`、
-  `Activity`、待处理
-  队列都以组件挂在它上面 —— 由宿主 spawn 并挂载（`session_state` 等
-  构造器来自各属主 crate），插件不建实体、不挂组件；turn 实体经
+- **每会话核心状态 = 单个组件，能力 = 组件/资源**：每个 agent 是挂
+  `AgentCore`（`agnes-agent` 所有，内含 `Log` 与 `ModelSettings`）的实体，
+  `RunEvent` 等消息里的 `agent: Entity` 以它为地址；宿主另挂 `Inbox`
+  （排队的 turn 请求与待注入用户消息）与能力组件（`Activity`、
+  `Durability`、`SessionPump`，以及可选的 `SessionStoreResource`）。
+  核心状态收成一个组件后，部分装配在类型层面不可表示；`Inbox` 独立存放，
+  核心状态丢失时积压请求仍能以失败交还宿主。turn 实体经
   `TurnOwner` 回指归属，begin_turn 的单 turn 守卫按 agent 隔离 ——
   多个 agent 在同一世界里并发互不串扰（CLI 本轮仍只装配一个）。真正的
   全局能力保持资源：`AsyncExecutor`、`HttpTransportResource`、`HttpClient`、
@@ -234,7 +236,7 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
   `LlmProvider`。在飞桥接状态（HTTP 在飞请求、OpenAI 流解码）各自成
   实体，按全局唯一 id 路由。
 - **插件与权限**：每个能力是一个 ecs `Plugin`，注册顺序即每 tick 的系统
-  执行顺序；插件之间只通过上述资源、根实体组件与消息协作，强依赖由
+  执行顺序；插件之间只通过上述资源、agent 组件与消息协作，强依赖由
   依赖方在注册期 `assert!(app.is_plugin_added::<…>())` 钉死。权限规则
   deny > ask > 不表态，拒绝单调（规则无法把拒绝变回放行，批准后还会做
   第二次门禁）；ask 命中而没接审批口时按 fail-closed 拒绝，`--yes`
@@ -281,8 +283,9 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
 - **审计与可追溯**：`MessageEnd` 记录产生该消息的模型（从系统自己构造的
   `LlmRequest.model` 回带），切换模型后日志仍能归因；审批落定、会话失败
   原因不扩 core 词汇，作为 `HostEvent` 与事件一起落盘。
-- **模型与思考设置是 ECS 状态**：`ModelSettings` 组件由宿主挂到根实体
-  （`ModelSettings::new`），`ModelPlugin` 的 `apply_settings` 是唯一写者；
+- **模型与思考设置是核心状态字段**：`ModelSettings` 由宿主经
+  `ModelSettings::new` 放进 `AgentCore`，`ModelPlugin` 的 `apply_settings`
+  是唯一写者；
   宿主（TUI、plain、未来的 GUI）只发 `SetModel` / `SetThinking` 意图消息，
   观察 `ModelSettingsChanged`。`RequestBuilder` 只投影提示词，模型参数来自
   设置，因此切换只影响下一份 `LlmCall`，in-flight 调用不变。`ModelPlugin`

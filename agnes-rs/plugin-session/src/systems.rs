@@ -1,5 +1,5 @@
 //! 会话系统的三件事：转发、确认、轮转。状态全部挂在各 agent 的
-//! 会话根实体上（宿主经 `session_state` 挂载），系统按实体迭代与按
+//! 会话实体上（宿主经 `session_state` 挂载），系统按实体迭代与按
 //! 消息里的 `agent` 字段寻址；多 agent 时每个会话的队列与耐久进度
 //! 天然互相隔离。
 
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use agnes_ecs::{Entity, MessageReader, Query, Res, RuntimeSender};
 use agnes_plugin_async::AsyncExecutor;
 use agnes_record::{
-    Durability, HostEvent, Log, RotateSession, RunEvent, RunEventKind, SessionStore,
+    Durability, HostEvent, RotateSession, RunEvent, RunEventKind, SessionStore,
     SessionStoreResource,
 };
 
@@ -18,7 +18,7 @@ use crate::{CHANNEL_CAPACITY, SessionCommand, SessionPump};
 /// The writer acknowledged everything up to this sequence as durable.
 #[derive(Clone, Debug)]
 pub struct SessionFlushed {
-    /// The agent root whose durability advanced.
+    /// The agent whose durability advanced.
     pub agent: Entity,
     pub seq: u64,
 }
@@ -26,7 +26,7 @@ pub struct SessionFlushed {
 /// The writer gave up: the session is unwritable from now on (fail-closed).
 #[derive(Clone, Debug)]
 pub struct SessionWriteFailed {
-    /// The agent root whose session failed.
+    /// The agent whose session failed.
     pub agent: Entity,
     pub cause: String,
 }
@@ -34,7 +34,7 @@ pub struct SessionWriteFailed {
 /// The store opened the rotated file.
 #[derive(Clone, Debug)]
 pub struct SessionRotated {
-    /// The agent root whose store rotated.
+    /// The agent whose store rotated.
     pub agent: Entity,
     pub path: PathBuf,
 }
@@ -232,16 +232,16 @@ pub fn session_ack(
     }
 }
 
-/// Clears the targeted session's in-memory log and durability baseline when
-/// the host rotates it; a persistence store opens the next storage and
-/// reports it as [`SessionRotated`]. Other agents' sessions are untouched.
-pub fn session_rotate(
-    mut sessions: Query<(&mut Log, &mut Durability)>,
+/// Resets the targeted session's durability baseline when the host rotates it;
+/// a persistence store opens the next storage and reports it as
+/// [`SessionRotated`]. The in-memory log is owned by the agent runtime and is
+/// reset there by `session_rotate_log`. Other agents' sessions are untouched.
+pub fn session_rotate_durability(
+    mut sessions: Query<&mut Durability>,
     mut requests: MessageReader<RotateSession>,
 ) {
     for request in requests.read() {
-        if let Some((mut log, mut durability)) = sessions.get_mut(request.agent) {
-            log.reset();
+        if let Some(mut durability) = sessions.get_mut(request.agent) {
             durability.sent_seq = 0;
             durability.flushed_seq = 0;
         }

@@ -15,22 +15,21 @@
 
 pub mod activity;
 pub mod approval;
+mod core;
 pub mod model;
 pub mod permission;
 
-pub mod root;
 pub mod runtime;
 pub mod tools;
 
 pub use activity::{Activity, ActivityPlugin, Phase};
 pub use approval::{ApprovalChannel, ApprovalRequest};
+pub use core::{AgentCore, Inbox};
 pub use model::{ModelPlugin, ModelSettings, ModelSettingsChanged, SetModel, SetThinking};
 pub use permission::{PermissionRules, Rule, RuleError};
-pub use root::AgentRoot;
 pub use runtime::{
-    ActiveTurn, AgentPlugin, ApprovalDecided, InterruptTurn, PendingTurns, PendingUserMessages,
-    RequestBuilderResource, ToolFinished, ToolsPlugin, TurnFailure, TurnFinished, TurnOwner,
-    TurnRequested, UserMessage,
+    ActiveTurn, AgentPlugin, ApprovalDecided, InterruptTurn, RequestBuilderResource, ToolFinished,
+    ToolsPlugin, TurnFailure, TurnFailureKind, TurnFinished, TurnOwner, TurnRequested, UserMessage,
 };
 
 use agnes_core::llm::LlmRequest;

@@ -120,7 +120,7 @@ impl Durability {
 /// several agents in one world only the target session rotates.
 #[derive(Clone, Copy, Debug)]
 pub struct RotateSession {
-    /// 要轮转的 agent 根实体。
+    /// 要轮转的 agent 实体。
     pub agent: Entity,
 }
 

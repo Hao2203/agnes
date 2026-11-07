@@ -44,7 +44,7 @@ pub struct TurnClock {
     pub cancellation: CancelToken,
 }
 
-/// turn 实体的归属：它属于哪个 agent 根实体。
+/// turn 实体的归属：它属于哪个 agent 实体。
 ///
 /// 对齐 `ToolCallEntry::turn` 的父回引模式：begin_turn 的每 agent 守卫、
 /// inject_pending 与 recorder 都靠它把 turn 路由回所属会话。
@@ -62,8 +62,11 @@ pub(crate) struct InFlightCall {
 
 /// 失败收场的标记：阶段已丢弃（session repairs 负责补写收尾事件），
 /// `close_turn` 按它发出 [`TurnFinished`](crate::runtime::TurnFinished)。
+///
+/// `kind` 保留失败类别供宿主程序化处理，`cause` 只用于展示。
 pub struct TurnFailed {
     pub cause: String,
+    pub kind: super::messages::TurnFailureKind,
 }
 
 /// 一个工具调用在其生命周期里的位置。
@@ -102,9 +105,7 @@ agnes_ecs::component!(
     TurnFailed,
     ToolCallEntry,
     TurnOwner,
-    InFlightCall,
-    PendingTurns,
-    PendingUserMessages
+    InFlightCall
 );
 
 /// 模型调用 id 的全局发放器：id 空间跨 agent 唯一，回复按 id 路由回
@@ -121,44 +122,5 @@ impl LlmCallSeq {
             .checked_add(1)
             .expect("model call id space exhausted");
         id
-    }
-}
-
-/// 某 agent 根实体上等待开跑的 turn 请求：它有活跃 turn 时到达的请求
-/// 在这里排队，收场后依次开跑。
-#[derive(Default)]
-pub struct PendingTurns(pub(crate) Vec<std::sync::Arc<super::messages::TurnRequested>>);
-
-impl PendingTurns {
-    /// 多少个 turn 请求在等待。
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// 是否没有 turn 请求在等待。
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-/// 某 agent 根实体上还没有并入会话的用户消息：只在待调用阶段生效，
-/// 其余场合在这里等待。
-#[derive(Default)]
-pub struct PendingUserMessages(pub(crate) Vec<agnes_core::content::Content>);
-
-impl PendingUserMessages {
-    /// 多少条用户消息在等待注入。
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// 是否没有用户消息在等待。
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// 取走全部等待中的用户消息（宿主收场时归还给输入侧）。
-    pub fn drain(&mut self) -> Vec<agnes_core::content::Content> {
-        std::mem::take(&mut self.0)
     }
 }

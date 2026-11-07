@@ -4,7 +4,7 @@
 //! 词汇：驱动/系统把它按发生顺序发出，渲染与落盘各自按需消费。core 的
 //! 封闭枚举不因插件扩展 —— 插件/系统的语义都长在 [`RunEventKind`] 上。
 //!
-//! [`RunEvent`] 是信封：`agent` 是事件所属 agent 根实体，消费方（会话
+//! [`RunEvent`] 是信封：`agent` 是事件所属 agent 实体，消费方（会话
 //! 落盘、活动快照、渲染）按它路由，一个世界里的多个 agent 各看各的流；
 //! `kind` 是事件本体。
 
@@ -19,10 +19,10 @@ use agnes_core::turn::Outcome;
 use agnes_ecs::Entity;
 use jiff::Timestamp;
 
-/// 一条运行期上报：所属 agent 根实体加事件本体。
+/// 一条运行期上报：所属 agent 实体加事件本体。
 #[derive(Debug, Clone)]
 pub struct RunEvent {
-    /// 事件所属的 agent 根实体：消费方按它把事件路由回所属会话。
+    /// 事件所属的 agent 实体：消费方按它把事件路由回所属会话。
     pub agent: Entity,
     /// 事件本体。
     pub kind: RunEventKind,

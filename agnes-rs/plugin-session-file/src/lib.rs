@@ -3,7 +3,7 @@
 //!
 //! [`FileStore`] is the port implementation the session plugin's writer task
 //! drives; the host wraps it in a [`SessionStoreResource`] and attaches it as
-//! a component to its session's root entity (absent means memory-only
+//! a component to its session entity (absent means memory-only
 //! mode). This crate owns everything file-shaped: the file handle, sibling
 //! naming for rotation, and reopening. The session plugin owns the state: the
 //! log, durability, ordering, and when to flush.

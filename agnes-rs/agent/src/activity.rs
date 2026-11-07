@@ -2,7 +2,7 @@
 //!
 //! [`Activity`] 是派生状态，不是会话日志的一部分：它从不落盘、不可恢复，
 //! 只从 [`RunEvent`] 与 [`LlmStreamEvent`] 投影而来。它以组件形式挂在
-//! agent 根实体上，每个 agent 一份快照，由宿主挂载（`Activity::default()`）。
+//! agent 实体上，每个 agent 一份快照，由宿主挂载（`Activity::default()`）。
 //! 权威用量仍在 `MessageEnd.usage` 与 `TurnResult.usage`；流尾的 `Usage`
 //! 只是让界面提前看到同一个值。
 //!
@@ -234,10 +234,11 @@ fn track_rotation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnes_core::config::ModelName;
+    use agnes_core::config::{ModelName, Thinking};
     use agnes_core::llm::StopKind;
     use agnes_core::turn::StepNumber;
     use agnes_io::llm::LlmCallId;
+    use agnes_record::Log;
     use jiff::Timestamp;
     use std::str::FromStr;
 
@@ -245,24 +246,30 @@ mod tests {
         ModelName::from_str("gpt-test").unwrap()
     }
 
+    fn core() -> crate::AgentCore {
+        crate::AgentCore::new(
+            Log::default(),
+            crate::ModelSettings::new(model(), Thinking::Off),
+        )
+    }
+
     fn app() -> App {
         let mut app = App::new();
-        // 宿主装配：根实体与快照组件先建，插件只注册系统。
-        app.world_mut()
-            .spawn_bundle((crate::AgentRoot, Activity::default()));
+        // 宿主装配：核心状态与快照组件先建，插件只注册系统。
+        app.world_mut().spawn_bundle((core(), Activity::default()));
         app.add_plugin(ActivityPlugin);
         app
     }
 
-    fn root(app: &App) -> agnes_ecs::Entity {
+    fn agent(app: &App) -> agnes_ecs::Entity {
         app.world()
-            .entity_with::<crate::AgentRoot>()
-            .expect("agent root exists")
+            .entity_with::<crate::AgentCore>()
+            .expect("agent exists")
     }
 
     fn activity(app: &App) -> Activity {
         app.world()
-            .get::<Activity>(root(app))
+            .get::<Activity>(agent(app))
             .expect("activity component")
             .clone()
     }
@@ -297,20 +304,20 @@ mod tests {
 
     /// 在飞调用实体：流式事件经它路由回所属 agent 的快照。
     fn install_stream_call(app: &mut App) {
-        let agent = root(app);
+        let owner = agent(app);
         app.world_mut().spawn_bundle((
             InFlightCall {
                 id: LlmCallId::new(1),
                 model: model(),
             },
-            TurnOwner(agent),
+            TurnOwner(owner),
         ));
     }
 
     #[test]
     fn a_run_moves_through_running_and_streaming() {
         let mut app = app();
-        let agent = root(&app);
+        let agent = agent(&app);
         app.world_mut().send_message(started(agent));
         app.pump().expect("schedule runs");
         {
@@ -389,7 +396,7 @@ mod tests {
     #[test]
     fn the_stream_tail_usage_is_visible_before_the_message_ends() {
         let mut app = app();
-        let agent = root(&app);
+        let agent = agent(&app);
         install_stream_call(&mut app);
         app.world_mut().send_message(started(agent));
         app.world_mut()
@@ -416,7 +423,7 @@ mod tests {
     #[test]
     fn reasoning_chars_are_counted_and_cleared_with_the_step() {
         let mut app = app();
-        let agent = root(&app);
+        let agent = agent(&app);
         install_stream_call(&mut app);
         app.world_mut()
             .send_message(stream(LlmStreamUpdate::Reasoning {
@@ -459,7 +466,7 @@ mod tests {
     #[test]
     fn rotation_clears_the_session_total() {
         let mut app = app();
-        let agent = root(&app);
+        let agent = agent(&app);
         app.world_mut().send_message(started(agent));
         app.world_mut().send_message(recorded(
             agent,
@@ -490,11 +497,10 @@ mod tests {
     #[test]
     fn foreign_events_do_not_touch_the_snapshot() {
         let mut app = App::new();
-        // 本 agent 的根实体 + 一个别的 agent 的根实体；事件都发给对方。
-        app.world_mut()
-            .spawn_bundle((crate::AgentRoot, Activity::default()));
+        // 本 agent 的实体 + 一个别的 agent 的实体；事件都发给对方。
+        app.world_mut().spawn_bundle((core(), Activity::default()));
         app.add_plugin(ActivityPlugin);
-        let other = app.world_mut().spawn(crate::AgentRoot);
+        let other = app.world_mut().spawn(core());
 
         app.world_mut().send_message(started(other));
         app.world_mut().send_message(RunEvent {

@@ -9,17 +9,17 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
-use agnes_agent::AgentRoot;
+use agnes_agent::AgentCore;
+use agnes_agent::Inbox;
 use agnes_agent::activity::{Activity, Phase};
 use agnes_agent::model::{ModelSettings, ModelSettingsChanged};
-use agnes_agent::runtime::{PendingUserMessages, TurnFinished};
+use agnes_agent::runtime::TurnFinished;
 use agnes_core::config::ModelName;
 use agnes_core::llm::StopKind;
 use agnes_core::message::{AssistantMessage, Message};
 use agnes_core::turn::Outcome;
 use agnes_ecs::{
     App, CancelToken, Entity, MessageReader, Plugin, Query, Res, ResMut, RuntimeSender, Update,
-    With,
 };
 use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate, ModelsListed};
 use agnes_plugin_async::AsyncExecutor;
@@ -30,8 +30,8 @@ use crate::input::UserInput;
 pub use crate::ui::Status;
 use crate::ui::{UiCommand, plain, tui};
 
-/// 每会话状态的只读快照对（都在 agent 根实体上）。
-type Snapshot<'w> = Query<'w, (&'static Activity, &'static ModelSettings), With<AgentRoot>>;
+/// 每会话状态的只读快照对（核心状态与观测快照都在 agent 实体上）。
+type Snapshot<'w> = Query<'w, (&'static Activity, &'static AgentCore)>;
 
 struct RendererInner {
     tx: std_mpsc::Sender<UiCommand>,
@@ -179,7 +179,7 @@ impl Drop for RendererInner {
 struct DisplayState {
     renderer: Renderer,
     sender: RuntimeSender,
-    /// 渲染器服务的 agent 根实体：装配时绑定，消息与快照都按它寻址。
+    /// 渲染器服务的 agent 实体：装配时绑定，消息与快照都按它寻址。
     agent: Entity,
     /// 单次运行模式：收场即退出，未生效的用户消息只打印提示。
     single_shot: bool,
@@ -283,8 +283,10 @@ fn track_stream(
             LlmStreamUpdate::Usage { .. } => {}
         }
     }
-    if let Some((activity, settings)) = snapshot.get(state.agent) {
-        state.renderer.status(status_snapshot(&activity, &settings));
+    if let Some((activity, core)) = snapshot.get(state.agent) {
+        state
+            .renderer
+            .status(status_snapshot(&activity, core.settings()));
     }
 }
 
@@ -308,7 +310,7 @@ fn render_run_events(
                     "* model {}, tools: [{}]",
                     snapshot
                         .get(state.agent)
-                        .map(|(_, settings)| settings.model().to_string())
+                        .map(|(_, core)| core.settings().model().to_string())
                         .unwrap_or_default(),
                     names.join(", ")
                 ));
@@ -340,8 +342,10 @@ fn render_run_events(
             _ => {}
         }
     }
-    if let Some((activity, settings)) = snapshot.get(state.agent) {
-        state.renderer.status(status_snapshot(&activity, &settings));
+    if let Some((activity, core)) = snapshot.get(state.agent) {
+        state
+            .renderer
+            .status(status_snapshot(&activity, core.settings()));
     }
 }
 
@@ -351,10 +355,10 @@ fn render_model_list(
     snapshot: Snapshot,
     state: Res<DisplayState>,
 ) {
-    let Some((_, settings)) = snapshot.get(state.agent) else {
+    let Some((_, core)) = snapshot.get(state.agent) else {
         return;
     };
-    let current = settings.model().clone();
+    let current = core.settings().model().clone();
     for message in listed.read() {
         match &message.result {
             Ok(models) => state.renderer.models(current.clone(), models.clone()),
@@ -376,13 +380,15 @@ fn render_settings_changes(
     {
         return;
     }
-    if let Some((activity, settings)) = snapshot.get(state.agent) {
+    if let Some((activity, core)) = snapshot.get(state.agent) {
         state.renderer.line(format!(
             "(model {} · thinking {})",
-            settings.model(),
-            settings.thinking()
+            core.settings().model(),
+            core.settings().thinking()
         ));
-        state.renderer.status(status_snapshot(&activity, &settings));
+        state
+            .renderer
+            .status(status_snapshot(&activity, core.settings()));
     }
 }
 
@@ -466,14 +472,8 @@ fn rotate_feedback(
 /// 单次运行模式随后请求退出。
 fn report_finished(
     executor: Res<AsyncExecutor>,
-    sessions: Query<
-        (
-            &Log,
-            Option<&agnes_record::Durability>,
-            &mut PendingUserMessages,
-        ),
-        With<AgentRoot>,
-    >,
+    sessions: Query<(&AgentCore, Option<&agnes_record::Durability>)>,
+    mut inboxes: Query<&mut Inbox>,
     mut finished: MessageReader<TurnFinished>,
     mut report: ResMut<PendingReport>,
     state: Res<DisplayState>,
@@ -508,7 +508,7 @@ fn report_finished(
     let Some(data) = report.0.take() else {
         return;
     };
-    let Some((log, durability, mut pending_msgs)) = sessions.get(state.agent) else {
+    let Some((core, durability)) = sessions.get(state.agent) else {
         report.0 = Some(data);
         return;
     };
@@ -517,7 +517,8 @@ fn report_finished(
     let durable = durability.is_none_or(|d| {
         d.failed.is_some()
             || (d.is_durable()
-                && u64::try_from(log.events().len()).is_ok_and(|count| count <= d.flushed_seq))
+                && u64::try_from(core.log().events().len())
+                    .is_ok_and(|count| count <= d.flushed_seq))
     });
     if !durable {
         // 落盘确认未到：报告放回，下一 tick 再试。
@@ -538,16 +539,18 @@ fn report_finished(
             data.finished_at,
         ),
     }
-    for content in pending_msgs.drain() {
-        if state.single_shot {
-            state
-                .renderer
-                .line(format!("note: unused queued message: {content}"));
-        } else {
-            // 排队的任务在空闲时自动依次开跑（与旧 chat 循环一致）。
-            let _ = state
-                .sender
-                .send_message(crate::input::TaskLine { content });
+    if let Some(mut inbox) = inboxes.get_mut(state.agent) {
+        for content in inbox.take_pending_messages() {
+            if state.single_shot {
+                state
+                    .renderer
+                    .line(format!("note: unused queued message: {content}"));
+            } else {
+                // 排队的任务在空闲时自动依次开跑（与旧 chat 循环一致）。
+                let _ = state
+                    .sender
+                    .send_message(crate::input::TaskLine { content });
+            }
         }
     }
     if state.single_shot {

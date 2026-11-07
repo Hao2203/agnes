@@ -21,32 +21,33 @@ use agnes_io::http::TransportError;
 use agnes_io::llm::{LlmCall, LlmCancel, LlmError, LlmProvider, LlmReply};
 use agnes_io::tool::Tool;
 use agnes_plugin_async::TokioPlugin;
-use agnes_plugin_session::{SessionPlugin, session_state};
+use agnes_plugin_session::{SessionPlugin, SessionState, session_state};
 use agnes_record::{
-    Durability, Event, HostEvent, RunEvent, RunEventKind, SessionError, SessionStore,
-    SessionStoreResource,
+    Durability, Event, HostEvent, RotateSession, RunEvent, RunEventKind, SessionError,
+    SessionStore, SessionStoreResource,
 };
 use agnes_util::NonEmpty;
 use async_trait::async_trait;
 use jiff::Timestamp;
 
-use super::messages::{ApprovalDecided, InterruptTurn, TurnFinished, TurnRequested, UserMessage};
-use super::{
-    ActiveTurn, AgentPlugin, PendingTurns, PendingUserMessages, RequestBuilderResource, ToolsPlugin,
+use super::messages::{
+    ApprovalDecided, InterruptTurn, TurnFailure, TurnFailureKind, TurnFinished, TurnRequested,
+    UserMessage,
 };
-use crate::AgentRoot;
+use super::{ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin};
 use crate::StandardRequestBuilder;
 use crate::approval::ApprovalChannel;
 use crate::model::{ModelPlugin, ModelSettings, SetModel, SetThinking};
 use crate::permission::{PermissionRules, Rule};
+use crate::{AgentCore, Inbox};
 
 const MODEL: &str = "test-model";
 
-/// The host-spawned agent root.
+/// The host-spawned agent.
 fn agent(app: &App) -> Entity {
     app.world()
-        .entity_with::<crate::AgentRoot>()
-        .expect("agent root exists")
+        .entity_with::<crate::AgentCore>()
+        .expect("agent exists")
 }
 
 fn capture(app: &App) -> Capture {
@@ -58,7 +59,7 @@ fn capture(app: &App) -> Capture {
 
 #[derive(Default, Clone)]
 struct Capture {
-    finished: Vec<Result<Outcome, String>>,
+    finished: Vec<Result<Outcome, TurnFailure>>,
     run_events: Vec<RunEvent>,
 }
 
@@ -66,7 +67,7 @@ fn capture_finished(mut reader: MessageReader<TurnFinished>, mut capture: ResMut
     for message in reader.read() {
         capture.finished.push(match &message.result {
             Ok(result) => Ok(result.outcome),
-            Err(failure) => Err(failure.cause.clone()),
+            Err(failure) => Err(failure.clone()),
         });
     }
 }
@@ -248,20 +249,24 @@ fn config(goal: &str) -> AgentConfig {
     }
 }
 
-/// 宿主装配：spawn 一个带完整会话状态的 agent 根实体。
+/// 宿主装配：spawn 一个挂载核心状态、输入队列与会话能力的 agent 实体。
 fn spawn_agent(app: &mut App) -> Entity {
-    let (log, pump, durability) = session_state(&[]).expect("session state");
-    app.world_mut().spawn_bundle((
-        AgentRoot,
+    let SessionState {
         log,
         pump,
         durability,
-        ModelSettings::new(
-            ModelName::from_str(MODEL).expect("static name is valid"),
-            Thinking::Off,
+    } = session_state(&[]).expect("session state");
+    app.world_mut().spawn_bundle((
+        AgentCore::new(
+            log,
+            ModelSettings::new(
+                ModelName::from_str(MODEL).expect("static name is valid"),
+                Thinking::Off,
+            ),
         ),
-        PendingTurns::default(),
-        PendingUserMessages::default(),
+        Inbox::default(),
+        pump,
+        durability,
     ))
 }
 
@@ -269,7 +274,7 @@ fn app(provider: ProviderState) -> App {
     app_with(provider, ToolsPlugin::empty())
 }
 
-/// 只装插件、不 spawn agent 根实体：用于装配校验测试。
+/// 只装插件、不 spawn agent 实体：用于装配校验测试。
 fn bare_app() -> App {
     let mut app = App::new();
     app.add_plugin(SessionPlugin)
@@ -482,7 +487,7 @@ async fn each_agent_runs_its_own_turn_concurrently() {
     app.insert_resource(ActiveCount::default());
     app.add_systems(Update, track_active_count);
 
-    // 第二个 agent 根实体：宿主按同样的流程 spawn 并挂上每会话状态。
+    // 第二个 agent 实体：宿主按同样的流程 spawn 并挂上核心状态与输入队列。
     let first = agent(&app);
     let second = spawn_agent(&mut app);
 
@@ -741,8 +746,9 @@ async fn a_failing_model_fails_the_turn_and_the_app_survives() {
             let capture = capture(&app);
             assert_eq!(capture.finished.len(), 2);
             for outcome in &capture.finished {
-                let cause = outcome.as_ref().expect_err("model fails").clone();
-                assert!(cause.contains("timed out"));
+                let failure = outcome.as_ref().expect_err("model fails");
+                assert_eq!(failure.kind, TurnFailureKind::Model);
+                assert!(failure.cause.contains("timed out"));
             }
             assert!(
                 capture
@@ -780,7 +786,12 @@ async fn a_session_failure_fails_the_turn_and_the_app_survives() {
     for _ in 0..256 {
         app.pump().expect("schedule runs");
         if !capture(&app).finished.is_empty() {
-            assert_eq!(capture(&app).finished, vec![Err("disk full".to_owned())]);
+            let snapshot = capture(&app);
+            let Err(failure) = &snapshot.finished[0] else {
+                panic!("the session failure must fail the turn");
+            };
+            assert_eq!(failure.kind, TurnFailureKind::Session);
+            assert_eq!(failure.cause, "disk full");
             // 应用存活：下一个 turn 不再发请求，同样立即失败收场。
             sender
                 .send_message(TurnRequested {
@@ -889,45 +900,112 @@ fn agent_plugin_requires_tools_plugin_first() {
 }
 
 #[test]
-fn agent_plugin_registers_without_an_agent_root() {
+fn agent_plugin_registers_without_an_agent() {
     let _app = bare_app();
 }
 
 #[test]
-fn a_turn_request_to_a_root_missing_model_settings_finishes_with_an_error() {
+fn a_turn_request_to_a_non_agent_entity_finishes_with_an_error() {
     let mut app = bare_app();
-    let (log, pump, durability) = session_state(&[]).expect("session state");
-    let incomplete = app.world_mut().spawn_bundle((
-        AgentRoot,
-        log,
-        pump,
-        durability,
-        PendingTurns::default(),
-        PendingUserMessages::default(),
-    ));
+    let not_an_agent = app.world_mut().spawn_empty();
     app.world_mut().send_message(TurnRequested {
-        agent: incomplete,
+        agent: not_an_agent,
         config: config("hello"),
     });
     app.pump().expect("the schedule runs without panicking");
 
     let capture = capture(&app);
     assert_eq!(capture.finished.len(), 1);
-    let Err(cause) = &capture.finished[0] else {
+    let Err(failure) = &capture.finished[0] else {
         panic!("the turn must fail: {:?}", capture.finished);
     };
-    assert!(cause.contains("core state"), "unexpected cause: {cause}");
+    assert_eq!(
+        failure.kind,
+        TurnFailureKind::MissingCore,
+        "the failure is typed, not a message-string match"
+    );
+}
+
+#[test]
+fn rotating_a_session_clears_its_log_and_resets_durability() {
+    let mut app = app(ProviderState::default());
+    let agent = agent(&app);
+    app.world_mut()
+        .get_mut::<AgentCore>(agent)
+        .expect("core state")
+        .log_mut()
+        .record(Event::TurnStart);
+    {
+        let mut durability = app
+            .world_mut()
+            .get_mut::<Durability>(agent)
+            .expect("durability component");
+        durability.sent_seq = 3;
+        durability.flushed_seq = 3;
+    }
+
+    app.world_mut().send_message(RotateSession { agent });
+    app.pump().expect("schedule runs");
+
+    assert!(
+        app.world()
+            .get::<AgentCore>(agent)
+            .expect("core state")
+            .log()
+            .events()
+            .is_empty(),
+        "the in-memory log is cleared"
+    );
+    let durability = app
+        .world()
+        .get::<Durability>(agent)
+        .expect("durability component")
+        .clone();
+    assert_eq!(durability.sent_seq, 0, "the durability baseline is reset");
+    assert_eq!(durability.flushed_seq, 0);
+    assert!(durability.is_durable());
+}
+
+#[test]
+fn losing_core_state_fails_the_turn_and_its_queued_requests() {
+    let mut app = app(ProviderState {
+        muted: true,
+        ..Default::default()
+    });
+    let agent = agent(&app);
+    app.world_mut().send_message(TurnRequested {
+        agent,
+        config: config("first"),
+    });
+    app.pump().expect("schedule runs");
+
+    // The first turn is waiting for a reply; the second request queues.
+    app.world_mut().send_message(TurnRequested {
+        agent,
+        config: config("second"),
+    });
+    app.pump().expect("schedule runs");
+
+    // The host removes the core state while the turn is in flight.
+    app.world_mut().remove::<AgentCore>(agent);
+    app.pump().expect("the schedule keeps running");
+
+    let capture = capture(&app);
+    assert_eq!(capture.finished.len(), 2, "active turn + queued request");
+    assert!(
+        capture.finished.iter().all(
+            |result| matches!(result, Err(failure) if failure.kind == TurnFailureKind::MissingCore)
+        ),
+        "both failures are typed: {:?}",
+        capture.finished
+    );
 }
 
 #[tokio::test]
 async fn an_incomplete_agent_does_not_block_a_complete_one() {
     let mut app = app(ProviderState::default());
     let complete = agent(&app);
-    let incomplete = app.world_mut().spawn_bundle((
-        AgentRoot,
-        PendingTurns::default(),
-        PendingUserMessages::default(),
-    ));
+    let incomplete = app.world_mut().spawn_empty();
 
     app.world_mut().send_message(TurnRequested {
         agent: incomplete,
@@ -948,8 +1026,15 @@ async fn an_incomplete_agent_does_not_block_a_complete_one() {
 
     let capture = capture(&app);
     assert_eq!(capture.finished.len(), 2);
-    assert!(
-        capture.finished[0].is_err(),
+    let Err(failure) = &capture.finished[0] else {
+        panic!(
+            "the incomplete agent fails its turn: {:?}",
+            capture.finished
+        );
+    };
+    assert_eq!(
+        failure.kind,
+        TurnFailureKind::MissingCore,
         "the incomplete agent fails its turn"
     );
     assert_eq!(capture.finished[1], Ok(Outcome::Answered));

@@ -45,7 +45,7 @@ pub(crate) enum Line {
 }
 
 /// Shared input state: answer mode for approval questions, the run flag
-/// the signal handler and the stdin reader watch, and the agent root the
+/// the signal handler and the stdin reader watch, and the agent the
 /// host tasks address their messages to.
 pub struct UserInput {
     /// 审批问询期间：读到的行不分类，原样进答覆队列。
@@ -53,7 +53,7 @@ pub struct UserInput {
     answers: Mutex<VecDeque<String>>,
     answer_wake: Notify,
     running: watch::Sender<bool>,
-    /// 目标 agent 根实体：装配完成后由 `run()` 绑定；宿主任务发送
+    /// 目标 agent 实体：装配完成后由 `run()` 绑定；宿主任务发送
     /// SetModel / SetThinking / InterruptTurn 前从这里取。
     agent: Mutex<Option<Entity>>,
 }
@@ -80,13 +80,13 @@ impl UserInput {
         let _ = self.running.send_replace(running);
     }
 
-    /// Binds the agent root the host tasks address; called once after the
+    /// Binds the agent the host tasks address; called once after the
     /// app is assembled.
     pub fn set_agent(&self, agent: Entity) {
         *lock(&self.agent) = Some(agent);
     }
 
-    /// The bound agent root, if assembly has finished.
+    /// The bound agent, if assembly has finished.
     pub(crate) fn agent(&self) -> Option<Entity> {
         *lock(&self.agent)
     }

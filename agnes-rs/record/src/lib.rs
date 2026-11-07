@@ -34,6 +34,6 @@ pub use session::{
     Durability, RotateSession, SessionError, SessionLog, SessionStore, SessionStoreResource,
 };
 
-// 会话状态以组件形式挂在各 agent 的根实体上（根实体标记 [`AgentRoot`]
-// 归 `agnes-agent`），这里集中声明本 crate 的组件词汇。
-agnes_ecs::component!(Log, Durability, SessionStoreResource);
+// 能力状态以组件形式挂在各 agent 实体上；`Log` 由 `agnes-agent` 的
+// `AgentCore` 持有，不再单独作为组件挂载。
+agnes_ecs::component!(Durability, SessionStoreResource);

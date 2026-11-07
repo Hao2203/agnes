@@ -1,22 +1,23 @@
 //! ECS 运行时：用 [`AgentPlugin`] 把 core 的 typestate 装进消息管线。
 //!
 //! 机器（[`agnes_core::agent`]）是唯一真相；本模块的系统只是解释阶段
-//! 提示、做 IO、记事件。每会话状态以组件形式挂在 agent 根实体
-//! （[`AgentRoot`](crate::AgentRoot) 标记）上，一个世界可以同时运行多个
-//! agent；根实体与状态由宿主创建并保管句柄
-//! （`agnes_plugin_session::session_state`，加 [`PendingTurns`] /
-//! [`PendingUserMessages`] / [`ModelSettings`]），本 crate 的插件不
-//! spawn 实体、不挂组件。
+//! 提示、做 IO、记事件。每个 agent 是一个挂载
+//! [`AgentCore`](crate::AgentCore) 的实体，一个世界可以同时运行多个 agent；
+//! 核心状态由宿主用 `AgentCore::new(log, settings)` 创建并保管句柄（日志
+//! 来自 `agnes_plugin_session::session_state`），本 crate 的插件不 spawn
+//! 实体、不挂组件。
 //!
-//! # 核心状态与能力组件
+//! # 核心状态、输入队列与能力组件
 //!
-//! 每个 agent 根实体分两层：
-//!
-//! - **核心状态（必须）**：`AgentRoot` + `agnes_record::Log` +
-//!   [`ModelSettings`] + [`PendingTurns`] +
-//!   [`PendingUserMessages`]。缺任一核心组件的 [`TurnRequested`] 不会
-//!   panic：`begin_turn` 立即以 [`TurnFinished`] 的 `Err(TurnFailure)`
-//!   交还宿主（并记一条 `RunEventKind::Failed`）。
+//! - **核心状态（必须）**：[`AgentCore`](crate::AgentCore) 一个组件，内含
+//!   会话日志与模型设置。没有它的 [`TurnRequested`] 不会 panic：`begin_turn`
+//!   立即以 [`TurnFinished`] 的 `Err(TurnFailure { kind: MissingCore, .. })`
+//!   交还宿主（并记一条 `RunEventKind::Failed`）。turn 进行中摘除
+//!   `AgentCore` 由 `fail_on_missing_core` 让该 turn 失败收场，不影响其他
+//!   agent。
+//! - **输入队列（必须）**：[`Inbox`](crate::Inbox) 一个组件，承载排队的
+//!   turn 请求与待注入用户消息。它与核心状态分开存放：核心状态丢失时，
+//!   `begin_turn` 仍能把积压请求以失败交还，调用方不会永久等待。
 //! - **能力组件（可选，装了就生效）**：`Activity`（观测）、
 //!   `Durability` / `SessionPump` / `SessionStoreResource`（会话持久化）
 //!   等。能力系统按 `Query<..., With<能力组件>>` 或按实体路由，没有该
@@ -30,7 +31,8 @@
 //! - `agnes_plugin_session::SessionPlugin`：**先于本插件**（断言）。其
 //!   `session_ack` 系统必须在同一 tick 内先于耐久门禁运行；
 //! - [`ModelPlugin`]：**先于本插件**（断言）。
-//!   `apply_settings` 在同一 tick 内先于模型调用生效；设置组件由宿主挂；
+//!   `apply_settings` 在同一 tick 内先于模型调用生效；设置是
+//!   [`AgentCore`](crate::AgentCore) 的字段；
 //! - [`ToolsPlugin`]：**先于本插件**（断言）。工具表由它填充；
 //! - `agnes_io::llm::LlmProvider`：provider 插件安装（如
 //!   `agnes-plugin-openai`）。可替换依赖不断言：`require_provider` 每
@@ -42,8 +44,7 @@
 //!   缺失即 fail-closed 拒绝）；
 //! - `crate::permission::PermissionRules`：权限规则（缺省全部放行）；
 //! - `agnes_record::Durability`：会话耐久进度（宿主经 `session_state`
-//!   挂到根实体上，`agnes-plugin-session` 的系统驱动它）；
-//! - `agnes_record::Log`：会话日志（根实体组件，宿主挂载）；
+//!   挂到 agent 实体上，`agnes-plugin-session` 的系统驱动它）；
 //! - [`ActiveTurn`] / [`TurnOwner`]：turn 实体上的零大小标记与归属回指，
 //!   宿主可 `Query<(&ActiveTurn, &TurnOwner)>` 判断某个 agent 是否有
 //!   turn 在飞（输入路由用）。
@@ -60,11 +61,11 @@ mod systems;
 mod tests;
 
 pub use messages::{
-    ApprovalDecided, InterruptTurn, ToolFinished, TurnFailure, TurnFinished, TurnRequested,
-    UserMessage,
+    ApprovalDecided, InterruptTurn, ToolFinished, TurnFailure, TurnFailureKind, TurnFinished,
+    TurnRequested, UserMessage,
 };
 pub(crate) use state::InFlightCall;
-pub use state::{ActiveTurn, PendingTurns, PendingUserMessages, TurnOwner};
+pub use state::{ActiveTurn, TurnOwner};
 
 use std::sync::Arc;
 
@@ -98,7 +99,7 @@ impl RequestBuilderResource {
 /// 注册 agent 运行时：按序注册消息管线的全部系统。
 ///
 /// 系统注册顺序即执行顺序；管线的一个 tick 对应旧驱动的一个检查点。
-/// 根实体与每会话状态由宿主装配，本插件不创建。
+/// agent 实体与每会话状态由宿主装配，本插件不创建。
 pub struct AgentPlugin;
 
 impl Plugin for AgentPlugin {
@@ -109,7 +110,7 @@ impl Plugin for AgentPlugin {
     /// # Panics
     ///
     /// 注册期断言强依赖：[`SessionPlugin`](agnes_plugin_session::SessionPlugin)、
-    /// [`ModelPlugin`] 与 [`ToolsPlugin`] 必须先装。根实体与核心状态由宿主
+    /// [`ModelPlugin`] 与 [`ToolsPlugin`] 必须先装。agent 实体与核心状态由宿主
     /// 装配，本插件不做全局检查：缺核心状态的 turn 请求以失败收场报告。
     fn build(&self, app: &mut App) {
         assert!(
@@ -131,7 +132,9 @@ impl Plugin for AgentPlugin {
         app.init_resource::<ToolRegistry>()
             .init_resource::<LlmCallSeq>()
             .add_systems(Update, systems::require_provider)
+            .add_systems(Update, systems::session_rotate_log)
             .add_systems(Update, systems::begin_turn)
+            .add_systems(Update, systems::fail_on_missing_core)
             .add_systems(Update, systems::handle_interrupt)
             .add_systems(Update, systems::fail_on_session_failure)
             .add_systems(Update, systems::inject_pending)
