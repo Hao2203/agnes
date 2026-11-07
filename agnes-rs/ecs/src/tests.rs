@@ -381,6 +381,55 @@ fn commands_can_reserve_entities_while_a_query_is_iterating() {
     assert_eq!(world.alive_len(), 4, "the deferred spawns were applied");
 }
 
+fn spawn_one_health_per_health(
+    mut commands: Commands,
+    query: Query<&Health>,
+    mut probe: ResMut<SpawnProbe>,
+) {
+    let mut seen = 0;
+    for _ in query.iter() {
+        seen += 1;
+        commands.spawn(Health(10));
+    }
+    probe.seen_during_system = seen;
+}
+
+#[test]
+fn commands_can_reserve_components_while_a_dense_query_iterates() {
+    let mut world = World::new();
+    world.insert_resource(SpawnProbe::default());
+    world.spawn(Health(1));
+    world.spawn(Health(2));
+    world.spawn(Ping(3));
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(spawn_one_health_per_health)
+        .expect("the system is valid");
+    schedule.run(&mut world).expect("run succeeds");
+
+    let probe = world.resource::<SpawnProbe>().expect("probe exists");
+    assert_eq!(
+        probe.seen_during_system, 2,
+        "deferred spawns are not visible to the dense walk"
+    );
+    drop(probe);
+    assert_eq!(world.alive_len(), 5, "the deferred spawns were applied");
+}
+
+#[test]
+fn a_marker_query_visits_only_tagged_entities() {
+    let mut world = World::new();
+    let first = world.spawn(Health(1));
+    world.spawn(Ping(2));
+    let third = world.spawn(Health(3));
+
+    let found: Vec<Entity> = Query::<Entity, crate::With<Health>>::new(&world)
+        .iter()
+        .collect();
+    assert_eq!(found, [first, third]);
+}
+
 fn despawn_all(mut commands: Commands, query: Query<Entity>) {
     for entity in query.iter() {
         commands.entity(entity).despawn();
@@ -415,7 +464,7 @@ fn commands_can_chain_insert_and_remove() {
         .expect("commands are valid");
     schedule.run(&mut world).expect("run succeeds");
 
-    let entity = world.alive_entities()[0];
+    let entity = world.entity_with::<Ping>().expect("entity has ping");
     assert!(world.get::<Health>(entity).is_none());
     assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
 }
@@ -453,7 +502,7 @@ fn commands_spawn_bundle_applies_all_components() {
         .expect("commands are valid");
     schedule.run(&mut world).expect("run succeeds");
 
-    let entity = world.alive_entities()[0];
+    let entity = world.entity_with::<Health>().expect("entity has health");
     assert_eq!(world.get::<Health>(entity).expect("health exists").0, 1);
     assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
 }
@@ -473,7 +522,9 @@ fn entity_commands_insert_bundle_applies_all_components() {
         .expect("commands are valid");
     schedule.run(&mut world).expect("run succeeds");
 
-    let entity = world.alive_entities()[0];
+    let entity = world
+        .entity_with::<Health>()
+        .expect("inserted bundle has health");
     assert_eq!(world.get::<Health>(entity).expect("health exists").0, 1);
     assert_eq!(world.get::<Ping>(entity).expect("ping exists").0, 2);
 }

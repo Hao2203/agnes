@@ -181,12 +181,12 @@ impl World {
     /// The first live entity carrying a component of type `T`.
     ///
     /// A build-time find helper for anchor patterns (for example a plugin
-    /// attaching its state to a shared root entity). Iteration order follows
-    /// entity creation; use [`Query`](crate::Query) when every match matters.
+    /// attaching its state to a shared root entity). Reads the head of the
+    /// component's dense storage, so this is O(1); order is storage order,
+    /// not entity creation order. Use [`Query`](crate::Query) when every
+    /// match matters.
     pub fn entity_with<T: Component>(&self) -> Option<Entity> {
-        self.alive_entities()
-            .into_iter()
-            .find(|entity| self.contains::<T>(*entity))
+        self.erased_storage(TypeId::of::<T>())?.dense_entity_at(0)
     }
 
     /// Inserts a resource, returning the previous value if one existed.
@@ -247,8 +247,9 @@ impl World {
             .map(|cell| cell.into_inner())
     }
 
-    pub(crate) fn alive_entities(&self) -> Vec<Entity> {
-        self.entities.borrow().alive_entities()
+    /// The erased component storage registered for `type_id`, if any.
+    pub(crate) fn erased_storage(&self, type_id: TypeId) -> Option<&dyn ErasedStorage> {
+        self.components.get(&type_id).map(Box::as_ref)
     }
 
     /// Advances `cursor` to the next alive entity.
@@ -262,26 +263,6 @@ impl World {
     /// The number of entity slots, live or not; an upper bound on iteration.
     pub(crate) fn slot_count(&self) -> usize {
         self.entities.borrow().slot_count()
-    }
-
-    /// Whether any live entity satisfies `predicate`.
-    ///
-    /// Short-circuits on the first match. The allocator borrow is held only
-    /// for this call, so `predicate` must not reenter `&mut World` methods.
-    pub(crate) fn any_alive(&self, predicate: impl FnMut(Entity) -> bool) -> bool {
-        self.entities.borrow().iter_alive().any(predicate)
-    }
-
-    /// The number of live entities satisfying `predicate`.
-    ///
-    /// The allocator borrow is held only for this call, so `predicate` must
-    /// not reenter `&mut World` methods.
-    pub(crate) fn count_alive(&self, mut predicate: impl FnMut(Entity) -> bool) -> usize {
-        self.entities
-            .borrow()
-            .iter_alive()
-            .filter(|entity| predicate(*entity))
-            .count()
     }
 
     pub(crate) fn alive_len(&self) -> usize {

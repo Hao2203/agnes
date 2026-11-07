@@ -35,6 +35,16 @@ pub(crate) trait ErasedStorage: Any + Send {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn remove_entity(&mut self, entity: Entity);
+
+    /// The number of entries in the dense array — the number of entities
+    /// carrying this component.
+    fn dense_len(&self) -> usize;
+
+    /// The entity stored at dense position `slot`.
+    ///
+    /// Reads only the entity id, never the component value, so it cannot
+    /// conflict with a borrow of the component itself.
+    fn dense_entity_at(&self, slot: usize) -> Option<Entity>;
 }
 
 /// Marks an unused entry in [`Storage::sparse`].
@@ -47,8 +57,10 @@ const NO_DENSE_SLOT: u32 = u32::MAX;
 /// observe another entity's value. Lookups are a slice index plus a
 /// generation check instead of a hash.
 ///
-/// Dense ordering is an implementation detail: [`Storage::remove`] uses
-/// `swap_remove`, so no iteration order is guaranteed.
+/// Queries iterate `dense` directly, so iteration visits only the entities
+/// that carry this component. Dense ordering is an implementation detail:
+/// [`Storage::remove`] uses `swap_remove`, so no iteration order is
+/// guaranteed.
 pub(crate) struct Storage<T: Component> {
     sparse: Vec<u32>,
     dense: Vec<(Entity, RefCell<T>)>,
@@ -128,5 +140,13 @@ impl<T: Component> ErasedStorage for Storage<T> {
 
     fn remove_entity(&mut self, entity: Entity) {
         self.remove(entity);
+    }
+
+    fn dense_len(&self) -> usize {
+        self.dense.len()
+    }
+
+    fn dense_entity_at(&self, slot: usize) -> Option<Entity> {
+        self.dense.get(slot).map(|(entity, _)| *entity)
     }
 }

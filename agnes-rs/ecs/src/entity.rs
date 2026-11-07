@@ -127,22 +127,6 @@ impl EntityAllocator {
         slot.state == SlotState::Alive && slot.generation == entity.generation
     }
 
-    pub(crate) fn iter_alive(&self) -> impl Iterator<Item = Entity> + '_ {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            if slot.state != SlotState::Alive {
-                return None;
-            }
-            let index = u32::try_from(index).expect("entity slot index fits in u32");
-            Some(Entity::new(index, slot.generation))
-        })
-    }
-
-    pub(crate) fn alive_entities(&self) -> Vec<Entity> {
-        let mut entities = Vec::with_capacity(self.slots.len());
-        entities.extend(self.iter_alive());
-        entities
-    }
-
     /// Returns the next alive entity at or after `cursor`, advancing the
     /// cursor past every visited slot.
     ///
@@ -199,7 +183,7 @@ mod tests {
         let mut allocator = EntityAllocator::default();
         let entity = allocator.reserve();
         assert!(!allocator.is_alive(entity));
-        assert!(allocator.alive_entities().is_empty());
+        assert_eq!(allocator.alive_len(), 0);
         allocator.confirm(entity).expect("reserved entity confirms");
         assert!(allocator.is_alive(entity));
     }

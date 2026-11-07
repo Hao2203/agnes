@@ -1,4 +1,4 @@
-use crate::access::{Access, AccessMode, AccessSet};
+use crate::access::{Access, AccessMode};
 use crate::commands::{CommandQueue, Commands};
 use crate::message::{Message, MessageReader, MessageWriter, ReaderId};
 use crate::query::{Query, QueryData, QueryFilter};
@@ -52,7 +52,12 @@ pub trait SystemParam {
     fn apply(_world: &mut World, _state: &mut Self::State) {}
 
     /// The values this parameter reads or writes.
-    fn access() -> AccessSet;
+    ///
+    /// Collected once when the system is registered; returning an iterator
+    /// keeps the per-parameter declarations allocation-free.
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::empty()
+    }
 }
 
 impl SystemParam for () {
@@ -62,10 +67,6 @@ impl SystemParam for () {
     fn init_state(_world: &mut World) -> Self::State {}
 
     fn get_param<'w, 's>(_world: &'w World, _state: &'s mut Self::State) -> Self::Item<'w, 's> {}
-
-    fn access() -> AccessSet {
-        AccessSet::new()
-    }
 }
 
 impl<'w, T: Resource> SystemParam for Res<'w, T> {
@@ -92,10 +93,8 @@ impl<'w, T: Resource> SystemParam for Res<'w, T> {
         )
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::resource::<T>(AccessMode::Read));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::resource::<T>(AccessMode::Read))
     }
 }
 
@@ -123,10 +122,8 @@ impl<'w, T: Resource> SystemParam for ResMut<'w, T> {
         )
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::resource::<T>(AccessMode::Write));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::resource::<T>(AccessMode::Write))
     }
 }
 
@@ -140,10 +137,8 @@ impl<'w, T: Resource> SystemParam for Option<Res<'w, T>> {
         world.resource::<T>().map(Res::new)
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::resource::<T>(AccessMode::Read));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::resource::<T>(AccessMode::Read))
     }
 }
 
@@ -161,7 +156,7 @@ where
         Query::new(world)
     }
 
-    fn access() -> AccessSet {
+    fn access() -> impl Iterator<Item = Access> {
         D::access()
     }
 }
@@ -182,10 +177,8 @@ impl<'w, T: Message> SystemParam for MessageWriter<'w, T> {
         )
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::message::<T>(AccessMode::Write));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::message::<T>(AccessMode::Write))
     }
 }
 
@@ -206,10 +199,8 @@ impl<'w, T: Message> SystemParam for MessageReader<'w, T> {
         )
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::message::<T>(AccessMode::Read));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::message::<T>(AccessMode::Read))
     }
 }
 
@@ -227,10 +218,6 @@ impl<'w, 's> SystemParam for Commands<'w, 's> {
 
     fn apply(world: &mut World, state: &mut Self::State) {
         state.apply(world);
-    }
-
-    fn access() -> AccessSet {
-        AccessSet::new()
     }
 }
 
@@ -264,10 +251,8 @@ macro_rules! impl_system_param_tuple {
                 $($param::apply(world, $param);)+
             }
 
-            fn access() -> AccessSet {
-                let mut set = AccessSet::new();
-                $(set.extend($param::access());)+
-                set
+            fn access() -> impl Iterator<Item = Access> {
+                std::iter::empty() $(.chain($param::access()))+
             }
         }
     };

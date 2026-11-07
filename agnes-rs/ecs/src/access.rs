@@ -123,15 +123,9 @@ impl AccessSet {
         self.entries.is_empty()
     }
 
-    pub(crate) fn push(&mut self, access: Access) {
-        self.entries.push(access);
-    }
-
-    pub(crate) fn extend(&mut self, other: Self) {
-        self.entries.extend(other.entries);
-    }
-
+    /// Appends the accesses of another set, reserving room for all of them.
     pub(crate) fn merge(&mut self, other: &Self) {
+        self.entries.reserve(other.entries.len());
         self.entries.extend_from_slice(&other.entries);
     }
 
@@ -151,31 +145,46 @@ impl AccessSet {
     }
 }
 
+impl FromIterator<Access> for AccessSet {
+    /// Collects accesses into one allocation.
+    ///
+    /// Query and parameter access declarations are iterators with exact size
+    /// hints, so the backing vector is allocated once.
+    fn from_iter<I: IntoIterator<Item = Access>>(iter: I) -> Self {
+        Self {
+            entries: iter.into_iter().collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Access, AccessMode, AccessSet};
 
     #[test]
     fn reads_do_not_conflict() {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<u32>(AccessMode::Read));
-        set.push(Access::component::<u32>(AccessMode::Read));
+        let set = AccessSet::from_iter([
+            Access::component::<u32>(AccessMode::Read),
+            Access::component::<u32>(AccessMode::Read),
+        ]);
         assert!(set.conflicts().is_none());
     }
 
     #[test]
     fn read_and_write_conflict() {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<u32>(AccessMode::Read));
-        set.push(Access::component::<u32>(AccessMode::Write));
+        let set = AccessSet::from_iter([
+            Access::component::<u32>(AccessMode::Read),
+            Access::component::<u32>(AccessMode::Write),
+        ]);
         assert!(set.conflicts().is_some());
     }
 
     #[test]
     fn different_namespaces_do_not_conflict() {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<u32>(AccessMode::Write));
-        set.push(Access::resource::<u32>(AccessMode::Write));
+        let set = AccessSet::from_iter([
+            Access::component::<u32>(AccessMode::Write),
+            Access::resource::<u32>(AccessMode::Write),
+        ]);
         assert!(set.conflicts().is_none());
     }
 }

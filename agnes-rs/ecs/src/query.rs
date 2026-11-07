@@ -1,8 +1,9 @@
+use std::any::TypeId;
 use std::cell::{Ref, RefMut};
 use std::marker::PhantomData;
 
-use crate::access::{Access, AccessMode, AccessSet};
-use crate::component::Component;
+use crate::access::{Access, AccessMode};
+use crate::component::{Component, ErasedStorage};
 use crate::entity::Entity;
 use crate::world::World;
 
@@ -18,7 +19,23 @@ pub trait QueryData {
     fn fetch<'w>(world: &'w World, entity: Entity) -> Option<Self::Item<'w>>;
 
     /// The component accesses required by this data.
-    fn access() -> AccessSet;
+    ///
+    /// This is a declaration-time value: callers collect it once when a
+    /// system is registered, so returning an iterator keeps the per-component
+    /// declarations allocation-free.
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::empty()
+    }
+
+    /// The components every match must have, in declaration order.
+    ///
+    /// Iteration is driven by the smallest of these component storages, so
+    /// only entities carrying at least one of them are visited. A query with
+    /// no required component (only [`Entity`] or [`Option`] data) falls back
+    /// to walking live entities.
+    fn required_components() -> impl Iterator<Item = TypeId> {
+        std::iter::empty()
+    }
 }
 
 impl<T: Component> QueryData for &T {
@@ -28,10 +45,12 @@ impl<T: Component> QueryData for &T {
         world.get::<T>(entity)
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<T>(AccessMode::Read));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::component::<T>(AccessMode::Read))
+    }
+
+    fn required_components() -> impl Iterator<Item = TypeId> {
+        std::iter::once(TypeId::of::<T>())
     }
 }
 
@@ -42,10 +61,12 @@ impl<T: Component> QueryData for &mut T {
         world.get_mut::<T>(entity)
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<T>(AccessMode::Write));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::component::<T>(AccessMode::Write))
+    }
+
+    fn required_components() -> impl Iterator<Item = TypeId> {
+        std::iter::once(TypeId::of::<T>())
     }
 }
 
@@ -61,10 +82,8 @@ impl<T: Component> QueryData for Option<&T> {
         Some(world.get::<T>(entity))
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<T>(AccessMode::Read));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::component::<T>(AccessMode::Read))
     }
 }
 
@@ -79,10 +98,8 @@ impl<T: Component> QueryData for Option<&mut T> {
         Some(world.get_mut::<T>(entity))
     }
 
-    fn access() -> AccessSet {
-        let mut set = AccessSet::new();
-        set.push(Access::component::<T>(AccessMode::Write));
-        set
+    fn access() -> impl Iterator<Item = Access> {
+        std::iter::once(Access::component::<T>(AccessMode::Write))
     }
 }
 
@@ -96,10 +113,6 @@ impl QueryData for Entity {
     fn fetch<'w>(_world: &'w World, entity: Entity) -> Option<Self::Item<'w>> {
         Some(entity)
     }
-
-    fn access() -> AccessSet {
-        AccessSet::new()
-    }
 }
 
 macro_rules! impl_query_data_tuple {
@@ -111,10 +124,12 @@ macro_rules! impl_query_data_tuple {
                 Some(($($name::fetch(world, entity)?,)+))
             }
 
-            fn access() -> AccessSet {
-                let mut set = AccessSet::new();
-                $(set.extend($name::access());)+
-                set
+            fn access() -> impl Iterator<Item = Access> {
+                std::iter::empty() $(.chain($name::access()))+
+            }
+
+            fn required_components() -> impl Iterator<Item = TypeId> {
+                std::iter::empty() $(.chain($name::required_components()))+
             }
         }
     };
@@ -138,6 +153,15 @@ pub struct Without<T>(PhantomData<T>);
 pub trait QueryFilter {
     /// Whether the entity passes the filter.
     fn matches(world: &World, entity: Entity) -> bool;
+
+    /// The components every match must have, in declaration order.
+    ///
+    /// Filters such as [`With`] can drive iteration without declaring read
+    /// access to the component; filters that only exclude entities
+    /// ([`Without`]) yield nothing.
+    fn required_components() -> impl Iterator<Item = TypeId> {
+        std::iter::empty()
+    }
 }
 
 impl QueryFilter for () {
@@ -149,6 +173,10 @@ impl QueryFilter for () {
 impl<T: Component> QueryFilter for With<T> {
     fn matches(world: &World, entity: Entity) -> bool {
         world.contains::<T>(entity)
+    }
+
+    fn required_components() -> impl Iterator<Item = TypeId> {
+        std::iter::once(TypeId::of::<T>())
     }
 }
 
@@ -168,6 +196,15 @@ impl<T: Component> QueryFilter for Without<T> {
 ///     agent.active = true;
 /// }
 /// ```
+///
+/// Iteration is driven by the smallest component storage among the query's
+/// required components — every `&T`, `&mut T`, and `With<T>` — so it visits
+/// only entities that carry at least one of them. Queries without a required
+/// component ([`Entity`], [`Option`] data, or a lone [`Without`]) fall back to
+/// walking live entities.
+///
+/// Matches are yielded in storage order, which is insertion order modified by
+/// removals; no ordering is guaranteed.
 pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     world: &'w World,
     marker: PhantomData<(D, F)>,
@@ -191,12 +228,17 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
 
     /// Iterates all matching entities.
     ///
-    /// The iterator allocates nothing: it keeps a cursor into the entity
-    /// allocator and re-borrows the allocator only while advancing, then
-    /// filters lazily with one component-storage lookup per entity.
+    /// The iterator allocates nothing. When the query requires a component,
+    /// it walks that component's dense storage, so the cost scales with the
+    /// number of entities carrying the component rather than with all entity
+    /// slots. Queries without a required component walk live entities
+    /// instead. Filters are applied lazily, one component-storage lookup per
+    /// candidate.
+    ///
     /// Entities reserved through [`Commands`](crate::Commands) from the loop
-    /// body are not alive yet and are skipped; the per-step borrow keeps that
-    /// safe.
+    /// body are not alive yet and are skipped. Structural changes cannot
+    /// happen mid-iteration: they require `&mut World` and are applied after
+    /// the system returns.
     ///
     /// # Panics
     ///
@@ -205,6 +247,10 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     pub fn iter(&self) -> QueryIter<'w, D, F> {
         QueryIter {
             world: self.world,
+            source: select_source(
+                self.world,
+                D::required_components().chain(F::required_components()),
+            ),
             cursor: 0,
             marker: PhantomData,
         }
@@ -254,26 +300,43 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
 
     /// The number of matching entities.
     ///
-    /// Walks the entity allocator directly, so this never allocates.
+    /// Uses the same storage-driven walk as [`Query::iter`] and never
+    /// allocates.
     pub fn count(&self) -> usize {
-        self.world
-            .count_alive(|entity| filtered_fetch::<D, F>(self.world, entity).is_some())
+        self.iter().count()
     }
 
     /// Whether no entity matches.
     ///
-    /// Walks the entity allocator directly and stops at the first match, so
-    /// this never allocates.
+    /// Uses the same storage-driven walk as [`Query::iter`] and stops at the
+    /// first match, so this never allocates.
     pub fn is_empty(&self) -> bool {
-        !self
-            .world
-            .any_alive(|entity| filtered_fetch::<D, F>(self.world, entity).is_some())
+        self.iter().next().is_none()
     }
 }
 
+/// Where a [`QueryIter`] gets its candidate entities from.
+#[derive(Clone, Copy)]
+enum IterSource<'w> {
+    /// A required component has no storage, so nothing can match.
+    Empty,
+    /// Walks one component's dense array; `len` is snapshotted at creation.
+    Dense {
+        storage: &'w dyn ErasedStorage,
+        len: usize,
+    },
+    /// No required component: walks every live entity.
+    Entities,
+}
+
 /// The iterator returned by [`Query::iter`] and [`Query::iter_mut`].
+///
+/// When a required component drives it, the iterator walks that component's
+/// dense array, so only entities carrying the component are visited. Otherwise
+/// it falls back to walking live entities.
 pub struct QueryIter<'w, D: QueryData, F: QueryFilter> {
     world: &'w World,
+    source: IterSource<'w>,
     cursor: usize,
     marker: PhantomData<(D, F)>,
 }
@@ -282,17 +345,62 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
     type Item = D::Item<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(entity) = self.world.next_alive(&mut self.cursor) {
-            if let Some(item) = filtered_fetch::<D, F>(self.world, entity) {
-                return Some(item);
+        match self.source {
+            IterSource::Empty => None,
+            IterSource::Dense { storage, len } => {
+                while self.cursor < len {
+                    let slot = self.cursor;
+                    self.cursor += 1;
+                    let Some(entity) = storage.dense_entity_at(slot) else {
+                        continue;
+                    };
+                    if let Some(item) = filtered_fetch::<D, F>(self.world, entity) {
+                        return Some(item);
+                    }
+                }
+                None
+            }
+            IterSource::Entities => {
+                while let Some(entity) = self.world.next_alive(&mut self.cursor) {
+                    if let Some(item) = filtered_fetch::<D, F>(self.world, entity) {
+                        return Some(item);
+                    }
+                }
+                None
             }
         }
-        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.world.slot_count().saturating_sub(self.cursor);
+        let remaining = match self.source {
+            IterSource::Empty => 0,
+            IterSource::Dense { len, .. } => len.saturating_sub(self.cursor),
+            IterSource::Entities => self.world.slot_count().saturating_sub(self.cursor),
+        };
         (0, Some(remaining))
+    }
+}
+
+/// Picks the iteration source for a query.
+///
+/// The smallest required component storage drives the walk, so the cost
+/// tracks the rarest component instead of every entity slot. A missing
+/// storage means no entity can carry that component, so the iterator is
+/// empty.
+fn select_source<'w>(world: &'w World, required: impl Iterator<Item = TypeId>) -> IterSource<'w> {
+    let mut smallest: Option<(&'w dyn ErasedStorage, usize)> = None;
+    for type_id in required {
+        let Some(storage) = world.erased_storage(type_id) else {
+            return IterSource::Empty;
+        };
+        let len = storage.dense_len();
+        if smallest.is_none_or(|(_, best)| len < best) {
+            smallest = Some((storage, len));
+        }
+    }
+    match smallest {
+        Some((storage, len)) => IterSource::Dense { storage, len },
+        None => IterSource::Entities,
     }
 }
 
@@ -386,6 +494,57 @@ mod tests {
         let query = Query::<&'static Name, Without<Running>>::new(&world);
         let idle: Vec<&'static str> = query.iter().map(|name| name.0).collect();
         assert_eq!(idle, ["idle"]);
+    }
+
+    #[test]
+    fn a_with_filter_alone_drives_iteration() {
+        let mut world = World::new();
+        let first = world.spawn_bundle((Name("a"), Running));
+        world.spawn(Name("b"));
+        let third = world.spawn(Running);
+
+        let found: Vec<crate::Entity> = Query::<crate::Entity, With<Running>>::new(&world)
+            .iter()
+            .collect();
+        assert_eq!(found, [first, third]);
+    }
+
+    #[test]
+    fn data_and_filter_both_restrict_matches() {
+        let mut world = World::new();
+        world.spawn_bundle((Name("tagged"), Running));
+        world.spawn(Name("untagged"));
+        world.spawn(Running);
+
+        let query = Query::<&'static Name, With<Running>>::new(&world);
+        assert_eq!(query.count(), 1);
+        assert_eq!(query.single().expect("one match").0, "tagged");
+    }
+
+    #[test]
+    fn iteration_skips_removed_dense_entries() {
+        let mut world = World::new();
+        world.spawn(Name("a"));
+        let removed = world.spawn(Name("b"));
+        world.spawn(Name("c"));
+
+        assert_eq!(world.remove::<Name>(removed), Some(Name("b")));
+
+        let names: Vec<&'static str> = Query::<&'static Name>::new(&world)
+            .iter()
+            .map(|name| name.0)
+            .collect();
+        assert_eq!(names, ["a", "c"]);
+    }
+
+    #[test]
+    fn a_missing_storage_matches_nothing() {
+        let world = World::new();
+        let query = Query::<&'static Running>::new(&world);
+
+        assert!(query.is_empty());
+        assert_eq!(query.count(), 0);
+        assert_eq!(query.iter().count(), 0);
     }
 
     #[test]

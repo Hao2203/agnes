@@ -195,7 +195,7 @@ where
         Self {
             function,
             state: None,
-            access: <F::In as SystemParam>::access(),
+            access: AccessSet::from_iter(<F::In as SystemParam>::access()),
             marker: PhantomData,
         }
     }
