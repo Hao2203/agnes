@@ -1,16 +1,19 @@
 //! 消息管线：一组系统按注册顺序解释 [`agnes_core::agent`] 的阶段转移。
 //!
-//! 每个 tick 的推进与旧驱动的检查点一一对应；事件的三步落地（日志、
-//! 会话、上报）在 [`record`] 里完成 —— 会话落盘经 [`RunEvent`] 消息由
-//! `agnes-plugin-session` 异步完成，耐久门禁见 [`issue_model_call`]。
-//! turn 实体经 [`TurnOwner`] 回指所属 agent 实体，日志与耐久、待处理
-//! 队列都按 owner 路由，多个 agent 的管线互不串扰。
+//! 每个 turn 请求是一个实体：提交时挂 [`TurnRequest`] + [`TurnQueued`]，
+//! 调度时在**同一实体**上插入 typestate 阶段与时钟，收场时写
+//! [`TurnResponse`]。响应不再经过消息总线，读者缺失或调度提前返回都不会
+//! 让它消失。终态先由各路径写成 [`TurnTerminal`]，再由
+//! [`finalize_requests`] 统一落成响应（恰好一次）。
 //!
-//! 错误分级：系统返回 `Err` 仅用于不变量被破坏（缺资源、任务派发失败）——
-//! 它会短路整个调度；运行期可恢复错误（模型失败、会话失败）一律转为
-//! 失败收场事件与 [`TurnFinished`]，返回 `Ok`。
+//! turn 实体身上的 [`TurnOwner`] 回指所属 agent 实体，日志与耐久都按 owner
+//! 路由，多个 agent 的管线互不串扰。
+//!
+//! 错误分级：系统返回 `Err` 仅用于不变量被破坏（缺资源）—— 它会短路整个
+//! 调度；运行期可恢复错误（模型失败、会话失败、缺 provider、任务派发失败）
+//! 一律转为终态响应，返回 `Ok`。
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use agnes_core::agent::{Advanced, Agent, Replied};
@@ -33,18 +36,24 @@ use jiff::Timestamp;
 
 use super::RequestBuilderResource;
 use super::messages::{
-    ApprovalDecided, InterruptTurn, ToolFinished, TurnFailure, TurnFailureKind, TurnFinished,
+    ApprovalDecided, CancelTurn, InterruptTurn, ToolFinished, TurnFailure, TurnFailureKind,
     TurnRequested, UserMessage,
 };
+use super::request::{
+    TurnQueued, TurnRequest, TurnRequestId, TurnResponded, TurnResponder, TurnResponse,
+    TurnTerminal,
+};
 use super::state::{
-    ActiveTurn, CallPhase, InFlightCall, LlmCallSeq, Staged, ToolCallEntry, TurnClock, TurnFailed,
-    TurnOwner, TurnPhase,
+    ActiveTurn, CallPhase, InFlightCall, LlmCallSeq, Staged, ToolCallEntry, TurnClock, TurnOwner,
+    TurnPhase,
 };
 use crate::approval::{ApprovalChannel, ApprovalRequest};
 use crate::permission::PermissionRules;
 use crate::{AgentCore, Inbox};
 
 const POLICY_DENIER: &str = "permission";
+const CORE_STATE_MISSING: &str = "agent entity has no AgentCore";
+const NO_PROVIDER: &str = "no LLM provider plugin is installed";
 
 /// 绑定一个 agent 的 core 与上报流：一条事件先入日志，再镜像到
 /// [`RunEvent`]（会话落盘与渲染各自消费）。
@@ -131,41 +140,47 @@ fn new_messages(turn: &Turn, before: usize) -> Vec<Message> {
     turn.messages()[before..].to_vec()
 }
 
-/// 一个 agent 实体缺核心状态时的失败原因。
-const CORE_STATE_MISSING: &str = "agent entity has no AgentCore";
-
-/// 一个无法开跑的 turn 请求：记失败事件并立即交出失败结果。
-fn fail_request(
-    run_events: &mut MessageWriter<RunEvent>,
-    finished: &mut MessageWriter<TurnFinished>,
-    agent: Entity,
-    cause: &str,
-) {
-    let at = Timestamp::now();
-    run_events.write(RunEvent {
-        agent,
-        kind: RunEventKind::Failed {
-            at,
-            cause: cause.to_owned(),
-        },
-    });
-    finished.write(TurnFinished {
-        agent,
-        result: Err(TurnFailure {
-            cause: cause.to_owned(),
-            kind: TurnFailureKind::MissingCore,
-        }),
-        started_at: at,
-        finished_at: at,
-    });
+fn missing_core_failure() -> TurnFailure {
+    TurnFailure {
+        cause: CORE_STATE_MISSING.to_owned(),
+        kind: TurnFailureKind::MissingCore,
+    }
 }
 
-/// 让一个进行中的 turn 以失败收场：记失败事件 + 打上 [`TurnFailed`]，
-/// 由 [`close_turn`] 交出 [`TurnFinished`]。不中止整个调度。
+fn model_failure(cause: &str) -> TurnFailure {
+    TurnFailure {
+        cause: cause.to_owned(),
+        kind: TurnFailureKind::Model,
+    }
+}
+
+fn session_failure(cause: String) -> TurnFailure {
+    TurnFailure {
+        cause,
+        kind: TurnFailureKind::Session,
+    }
+}
+
+fn cancelled_failure(cause: &str) -> TurnFailure {
+    TurnFailure {
+        cause: cause.to_owned(),
+        kind: TurnFailureKind::Cancelled,
+    }
+}
+
+fn internal_failure(cause: &str) -> TurnFailure {
+    TurnFailure {
+        cause: cause.to_owned(),
+        kind: TurnFailureKind::Internal,
+    }
+}
+
+/// 让一个请求以失败收场：记失败事件 + 写终态意图，由
+/// [`finalize_requests`] 交出 [`TurnResponse`]。不中止整个调度。
 fn fail_turn(
     commands: &mut Commands,
     run_events: &mut MessageWriter<RunEvent>,
-    turn: Entity,
+    request: Entity,
     agent: Entity,
     failure: TurnFailure,
 ) {
@@ -176,17 +191,17 @@ fn fail_turn(
             cause: failure.cause.clone(),
         },
     });
-    commands.entity(turn).insert(TurnFailed {
-        cause: failure.cause,
-        kind: failure.kind,
+    commands.entity(request).insert(TurnTerminal {
+        result: Err(failure),
+        finished_at: Timestamp::now(),
     });
 }
 
 /// 轮转会话：清空目标 agent 的内存日志。
 ///
 /// 与 `agnes_plugin_session` 的 `session_rotate_durability` 配对，两者各自
-/// 消费独立的 [`RotateSession`] 游标。注册在 `begin_turn` 之前，同一 tick
-/// 内的下一个 turn 从空日志重建。
+/// 消费独立的 [`RotateSession`] 游标。注册在请求调度之前，同一 tick 内的
+/// 下一个 turn 从空日志重建。
 pub fn session_rotate_log(
     mut rotations: MessageReader<RotateSession>,
     mut cores: Query<&mut AgentCore>,
@@ -199,93 +214,83 @@ pub fn session_rotate_log(
     }
 }
 
-/// 目标 agent 丢失核心状态时，把输入队列里的积压请求全部以失败交还，
-/// 避免调用方永久等待。
-fn fail_backlog(
-    run_events: &mut MessageWriter<RunEvent>,
-    finished: &mut MessageWriter<TurnFinished>,
-    agent: Entity,
-    inbox: &mut Inbox,
-) {
-    for _ in inbox.take_turns() {
-        fail_request(run_events, finished, agent, CORE_STATE_MISSING);
-    }
-}
-
-/// turn 开局：目标 agent 已有活跃 turn 就进它的队列，否则从它的日志重建
-/// turn、记开局事件并启动。
+/// 把跨线程/外部客户端提交的 [`TurnRequested`] 落成请求实体。
 ///
-/// 同一 agent 每 tick 只 spawn 一个 turn（spawn 是延迟应用的，本 tick 内
-/// 看不到），其余请求进该 agent 的 [`Inbox`] 队列，收场后依次开跑；不同
-/// agent 的队列互不阻塞。目标实体没有 [`AgentCore`] 时请求直接以失败收场，
-/// 队列中的积压请求一并失败，不影响其他 agent。
-pub fn begin_turn(
-    mut commands: Commands,
-    mut requests: MessageReader<TurnRequested>,
-    turns: Query<(Entity, &TurnOwner), With<ActiveTurn>>,
-    mut cores: Query<(Entity, &mut AgentCore)>,
-    mut inboxes: Query<(Entity, &mut Inbox)>,
-    mut run_events: MessageWriter<RunEvent>,
-    mut finished: MessageWriter<TurnFinished>,
-) {
-    // 本 tick 已忙的 agent：活跃 turn 的归属 + 本 tick 刚 spawn 的（Commands
-    // 延迟应用，查询看不到新实体）。查询快照只取一次，避免每个请求都重新
-    // 遍历实体并分配。
-    let mut busy: Vec<Entity> = turns.iter().map(|(_, owner)| owner.0).collect();
+/// 本系统常驻注册：请求一旦提交就进入世界，不会因为“没有人读消息”而消失。
+pub fn ingest_requests(mut commands: Commands, mut requests: MessageReader<TurnRequested>) {
     for request in requests.read() {
-        let agent = request.agent;
-        let Some((_, mut core)) = cores.get_mut(agent) else {
-            if let Some((_, mut inbox)) = inboxes.get_mut(agent) {
-                fail_backlog(&mut run_events, &mut finished, agent, &mut inbox);
-            }
-            fail_request(&mut run_events, &mut finished, agent, CORE_STATE_MISSING);
-            continue;
-        };
-        let Some((_, mut inbox)) = inboxes.get_mut(agent) else {
-            fail_request(&mut run_events, &mut finished, agent, CORE_STATE_MISSING);
-            continue;
-        };
-        if busy.contains(&agent) {
-            inbox.push_turn(Arc::clone(&request));
-            continue;
-        }
-        let mut recorder = Recorder {
-            core: &mut core,
-            run_events: &mut run_events,
-        };
-        spawn_turn(&mut commands, &mut recorder, agent, &request.config);
-        busy.push(agent);
-    }
-    // 缓冲的请求：该 agent 没有活跃 turn 时开跑一个，下一个等收场后的 tick。
-    for (agent, mut inbox) in inboxes.iter_mut() {
-        if busy.contains(&agent) {
-            continue;
-        }
-        let Some(request) = inbox.pop_turn() else {
-            continue;
-        };
-        let Some((_, mut core)) = cores.get_mut(agent) else {
-            fail_request(&mut run_events, &mut finished, agent, CORE_STATE_MISSING);
-            fail_backlog(&mut run_events, &mut finished, agent, &mut inbox);
-            continue;
-        };
-        let mut recorder = Recorder {
-            core: &mut core,
-            run_events: &mut run_events,
-        };
-        spawn_turn(&mut commands, &mut recorder, agent, &request.config);
-        busy.push(agent);
+        crate::host::submit_turn(
+            &mut commands,
+            request.id,
+            request.agent,
+            request.config.clone(),
+            request.responder.clone(),
+        );
     }
 }
 
-/// spawn 一个 turn 实体：从所属 agent 的日志重建机器、记开局事件（header、
-/// goal 消息、turn 边界）并启动到待调用阶段。
+/// 调度：从排队请求里按 id 顺序为每个空闲 agent 启动最早的一条。
 ///
-/// 调用方已通过 `begin_turn` 的入口校验，并把同一个 core guard 交进来；
-/// 这里不再二次查找。
-fn spawn_turn(
+/// 同一 agent 每 tick 只启动一个请求，其余保持 `TurnQueued`；不同 agent
+/// 互不阻塞。目标实体没有 [`AgentCore`] 时请求直接以失败终态收场；会话
+/// 已 fail-closed 时整队以 `Session` 失败收场，不再等待。
+pub fn schedule_turns(
+    mut commands: Commands,
+    mut cores: Query<(Entity, &mut AgentCore, Option<&Durability>)>,
+    running: Query<&TurnOwner, With<ActiveTurn>>,
+    queued: Query<(Entity, &TurnRequest, &TurnQueued)>,
+    mut run_events: MessageWriter<RunEvent>,
+) {
+    let mut busy: HashSet<Entity> = running.iter().map(|owner| owner.0).collect();
+    let mut pending: Vec<(Entity, TurnRequestId, Entity)> = queued
+        .iter()
+        .map(|(entity, request, _)| (entity, request.id, request.agent))
+        .collect();
+    pending.sort_unstable_by_key(|(_, id, _)| *id);
+
+    for (entity, _, agent) in pending {
+        if busy.contains(&agent) {
+            continue;
+        }
+        let Some((_, mut core, durability)) = cores.get_mut(agent) else {
+            fail_turn(
+                &mut commands,
+                &mut run_events,
+                entity,
+                agent,
+                missing_core_failure(),
+            );
+            continue;
+        };
+        if let Some(cause) = durability.and_then(|durability| durability.failed.clone()) {
+            fail_turn(
+                &mut commands,
+                &mut run_events,
+                entity,
+                agent,
+                session_failure(cause),
+            );
+            continue;
+        }
+        let Some((_, request, _)) = queued.get(entity) else {
+            continue;
+        };
+        let config = request.config.clone();
+        let mut recorder = Recorder {
+            core: &mut core,
+            run_events: &mut run_events,
+        };
+        start_turn(&mut commands, &mut recorder, entity, agent, &config);
+        busy.insert(agent);
+    }
+}
+
+/// 在请求实体上启动 turn：从所属 agent 的日志重建机器、记开局事件
+/// （header、goal 消息、turn 边界），并挂上运行期组件。
+fn start_turn(
     commands: &mut Commands,
     recorder: &mut Recorder<'_, '_>,
+    request: Entity,
     agent: Entity,
     config: &AgentConfig,
 ) {
@@ -319,15 +324,18 @@ fn spawn_turn(
         None => Staged::AwaitingCall(Agent::new(turn).start()),
     };
     recorder.record(agent, RecordEvent::TurnStart);
-    commands.spawn_bundle((
-        TurnPhase::new(staged),
-        TurnClock {
-            started_at,
-            cancellation: CancelToken::new(),
-        },
-        TurnOwner(agent),
-        ActiveTurn,
-    ));
+    commands
+        .entity(request)
+        .remove::<TurnQueued>()
+        .insert_bundle((
+            TurnPhase::new(staged),
+            TurnClock {
+                started_at,
+                cancellation: CancelToken::new(),
+            },
+            TurnOwner(agent),
+            ActiveTurn,
+        ));
 }
 
 /// 注入排空：用户消息只在目标 agent 的待调用阶段并入会话，其余场合在该
@@ -398,12 +406,14 @@ pub fn inject_pending(
 
 /// turn 进行中丢失核心状态：让受影响的 turn 以失败收场，不中止调度。
 ///
-/// 注册在 `begin_turn` 之后、其余 turn 系统之前：同 tick 内新 spawn 的 turn
+/// 注册在 `schedule_turns` 之后、其余 turn 系统之前：同 tick 内新启动的 turn
 /// 也会被检查；被摘除 `AgentCore` 的 agent 不再影响其他 agent 的调度。
+/// 排队请求由 `schedule_turns` 在同一 tick 收口。
 pub fn fail_on_missing_core(
     mut commands: Commands,
     cores: Query<&AgentCore>,
     mut phases: Query<(Entity, &TurnOwner, &mut TurnPhase)>,
+    queued: Query<(Entity, &TurnRequest, Option<&TurnTerminal>), With<TurnQueued>>,
     mut run_events: MessageWriter<RunEvent>,
 ) {
     for (entity, owner, mut phase) in phases.iter_mut() {
@@ -416,17 +426,27 @@ pub fn fail_on_missing_core(
             &mut run_events,
             entity,
             owner.0,
-            TurnFailure {
-                cause: CORE_STATE_MISSING.to_owned(),
-                kind: TurnFailureKind::MissingCore,
-            },
+            missing_core_failure(),
+        );
+    }
+    // 排队请求：agent 核心已丢失时整队收口（`schedule_turns` 已写过终态的
+    // 请求会被跳过，避免重复失败事件）。
+    for (entity, request, terminal) in queued.iter() {
+        if terminal.is_some() || cores.get(request.agent).is_some() {
+            continue;
+        }
+        fail_turn(
+            &mut commands,
+            &mut run_events,
+            entity,
+            request.agent,
+            missing_core_failure(),
         );
     }
 }
 
 /// 会话失败是 fail-closed：让该 agent 的活跃 turn 以失败收场，不再发起
-/// 新调用。阶段丢弃（session repairs 兜底），插入 [`TurnFailed`] 标记，由
-/// [`close_turn`] 发出失败结果并清理。
+/// 新调用。排队请求由 `schedule_turns` 收口。
 pub fn fail_on_session_failure(
     mut commands: Commands,
     sessions: Query<(Entity, &Durability), With<AgentCore>>,
@@ -441,62 +461,63 @@ pub fn fail_on_session_failure(
             if owner.0 != root || phase.0.is_none() {
                 continue;
             }
-            run_events.write(RunEvent {
-                agent: root,
-                kind: RunEventKind::Failed {
-                    at: Timestamp::now(),
-                    cause: cause.clone(),
-                },
-            });
             phase.0 = None;
-            commands.entity(entity).insert(TurnFailed {
-                cause: cause.clone(),
-                kind: TurnFailureKind::Session,
-            });
+            fail_turn(
+                &mut commands,
+                &mut run_events,
+                entity,
+                root,
+                session_failure(cause.clone()),
+            );
         }
     }
-}
-
-/// 启动不变量：没有 provider 插件时直接失败，而不是让调用消失在消息总线里。
-pub fn require_provider(provider: Option<Res<LlmProvider>>) -> Result<(), anyhow::Error> {
-    if provider.is_none() {
-        return Err(anyhow::Error::msg(
-            "no LLM provider plugin is installed; add a plugin that installs `LlmProvider`",
-        ));
-    }
-    Ok(())
 }
 
 /// 发出一次模型调用（`LlmCall` 消息），回复经 [`LlmReply`] 回注。
 ///
 /// 耐久门禁是旧驱动的提交边界：请求发出前，该 agent 已记录的日志必须
-/// 已经落盘。在飞调用记在 turn 实体的 [`InFlightCall`] 组件上，回复与
-/// 取消按 id 路由回来。
+/// 已经落盘。没有 provider 时请求以失败终态收场，而不是让整 tick 返回
+/// `Err`、把已写入的响应一起丢掉。
+#[allow(clippy::too_many_arguments)]
 pub fn issue_model_call(
     requests: Res<RequestBuilderResource>,
+    provider: Option<Res<LlmProvider>>,
     mut seq: ResMut<LlmCallSeq>,
     mut cores: Query<(&mut AgentCore, Option<&Durability>)>,
     mut phases: Query<(Entity, &TurnOwner, &mut TurnPhase)>,
     mut outgoing: MessageWriter<LlmCall>,
     mut run_events: MessageWriter<RunEvent>,
     mut commands: Commands,
-) -> Result<(), anyhow::Error> {
+) {
     for (entity, owner, mut phase) in phases.iter_mut() {
         let Some((mut core, durability)) = cores.get_mut(owner.0) else {
             // 核心状态已被摘除；turn 由 fail_on_missing_core 收场。
             continue;
         };
+        if provider.is_none() {
+            if matches!(phase.0, Some(Staged::AwaitingCall(_))) {
+                phase.0 = None;
+                fail_turn(
+                    &mut commands,
+                    &mut run_events,
+                    entity,
+                    owner.0,
+                    model_failure(NO_PROVIDER),
+                );
+            }
+            continue;
+        }
         if durability.is_some_and(|durability| !durability.is_durable()) {
             // 该 agent 本 tick 的记录还没落盘；等确认后再发请求。
             continue;
         }
-        let mut recorder = Recorder {
-            core: &mut core,
-            run_events: &mut run_events,
-        };
         let staged = phase.0.take();
-        let next = match staged {
+        match staged {
             Some(Staged::AwaitingCall(turn)) => {
+                let mut recorder = Recorder {
+                    core: &mut core,
+                    run_events: &mut run_events,
+                };
                 let request = requests.build(turn.turn(), recorder.core.settings());
                 let model = request.model.clone();
                 let turn = turn.call();
@@ -509,13 +530,11 @@ pub fn issue_model_call(
                     model: model.clone(),
                 });
                 outgoing.write(LlmCall { id, request });
-                Some(Staged::AwaitingModel(turn))
+                phase.0 = Some(Staged::AwaitingModel(turn));
             }
-            other => other,
-        };
-        phase.0 = next;
+            other => phase.0 = other,
+        }
     }
-    Ok(())
 }
 
 /// 处理模型回复：按 id 找到挂着 [`InFlightCall`] 的 turn，推进机器（或落
@@ -613,10 +632,7 @@ pub fn process_llm_reply(
                     recorder.run_events,
                     entity,
                     agent,
-                    TurnFailure {
-                        cause: error.to_string(),
-                        kind: TurnFailureKind::Model,
-                    },
+                    model_failure(&error.to_string()),
                 );
                 None
             }
@@ -674,6 +690,7 @@ pub fn gate_tool_calls(
             },
         });
         let request = ApprovalRequest {
+            agent: owner.0,
             call_id: entry.call.id.clone(),
             tool_name: entry.call.name.clone(),
             arguments: entry.call.arguments.clone(),
@@ -698,8 +715,9 @@ pub fn gate_tool_calls(
     }
 }
 
-/// 审批落定：答覆与超时（level-triggered）。批准后做第二次门禁 —— 只认
-/// 新的 deny；Ask 已经问过，不再重问。
+/// 审批落定：答覆与超时（level-triggered）。答覆按 `(agent, call_id)` 匹配，
+/// 避免不同 agent 的同名 call id 串扰。批准后做第二次门禁 —— 只认新的
+/// deny；Ask 已经问过，不再重问。
 pub fn resolve_approvals(
     mut decided: MessageReader<ApprovalDecided>,
     rules: Option<Res<PermissionRules>>,
@@ -726,14 +744,17 @@ pub fn resolve_approvals(
         }
     }
     for decision in decided.read() {
-        let Some((mut entry, owner)) = entries.iter_mut().find(|(entry, _)| {
-            entry.call.id == decision.call_id && matches!(entry.phase, CallPhase::Asked { .. })
+        let Some((mut entry, owner)) = entries.iter_mut().find(|(entry, owner)| {
+            owner.0 == decision.agent
+                && entry.call.id == decision.call_id
+                && matches!(entry.phase, CallPhase::Asked { .. })
         }) else {
             continue;
         };
+        let agent = owner.0;
         if !decision.approved {
             run_events.write(RunEvent {
-                agent: owner.0,
+                agent,
                 kind: RunEventKind::ApprovalResolved {
                     at: Timestamp::now(),
                     call_id: entry.call.id.clone(),
@@ -744,7 +765,7 @@ pub fn resolve_approvals(
             continue;
         }
         run_events.write(RunEvent {
-            agent: owner.0,
+            agent,
             kind: RunEventKind::ApprovalResolved {
                 at: Timestamp::now(),
                 call_id: entry.call.id.clone(),
@@ -752,7 +773,7 @@ pub fn resolve_approvals(
             },
         });
         if let Some(reason) = deny_reason(rules.as_deref(), &entry.call.name) {
-            deny_entry(&mut run_events, owner.0, &mut entry, reason);
+            deny_entry(&mut run_events, agent, &mut entry, reason);
             continue;
         }
         entry.phase = CallPhase::Allowed;
@@ -760,7 +781,8 @@ pub fn resolve_approvals(
 }
 
 /// 派发已放行的调用：记 `ToolExecutionStart`，异步任务与 turn 的取消令牌
-/// 赛跑，打断返回合成的 `not_run`。
+/// 赛跑，打断返回合成的 `not_run`。派发失败转成一次失败的工具结果，不再
+/// 让整个调度返回 `Err`。
 pub fn execute_tools(
     executor: Res<AsyncExecutor>,
     registry: Res<ToolRegistry>,
@@ -769,7 +791,7 @@ pub fn execute_tools(
     mut entries: Query<(Entity, &mut ToolCallEntry)>,
     mut cores: Query<&mut AgentCore>,
     mut run_events: MessageWriter<RunEvent>,
-) -> Result<(), anyhow::Error> {
+) {
     for (entity, mut entry) in entries.iter_mut() {
         if !matches!(entry.phase, CallPhase::Allowed) {
             continue;
@@ -777,7 +799,7 @@ pub fn execute_tools(
         let agent = match owners.get(entry.turn) {
             Some(owner) => owner.0,
             None => {
-                // turn 已收场；它的调用实体由 close_turn 清理，不再派发。
+                // turn 已收场；它的调用实体由 finalize 清理，不再派发。
                 entry.phase = CallPhase::Settled;
                 continue;
             }
@@ -807,25 +829,29 @@ pub fn execute_tools(
         let task_registry = registry.clone();
         let call = entry.call.clone();
         let task_executor = executor.clone();
-        executor
-            .spawn(async move {
-                let output = match token {
-                    Some(token) => tokio::select! {
-                        biased;
-                        () = token.cancelled() => ToolOutput::not_run(),
-                        output = task_registry.execute(&call) => output,
-                    },
-                    None => task_registry.execute(&call).await,
-                };
-                let _ = task_executor.send(ToolFinished {
-                    call: entity,
-                    output,
-                });
-            })
-            .map_err(anyhow::Error::from)?;
-        entry.phase = CallPhase::Running;
+        let spawned = executor.spawn(async move {
+            let output = match token {
+                Some(token) => tokio::select! {
+                    biased;
+                    () = token.cancelled() => ToolOutput::not_run(),
+                    output = task_registry.execute(&call) => output,
+                },
+                None => task_registry.execute(&call).await,
+            };
+            let _ = task_executor.send(ToolFinished {
+                call: entity,
+                output,
+            });
+        });
+        match spawned {
+            Ok(()) => entry.phase = CallPhase::Running,
+            Err(error) => {
+                entry.phase = CallPhase::Denied(ToolOutput::error(format!(
+                    "failed to dispatch the tool task: {error}"
+                )));
+            }
+        }
     }
-    Ok(())
 }
 
 /// 落位：任务回注的结果与门禁合成的拒绝都在这里推进机器。结算顺序按
@@ -924,45 +950,78 @@ pub fn finish_tool_calls(
     }
 }
 
-/// 打断收场：目标 agent 的活跃 turn 按阶段走 [`Agent::interrupted`] 的
-/// 对应路径，取消令牌让 in-flight 任务停下，在飞的模型调用补发
-/// [`LlmCancel`]；迟到的回注消息会被忽略（turn 已消失）。
-pub fn handle_interrupt(
+/// 打断/取消收场：目标 turn 按阶段走 [`Agent::interrupted`] 的对应路径，
+/// 取消令牌让 in-flight 任务停下，在飞的模型调用补发 [`LlmCancel`]；
+/// 迟到的回注消息会被忽略（turn 已消失）。
+///
+/// - [`InterruptTurn`] 按 agent 打断当前 turn，不碰排队请求；
+/// - [`CancelTurn`] 按请求 id 取消：排队中直接终态，运行中走同一条打断路径。
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn handle_turn_cancels(
     mut interrupts: MessageReader<InterruptTurn>,
-    mut phases: Query<(
+    mut cancels: MessageReader<CancelTurn>,
+    mut commands: Commands,
+    mut requests: Query<(
         Entity,
-        &TurnOwner,
-        &mut TurnPhase,
-        &TurnClock,
+        &TurnRequest,
+        Option<&TurnQueued>,
+        Option<&mut TurnPhase>,
+        Option<&TurnClock>,
         Option<&mut InFlightCall>,
     )>,
     mut entries: Query<(&mut ToolCallEntry, &TurnOwner)>,
     mut cores: Query<&mut AgentCore>,
     mut run_events: MessageWriter<RunEvent>,
-    mut cancels: MessageWriter<LlmCancel>,
+    mut llm_cancels: MessageWriter<LlmCancel>,
 ) {
-    let targets: Vec<Entity> = interrupts
+    let interrupt_agents: Vec<Entity> = interrupts
         .read()
         .iter()
         .map(|message| message.agent)
         .collect();
-    if targets.is_empty() {
+    let cancel_ids: Vec<TurnRequestId> = cancels
+        .read()
+        .iter()
+        .map(|message| message.request)
+        .collect();
+    if interrupt_agents.is_empty() && cancel_ids.is_empty() {
         return;
     }
+
     let mut interrupted: Vec<Entity> = Vec::new();
-    for (entity, owner, mut phase, clock, mut in_flight) in phases.iter_mut() {
-        if !targets.contains(&owner.0) {
+    for (entity, request, queued, phase, clock, in_flight) in requests.iter_mut() {
+        let by_agent = interrupt_agents.contains(&request.agent);
+        let by_id = cancel_ids.contains(&request.id);
+        if !by_agent && !by_id {
             continue;
         }
-        clock.cancellation.cancel();
-        if let Some(call) = in_flight.as_deref_mut() {
-            cancels.write(LlmCancel { id: call.id });
+        if queued.is_some() {
+            // agent 级打断不碰排队请求；按 id 取消则直接收口。
+            if by_id {
+                fail_turn(
+                    &mut commands,
+                    &mut run_events,
+                    entity,
+                    request.agent,
+                    cancelled_failure("the request was cancelled before it started"),
+                );
+            }
+            continue;
         }
-        let Some(mut core) = cores.get_mut(owner.0) else {
+        let Some(mut phase) = phase else {
+            continue;
+        };
+        if let Some(clock) = clock {
+            clock.cancellation.cancel();
+        }
+        if let Some(call) = in_flight {
+            llm_cancels.write(LlmCancel { id: call.id });
+        }
+        let Some(mut core) = cores.get_mut(request.agent) else {
             // 核心状态已被摘除；turn 由 fail_on_missing_core 收场。
             continue;
         };
-        let agent = owner.0;
+        let agent = request.agent;
         let mut recorder = Recorder {
             core: &mut core,
             run_events: &mut run_events,
@@ -1025,68 +1084,123 @@ pub fn handle_interrupt(
     }
 }
 
-/// 收场清理：正常收场的 turn 发 [`TurnFinished`]，失败收场的发
-/// [`TurnFinished`]（带原因）；随后 despawn turn 与它的工具调用实体。
+/// 收场意图：正常收场的 turn 写 [`TurnTerminal`]（携带结果）。
+///
+/// 失败/取消路径已经直接写了终态；本系统只处理机器走到 `Closed` 的正常
+/// 收场。响应由 [`finalize_requests`] 统一落成。
 pub fn close_turn(
     mut commands: Commands,
     mut phases: Query<(Entity, &TurnOwner, &mut TurnPhase)>,
-    failures: Query<&TurnFailed>,
-    clocks: Query<&TurnClock>,
-    calls: Query<(Entity, &ToolCallEntry)>,
     mut run_events: MessageWriter<RunEvent>,
-    mut finished: MessageWriter<TurnFinished>,
 ) {
-    let mut closed = Vec::new();
     for (entity, owner, mut phase) in phases.iter_mut() {
-        match phase.0.as_ref() {
-            Some(Staged::Closed(_)) => {
-                let Some(Staged::Closed(turn)) = phase.0.take() else {
-                    continue;
-                };
-                let result: TurnResult = turn.into_result();
-                run_events.write(RunEvent {
-                    agent: owner.0,
-                    kind: RunEventKind::Finished {
-                        at: Timestamp::now(),
-                        outcome: result.outcome,
-                    },
-                });
-                finished.write(TurnFinished {
-                    agent: owner.0,
-                    result: Ok(result),
-                    started_at: clocks
-                        .get(entity)
-                        .map_or_else(Timestamp::now, |clock| clock.started_at),
-                    finished_at: Timestamp::now(),
-                });
-                closed.push(entity);
-            }
-            None => {
-                let Some(failure) = failures.get(entity) else {
-                    continue;
-                };
-                finished.write(TurnFinished {
-                    agent: owner.0,
-                    result: Err(TurnFailure {
-                        cause: failure.cause.clone(),
-                        kind: failure.kind,
-                    }),
-                    started_at: clocks
-                        .get(entity)
-                        .map_or_else(Timestamp::now, |clock| clock.started_at),
-                    finished_at: Timestamp::now(),
-                });
-                closed.push(entity);
-            }
-            _ => {}
+        if !matches!(phase.0, Some(Staged::Closed(_))) {
+            continue;
         }
+        let Some(Staged::Closed(turn)) = phase.0.take() else {
+            continue;
+        };
+        let result: TurnResult = turn.into_result();
+        run_events.write(RunEvent {
+            agent: owner.0,
+            kind: RunEventKind::Finished {
+                at: Timestamp::now(),
+                outcome: result.outcome,
+            },
+        });
+        commands.entity(entity).insert(TurnTerminal {
+            result: Ok(result),
+            finished_at: Timestamp::now(),
+        });
     }
-    for turn in closed {
+}
+
+/// 防御性收口：阶段被取走却没有留下终态意图的请求。
+///
+/// 正常转移总是把阶段放回；这里兜住未来新增路径的遗漏，避免实体静默泄漏。
+pub fn fail_on_dropped_phase(
+    mut commands: Commands,
+    phases: Query<(
+        Entity,
+        &TurnPhase,
+        Option<&TurnTerminal>,
+        Option<&TurnResponse>,
+    )>,
+) {
+    for (entity, phase, terminal, response) in phases.iter() {
+        if phase.0.is_some() || terminal.is_some() || response.is_some() {
+            continue;
+        }
+        commands.entity(entity).insert(TurnTerminal {
+            result: Err(internal_failure(
+                "turn phase was dropped without a terminal state",
+            )),
+            finished_at: Timestamp::now(),
+        });
+    }
+}
+
+/// 唯一收口：把 [`TurnTerminal`] 落成 [`TurnResponse`]，恰好一次。
+///
+/// 同时移除运行期组件、清理工具调用实体；有 [`TurnResponder`] 时推送并
+/// 标记回收，没有则保留实体供宿主拉取。
+#[allow(clippy::type_complexity)]
+pub fn finalize_requests(
+    mut commands: Commands,
+    requests: Query<(
+        Entity,
+        &TurnRequest,
+        &TurnTerminal,
+        Option<&TurnClock>,
+        Option<&TurnResponder>,
+        Option<&TurnResponse>,
+    )>,
+    calls: Query<(Entity, &ToolCallEntry)>,
+) {
+    for (entity, request, terminal, clock, responder, existing) in requests.iter() {
+        if existing.is_some() {
+            continue;
+        }
+        let started_at = clock.map_or(request.submitted_at, |clock| clock.started_at);
+        let response = TurnResponse {
+            id: request.id,
+            agent: request.agent,
+            result: terminal.result.clone(),
+            submitted_at: request.submitted_at,
+            started_at,
+            finished_at: terminal.finished_at,
+        };
+        commands
+            .entity(entity)
+            .insert(response.clone())
+            .remove::<TurnPhase>()
+            .remove::<TurnClock>()
+            .remove::<TurnOwner>()
+            .remove::<ActiveTurn>()
+            .remove::<InFlightCall>()
+            .remove::<TurnTerminal>()
+            .remove::<TurnQueued>();
         for (call_entity, entry) in calls.iter() {
-            if entry.turn == turn {
+            if entry.turn == entity {
                 commands.entity(call_entity).despawn();
             }
         }
-        commands.entity(turn).despawn();
+        if let Some(responder) = responder {
+            responder.send(response);
+            commands.entity(entity).insert(TurnResponded);
+        }
+    }
+}
+
+/// 回收已经通过 [`TurnResponder`] 送达的请求实体。
+///
+/// 拉取式响应不在这里回收：它必须保留到宿主消费为止，即使目标 agent 已经
+/// 消失（`MissingCore` 失败响应正是这种情况）。
+pub fn reap_responded_requests(
+    mut commands: Commands,
+    responded: Query<Entity, With<TurnResponded>>,
+) {
+    for entity in responded.iter() {
+        commands.entity(entity).despawn();
     }
 }

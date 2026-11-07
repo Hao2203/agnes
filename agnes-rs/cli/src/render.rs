@@ -13,13 +13,14 @@ use agnes_agent::AgentCore;
 use agnes_agent::Inbox;
 use agnes_agent::activity::{Activity, Phase};
 use agnes_agent::model::{ModelSettings, ModelSettingsChanged};
-use agnes_agent::runtime::TurnFinished;
+use agnes_agent::runtime::TurnResponse;
 use agnes_core::config::ModelName;
 use agnes_core::llm::StopKind;
 use agnes_core::message::{AssistantMessage, Message};
 use agnes_core::turn::Outcome;
 use agnes_ecs::{
-    App, CancelToken, Entity, MessageReader, Plugin, Query, Res, ResMut, RuntimeSender, Update,
+    App, CancelToken, Commands, Entity, MessageReader, Plugin, Query, Res, ResMut, RuntimeSender,
+    Update,
 };
 use agnes_io::llm::{LlmStreamEvent, LlmStreamUpdate, ModelsListed};
 use agnes_plugin_async::AsyncExecutor;
@@ -189,9 +190,9 @@ struct DisplayState {
 }
 
 /// 已收场、等待落盘确认的 turn 报告。摘要必须在会话耐久之后打印 ——
-/// 否则退出可能抢掉最后一批事件。
+/// 否则退出可能抢掉最后一批事件。条目携带请求实体，打印后 despawn。
 #[derive(Default)]
-struct PendingReport(Option<ReportData>);
+struct PendingReport(Option<(Entity, ReportData)>);
 
 struct ReportData {
     outcome: Outcome,
@@ -474,42 +475,43 @@ fn report_finished(
     executor: Res<AsyncExecutor>,
     sessions: Query<(&AgentCore, Option<&agnes_record::Durability>)>,
     mut inboxes: Query<&mut Inbox>,
-    mut finished: MessageReader<TurnFinished>,
+    responses: Query<(Entity, &TurnResponse)>,
+    mut commands: Commands,
     mut report: ResMut<PendingReport>,
     state: Res<DisplayState>,
 ) {
     if report.0.is_none()
-        && let Some(message) = finished
-            .read()
+        && let Some((entity, response)) = responses
             .iter()
-            .find(|message| message.agent == state.agent)
+            .find(|(_, response)| response.agent == state.agent)
     {
-        let data = match &message.result {
+        let data = match &response.result {
             Ok(result) => ReportData {
                 outcome: result.outcome,
                 usage: result.usage,
                 steps_used: result.steps_used,
-                started_at: message.started_at,
-                finished_at: message.finished_at,
+                started_at: response.started_at,
+                finished_at: response.finished_at,
                 failure: None,
             },
             Err(failure) => ReportData {
                 outcome: Outcome::Interrupted,
                 usage: agnes_core::message::TokenUsage::default(),
                 steps_used: 0,
-                started_at: message.started_at,
-                finished_at: message.finished_at,
+                started_at: response.started_at,
+                finished_at: response.finished_at,
                 failure: Some(failure.cause.clone()),
             },
         };
-        report.0 = Some(data);
+        report.0 = Some((entity, data));
     }
 
-    let Some(data) = report.0.take() else {
+    let Some((request, data)) = report.0.take() else {
         return;
     };
     let Some((core, durability)) = sessions.get(state.agent) else {
-        report.0 = Some(data);
+        // agent 已消失：收口请求实体，避免报告永久挂起。
+        commands.entity(request).despawn();
         return;
     };
     // 会话失败也是终态：没有可等的落盘了。否则要求「已记录的事件全部
@@ -522,7 +524,7 @@ fn report_finished(
     });
     if !durable {
         // 落盘确认未到：报告放回，下一 tick 再试。
-        report.0 = Some(data);
+        report.0 = Some((request, data));
         return;
     }
     match data.failure {
@@ -553,6 +555,7 @@ fn report_finished(
             }
         }
     }
+    commands.entity(request).despawn();
     if state.single_shot {
         executor.cancellation().cancel();
     } else {

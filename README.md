@@ -27,9 +27,13 @@ agnes 采用六边形架构：纯领域核心（类型状态机）与所有 I/O 
   日志单独推导
 - 插件即装配单元：HTTP 传输、模型 provider、会话系统、工具、权限与审批
   都是 ecs `Plugin`，注册顺序即每 tick 的系统执行顺序；插件不建实体、
-  不挂组件 —— 宿主按需 spawn agent 实体并挂核心状态与输入队列，插件间强依赖
-  在注册期断言（漏装/装错顺序当场报错）；拒绝单调（规则无法把拒绝变回
-  放行），运行中输入排队，在 step 边界生效
+  不挂组件 —— 宿主用 `AgentBuilder` 一次挂齐 agent 的核心状态、输入队列与
+  会话能力，插件间强依赖在注册期断言（漏装/装错顺序当场报错）；拒绝单调
+  （规则无法把拒绝变回放行），运行中输入排队，在 step 边界生效
+- 请求即实体、响应即组件：一次 turn 请求从提交到收场是同一个实体，
+  响应落在请求实体的 `TurnResponse` 组件上（可选一次性 `TurnResponder`
+  推送）。请求 id 稳定可关联，排队状态可查询、可按 id 取消，响应不依赖
+  消息读者，读者缺失或调度提前返回都不会丢
 - 工具调用可走审批流：`allowed-once | rejected | cancelled | unavailable`，
   没接审批口即拒绝（fail-closed）
 - 会话日志可落盘：JSONL、单写者、崩溃后补写收尾（绝不重写已有记录）；
@@ -184,16 +188,16 @@ agnes chat --session ./notes/session.jsonl
 | `agnes-plugin-openai` | provider 桥：`LlmCall` 经 `OpenAiCodec` 编码成流式请求，SSE 增量解码并转发 `LlmStreamEvent`，流尾解码回 `LlmReply`；`ListModels` 走缓冲 HTTP 路径回答 `ModelsListed`；装 `LlmProvider` 标记 |
 | `agnes-plugin-session` | 会话系统与状态构造：`session_state(events)` 产出 `SessionState { log, pump, durability }`（log 交给 `AgentCore::new`，pump + durability 挂到 agent 实体）；`SessionPlugin` 只注册 `RunEvent` 转发、flush 确认与耐久基线重置；不碰文件 |
 | `agnes-plugin-session-file` | 会话持久化适配器：`FileStore` 把打开的 `SessionFile` 实现成 `SessionStore` 端口，宿主包成 `SessionStoreResource` 组件挂到 agent 实体；拥有文件句柄、兄弟文件名与重开 |
-| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate、工具注册、权限规则与审批通道；注册期断言强依赖（Session/Model/Tools 先装）。核心状态是宿主挂载的 `AgentCore`（日志 + 模型设置）与 `Inbox`（排队的 turn 请求与待注入用户消息）。`ModelPlugin`：设置投影系统（`ModelSettings` 是 `AgentCore` 的字段，唯一写者）。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时、流式思考字符数），只读、不落盘 |
+| `agnes-agent` | `AgentPlugin`：消息管线驱动 typestate、工具注册、权限规则与审批通道；注册期断言强依赖（Session/Model/Tools 先装）。每个 turn 请求是一个带 `TurnRequest`/`TurnQueued` 的实体，调度后在同一实体上运行 typestate，收场写 `TurnResponse` 组件；`Inbox` 只承载待注入用户消息。`host`：`AgentBuilder` 一次挂齐 `AgentCore`（日志 + 模型设置）、`Inbox`、会话能力与可选 `Activity`，并提供 `submit_turn` / `request_turn`。`ModelPlugin`：设置投影系统（`ModelSettings` 是 `AgentCore` 的字段，唯一写者）。`ActivityPlugin`：运行期可观测状态（phase、step、用量、耗时、流式思考字符数），只读、不落盘 |
 | `agnes-cli` | 二进制 `agnes`：装配 `App`、stdin/审批/Ctrl-C 宿主任务、独立线程的 plain/ratatui 渲染与输入 |
 
 `agnes-transport-reqwest`、`agnes-llm-openai` 与 `agnes-session-file` 是纯
 适配器；`plugin-async` / `plugin-http` / `plugin-openai` / `plugin-session` /
 `plugin-session-file` 提供插件与适配器，`record` 持有词汇、`agent`
-持有管线，互不知晓对方。只有 `agnes-cli` 负责装配可运行的程序：宿主
-先 spawn agent 实体并挂上核心状态与输入队列（`AgentCore::new(log,
-settings)`、`Inbox::default()`）与能力组件（`Activity::default()`、
-`session_state` 的 pump + durability），再注册插件。插件间强依赖由依赖方
+持有管线，互不知晓对方。只有 `agnes-cli` 负责装配可运行的程序：宿主用
+`AgentBuilder` 一次装配 agent 实体（`AgentCore`、`Inbox`、
+`session_state` 的 pump + durability，以及可选的 `Activity` 与持久化
+store），再注册插件。插件间强依赖由依赖方
 在 build 内 `assert!(app.is_plugin_added::<…>())` 强制 —— `OpenAiPlugin`
 断言 `HttpPlugin`，`AgentPlugin` 断言 `SessionPlugin` / `ModelPlugin` /
 `ToolsPlugin`，`RendererPlugin` 断言 `SessionPlugin`；注册
@@ -213,6 +217,16 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
 
 ### 关键设计
 
+- **请求即实体、响应即组件**：`TurnRequested`（跨线程提交）或
+  `host::submit_turn` 生成一个挂 `TurnRequest` + `TurnQueued` 的实体；
+  `TurnRequestSeq` 发放全局唯一 `TurnRequestId`。调度系统按 id 顺序为每个
+  空闲 agent 启动最早的一条，在**同一实体**上插入 typestate 阶段与时钟；
+  收场路径只写 `TurnTerminal` 意图，由 `finalize_requests` 统一落成
+  `TurnResponse`（恰好一次）。响应不再走消息总线：宿主查询组件后 despawn，
+  或提交时挂 `TurnResponder` 等待一次性推送。排队是
+  `Query<(&TurnRequest, &TurnQueued)>`，可查询、可按 id 取消；同一 agent
+  串行、不同 agent 并发。`MissingCore` / 模型失败 / 会话失败 / 打断 /
+  取消都会在该实体上留下响应，调用方不会永久等待。
 - **类型状态机**：`Agent<Ready>` / `Agent<ReadyWithGoal>` →
   `Agent<AwaitingCall>` → `Agent<AwaitingModel>` → `Agent<AwaitingTools>` →
   `Agent<Closed>`；转移消耗当前状态、交还下一个阶段（或携带下一阶段的
@@ -224,13 +238,13 @@ body）与 `HttpStreamEnd` → 桥边解码边发 `LlmStreamEvent`，流尾组�
   记录事件。
 - **每会话核心状态 = 单个组件，能力 = 组件/资源**：每个 agent 是挂
   `AgentCore`（`agnes-agent` 所有，内含 `Log` 与 `ModelSettings`）的实体，
-  `RunEvent` 等消息里的 `agent: Entity` 以它为地址；宿主另挂 `Inbox`
-  （排队的 turn 请求与待注入用户消息）与能力组件（`Activity`、
-  `Durability`、`SessionPump`，以及可选的 `SessionStoreResource`）。
-  核心状态收成一个组件后，部分装配在类型层面不可表示；`Inbox` 独立存放，
-  核心状态丢失时积压请求仍能以失败交还宿主。turn 实体经
-  `TurnOwner` 回指归属，begin_turn 的单 turn 守卫按 agent 隔离 ——
-  多个 agent 在同一世界里并发互不串扰（CLI 本轮仍只装配一个）。真正的
+  `RunEvent` 等消息里的 `agent: Entity` 以它为地址；宿主经 `AgentBuilder`
+  另挂 `Inbox`（待注入用户消息）与能力组件（`Activity`、`Durability`、
+  `SessionPump`，以及可选的 `SessionStoreResource`）。核心状态收成一个
+  组件后，部分装配在类型层面不可表示；turn 请求是独立实体，核心状态丢失
+  时调度系统仍会给每个请求写失败响应。turn 实体经 `TurnOwner` 回指归属，
+  调度的单 turn 守卫按 agent 隔离 —— 多个 agent 在同一世界里并发互不
+  串扰（CLI 本轮仍只装配一个）。真正的
   全局能力保持资源：`AsyncExecutor`、`HttpTransportResource`、`HttpClient`、
   `OpenAiCodec`、`ToolRegistry`、`PermissionRules`、`ApprovalChannel`、
   `LlmProvider`。在飞桥接状态（HTTP 在飞请求、OpenAI 流解码）各自成

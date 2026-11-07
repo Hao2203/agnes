@@ -10,32 +10,32 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agnes_agent::StandardRequestBuilder;
-use agnes_agent::activity::{Activity, ActivityPlugin};
+use agnes_agent::activity::ActivityPlugin;
 use agnes_agent::approval::{ApprovalChannel, ApprovalRequest};
-use agnes_agent::model::{ModelPlugin, ModelSettings};
+use agnes_agent::model::ModelPlugin;
 use agnes_agent::permission::{PermissionRules, Rule};
 use agnes_agent::runtime::{
-    ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnFinished, TurnOwner,
-    TurnRequested, UserMessage,
+    ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin, TurnOwner, TurnQueued,
+    TurnRequest, TurnRequestSeq, UserMessage,
 };
 use agnes_agent::tools::builtin_tools;
-use agnes_agent::{AgentCore, Inbox};
+use agnes_agent::{AgentBuilder, AgentCore, StandardRequestBuilder, submit_turn};
 use agnes_core::config::{ApiKey, StepBudget, SystemPrompt};
 use agnes_core::content::Content;
 use agnes_core::header::{Environment, Header};
 use agnes_core::tool::ToolName;
 use agnes_core::turn::AgentConfig;
 use agnes_ecs::{
-    App, CancelToken, Entity, MessageReader, MessageWriter, Query, Res, RuntimeSender, Update,
+    App, CancelToken, Commands, Entity, MessageReader, MessageWriter, Query, Res, RuntimeSender,
+    Update,
 };
 use agnes_io::tool::ToolRegistry;
 use agnes_plugin_async::TokioPlugin;
 use agnes_plugin_http::HttpPlugin;
 use agnes_plugin_openai::OpenAiPlugin;
-use agnes_plugin_session::{SessionPlugin, SessionState, session_state};
+use agnes_plugin_session::SessionPlugin;
 use agnes_plugin_session_file::FileStore;
-use agnes_record::{Event, SessionStoreResource};
+use agnes_record::{Event, SessionStore};
 use agnes_session_file::{Opened, SessionFile};
 use agnes_transport_reqwest::ReqwestTransport;
 use anyhow::{Context, Result, bail};
@@ -55,10 +55,10 @@ pub struct HostChannels {
     pub shutdown: CancelToken,
 }
 
-/// 宿主侧的固定配置：step 预算与系统提示。
+/// 宿主侧的固定配置：step 预算与本轮 header（工具表在启动时已定型）。
 struct HostConfig {
     budget: StepBudget,
-    system_prompt: SystemPrompt,
+    header: Header,
 }
 
 /// 把用户输入路由进管线：目标 agent 没有活跃 turn 时开新 turn，否则交给
@@ -66,29 +66,35 @@ struct HostConfig {
 ///
 /// 目标 agent 是宿主装配时绑定的 agent 实体句柄，而不是"世界里的第一个"；
 /// `turns` 只匹配带 [`ActiveTurn`] 标记、且归属该 agent 的 turn 实体。
+#[allow(clippy::too_many_arguments)]
 fn dispatch_lines(
     mut lines: MessageReader<TaskLine>,
     turns: Query<(&ActiveTurn, &TurnOwner)>,
+    queued: Query<(&TurnRequest, &TurnQueued)>,
     input: Res<Arc<UserInput>>,
-    registry: Res<ToolRegistry>,
     config: Res<HostConfig>,
-    mut turn_requests: MessageWriter<TurnRequested>,
+    seq: Res<TurnRequestSeq>,
+    mut commands: Commands,
     mut injections: MessageWriter<UserMessage>,
 ) {
     let Some(agent) = input.agent() else {
         return;
     };
-    let busy = turns.iter().any(|(_, owner)| owner.0 == agent);
+    let busy = turns.iter().any(|(_, owner)| owner.0 == agent)
+        || queued.iter().any(|(request, _)| request.agent == agent);
     for line in lines.read() {
         if !busy {
-            turn_requests.write(TurnRequested {
+            submit_turn(
+                &mut commands,
+                seq.next(),
                 agent,
-                config: AgentConfig {
-                    header: session_header(&config.system_prompt, &registry),
+                AgentConfig {
+                    header: config.header.clone(),
                     goal: Some(line.content.clone()),
                     budget: config.budget,
                 },
-            });
+                None,
+            );
         } else {
             injections.write(UserMessage {
                 agent,
@@ -98,22 +104,19 @@ fn dispatch_lines(
     }
 }
 
-/// turn 在飞时维护输入侧的 running 旗标，Ctrl-C 与 stdin 路由都看它。
-/// 只跟踪绑定 agent 的 turn，别的 agent 收场不清这份旗标。
+/// turn 在飞或排队时维护输入侧的 running 旗标，Ctrl-C 与 stdin 路由都看它。
+/// 只跟踪绑定 agent 的请求，别的 agent 收场不清这份旗标。
 fn track_running(
-    mut requests: MessageReader<TurnRequested>,
-    mut finished: MessageReader<TurnFinished>,
+    turns: Query<(&ActiveTurn, &TurnOwner)>,
+    queued: Query<(&TurnRequest, &TurnQueued)>,
     input: Res<Arc<UserInput>>,
 ) {
     let Some(agent) = input.agent() else {
         return;
     };
-    if requests.read().iter().any(|request| request.agent == agent) {
-        input.set_running(true);
-    }
-    if finished.read().iter().any(|message| message.agent == agent) {
-        input.set_running(false);
-    }
+    let busy = turns.iter().any(|(_, owner)| owner.0 == agent)
+        || queued.iter().any(|(request, _)| request.agent == agent);
+    input.set_running(busy);
 }
 
 /// 会话侧装配：恢复的历史事件 + 可选的持久化文件。
@@ -159,26 +162,16 @@ fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<(App, Entity
     let transport = Arc::new(ReqwestTransport::new(REQUEST_TIMEOUT)?);
     let root = std::env::current_dir().context("cannot determine the working directory")?;
 
-    // 核心状态、输入队列与能力组件：宿主创建 agent 实体，一次 spawn 挂齐；
-    // 持久化 store 是可选能力，单独挂。
-    let SessionState {
-        log,
-        pump,
-        durability,
-    } = session_state(&events).context("loading the session")?;
-    let agent = app.world_mut().spawn_bundle((
-        AgentCore::new(log, ModelSettings::new(cli.model.clone(), cli.think)),
-        Inbox::default(),
-        pump,
-        durability,
-        Activity::default(),
-    ));
-    if let Some(file) = file {
-        app.world_mut().insert(
-            agent,
-            SessionStoreResource::new(Arc::new(FileStore::new(file))),
-        );
-    }
+    // 核心状态、输入队列与能力组件由 AgentBuilder 一次挂齐；持久化 store
+    // 是可选能力，随装配一起交给 builder。
+    let store: Option<Arc<dyn SessionStore>> =
+        file.map(|file| Arc::new(FileStore::new(file)) as Arc<dyn SessionStore>);
+    let agent = AgentBuilder::new(cli.model.clone(), cli.think)
+        .restore(events)
+        .store(store)
+        .spawn(&mut app)
+        .context("loading the session")?
+        .entity;
 
     app.add_plugin(HttpPlugin::new(transport))
         .add_plugin(OpenAiPlugin::new(
@@ -189,16 +182,24 @@ fn build_app(mut app: App, cli: &Cli, host: HostAssembly) -> Result<(App, Entity
         .add_plugin(ActivityPlugin)
         .add_plugin(ModelPlugin)
         .insert_resource(rules)
-        .insert_resource(HostConfig {
-            budget: cli.max_steps,
-            system_prompt: SystemPrompt::new(SYSTEM_PROMPT),
-        })
         .insert_resource(RequestBuilderResource::new(Box::new(
             StandardRequestBuilder,
         )))
         .insert_resource(Arc::clone(&input))
         .add_systems(Update, dispatch_lines)
         .add_systems(Update, track_running);
+    // 工具表在注册 ToolsPlugin 后固定；header 只构造一次。
+    let header = {
+        let registry = app
+            .world()
+            .resource::<ToolRegistry>()
+            .expect("ToolsPlugin installs the registry");
+        session_header(&SystemPrompt::new(SYSTEM_PROMPT), &registry)
+    };
+    app.insert_resource(HostConfig {
+        budget: cli.max_steps,
+        header,
+    });
     if let Some(approvals) = approvals {
         app.insert_resource(approvals);
     }
@@ -406,6 +407,7 @@ fn spawn_approver(
             };
             // 答覆经 ECS 消息回注；落定与审计由门禁与 session 插件负责。
             let _ = sender.send_message(agnes_agent::runtime::ApprovalDecided {
+                agent: question.agent,
                 call_id: question.call_id.clone(),
                 approved,
             });

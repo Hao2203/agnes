@@ -132,7 +132,7 @@ impl Turn {
 /// 开局目标消息，以及最多可以启动多少个模型往返。`goal` 为 `None` 时
 /// 直接基于已有会话历史或调用前注入启动。已有会话历史不在这里 —— 它由
 /// 宿主重建进 [`Turn`]。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub header: Header,
     pub goal: Option<Content>,
@@ -193,7 +193,7 @@ impl fmt::Display for StepNumber {
 }
 
 /// turn 收场的结果：怎么收场、用量与走过的 step。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub struct TurnResult {
     pub outcome: Outcome,

@@ -7,24 +7,38 @@
 //! 来自 `agnes_plugin_session::session_state`），本 crate 的插件不 spawn
 //! 实体、不挂组件。
 //!
+//! # 请求即实体
+//!
+//! 一个 turn 请求从提交到收场是**同一个实体**：宿主（或 `ingest_requests`）
+//! 生成挂 [`TurnRequest`] + [`TurnQueued`] 的实体，调度时在同一实体上插入
+//! typestate 阶段与时钟，收场时写入 [`TurnResponse`]。响应不经过消息总线，
+//! 因此没有读者、或某个系统提前返回 `Err`，都不会让响应消失。
+//!
+//! - **请求 id**：[`TurnRequestId`] 由 [`TurnRequestSeq`] 发放，世界与宿主
+//!   线程共享同一 id 空间；它也是取消与日志关联的稳定句柄。
+//! - **队列**：`Query<(&TurnRequest, &TurnQueued)>` 即队列；同一 agent 每
+//!   tick 只启动最早的一条，其余排队。
+//! - **终态**：所有路径先写 [`TurnTerminal`]（内部类型），由
+//!   `finalize_requests` 统一落成 [`TurnResponse`]（恰好一次）。拉取式宿主
+//!   查询组件后 despawn；推送式请求由 [`TurnResponder`] 送达并自动回收。
+//!
 //! # 核心状态、输入队列与能力组件
 //!
 //! - **核心状态（必须）**：[`AgentCore`](crate::AgentCore) 一个组件，内含
-//!   会话日志与模型设置。没有它的 [`TurnRequested`] 不会 panic：`begin_turn`
-//!   立即以 [`TurnFinished`] 的 `Err(TurnFailure { kind: MissingCore, .. })`
-//!   交还宿主（并记一条 `RunEventKind::Failed`）。turn 进行中摘除
-//!   `AgentCore` 由 `fail_on_missing_core` 让该 turn 失败收场，不影响其他
-//!   agent。
-//! - **输入队列（必须）**：[`Inbox`](crate::Inbox) 一个组件，承载排队的
-//!   turn 请求与待注入用户消息。它与核心状态分开存放：核心状态丢失时，
-//!   `begin_turn` 仍能把积压请求以失败交还，调用方不会永久等待。
+//!   会话日志与模型设置。没有它的请求不会 panic：`schedule_turns` 立即写
+//!   [`TurnResponse`] 的 `Err(TurnFailure { kind: MissingCore, .. })`（并记
+//!   一条 `RunEventKind::Failed`）。turn 进行中摘除 `AgentCore` 由
+//!   `fail_on_missing_core` 让该 turn 失败收场，不影响其他 agent。
+//! - **输入队列（必须）**：[`Inbox`](crate::Inbox) 一个组件，只承载待注入的
+//!   用户消息；turn 请求不在这里。
 //! - **能力组件（可选，装了就生效）**：`Activity`（观测）、
 //!   `Durability` / `SessionPump` / `SessionStoreResource`（会话持久化）
 //!   等。能力系统按 `Query<..., With<能力组件>>` 或按实体路由，没有该
 //!   组件的 agent 自然跳过。
 //!
 //! 全局资源（`AsyncExecutor`、`ToolRegistry`、`LlmProvider` 等）是世界
-//! 级基础设施，不属于单个 agent 的能力装配。
+//! 级基础设施，不属于单个 agent 的能力装配。缺 `LlmProvider` 时请求以
+//! `Model` 失败收场，而不是让整 tick 返回 `Err`。
 //!
 //! 外部装配约定 —— 强依赖在 build 内断言，注册顺序即每 tick 系统顺序：
 //!
@@ -35,8 +49,8 @@
 //!   [`AgentCore`](crate::AgentCore) 的字段；
 //! - [`ToolsPlugin`]：**先于本插件**（断言）。工具表由它填充；
 //! - `agnes_io::llm::LlmProvider`：provider 插件安装（如
-//!   `agnes-plugin-openai`）。可替换依赖不断言：`require_provider` 每
-//!   tick 检查，缺失时调度当 tick 即报错，不会让调用消失在消息总线里。
+//!   `agnes-plugin-openai`）。可替换依赖不在注册期断言：缺失时请求以
+//!   `Model` 失败终态收场，不会让调用消失在消息总线里，也不会丢响应。
 //!   运行时不碰网络：它写 `LlmCall` / `LlmCancel` 消息，读 `LlmReply`
 //!   消息；
 //! - [`RequestBuilderResource`]：宿主安装（提示词投影在这里决定）；
@@ -50,10 +64,12 @@
 //!   turn 在飞（输入路由用）。
 //!
 //! 宿主经 `RuntimeSender` 注入 [`TurnRequested`] / [`UserMessage`] /
-//! [`ApprovalDecided`] / [`InterruptTurn`]（前三者与打断都带目标 agent）；
-//! 收场结果经 [`TurnFinished`] 消息交还宿主。
+//! [`ApprovalDecided`] / [`InterruptTurn`] / [`CancelTurn`]（审批与打断都带
+//! 目标 agent）。收场结果不经过消息：查询请求实体上的 [`TurnResponse`]，
+//! 或提交时挂 [`TurnResponder`] 等待推送。
 
 mod messages;
+pub mod request;
 mod state;
 mod systems;
 
@@ -61,8 +77,11 @@ mod systems;
 mod tests;
 
 pub use messages::{
-    ApprovalDecided, InterruptTurn, ToolFinished, TurnFailure, TurnFailureKind, TurnFinished,
+    ApprovalDecided, CancelTurn, InterruptTurn, ToolFinished, TurnFailure, TurnFailureKind,
     TurnRequested, UserMessage,
+};
+pub use request::{
+    TurnQueued, TurnRequest, TurnRequestId, TurnRequestSeq, TurnResponder, TurnResponse,
 };
 pub(crate) use state::InFlightCall;
 pub use state::{ActiveTurn, TurnOwner};
@@ -131,12 +150,13 @@ impl Plugin for AgentPlugin {
         );
         app.init_resource::<ToolRegistry>()
             .init_resource::<LlmCallSeq>()
-            .add_systems(Update, systems::require_provider)
+            .init_resource::<TurnRequestSeq>()
             .add_systems(Update, systems::session_rotate_log)
-            .add_systems(Update, systems::begin_turn)
+            .add_systems(Update, systems::ingest_requests)
+            .add_systems(Update, systems::schedule_turns)
             .add_systems(Update, systems::fail_on_missing_core)
-            .add_systems(Update, systems::handle_interrupt)
             .add_systems(Update, systems::fail_on_session_failure)
+            .add_systems(Update, systems::handle_turn_cancels)
             .add_systems(Update, systems::inject_pending)
             .add_systems(Update, systems::issue_model_call)
             .add_systems(Update, systems::process_llm_reply)
@@ -144,7 +164,10 @@ impl Plugin for AgentPlugin {
             .add_systems(Update, systems::resolve_approvals)
             .add_systems(Update, systems::execute_tools)
             .add_systems(Update, systems::finish_tool_calls)
-            .add_systems(Update, systems::close_turn);
+            .add_systems(Update, systems::close_turn)
+            .add_systems(Update, systems::fail_on_dropped_phase)
+            .add_systems(Update, systems::finalize_requests)
+            .add_systems(Update, systems::reap_responded_requests);
     }
 }
 

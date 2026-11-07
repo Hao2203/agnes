@@ -19,8 +19,9 @@ pub struct ActiveTurn;
 /// 驱动侧动态阶段：机器在运行时以枚举持有，阶段本身提示下一步动作。
 ///
 /// `Option` 只是转移机制的实现细节：系统取走阶段值做消耗式转移，结束后
-/// 放回；取走期间其他系统看到 `None` 并跳过。`None` 且带 [`TurnFailed`]
-/// 标记的 turn 由 `close_turn` 收场清理。
+/// 放回；取走期间其他系统看到 `None` 并跳过。终态由
+/// [`TurnTerminal`](super::request::TurnTerminal) 表达，由
+/// `finalize_requests` 统一收口。
 pub struct TurnPhase(pub(crate) Option<Staged>);
 
 impl TurnPhase {
@@ -60,15 +61,6 @@ pub(crate) struct InFlightCall {
     pub(crate) model: ModelName,
 }
 
-/// 失败收场的标记：阶段已丢弃（session repairs 负责补写收尾事件），
-/// `close_turn` 按它发出 [`TurnFinished`](crate::runtime::TurnFinished)。
-///
-/// `kind` 保留失败类别供宿主程序化处理，`cause` 只用于展示。
-pub struct TurnFailed {
-    pub cause: String,
-    pub kind: super::messages::TurnFailureKind,
-}
-
 /// 一个工具调用在其生命周期里的位置。
 pub(crate) enum CallPhase {
     /// 从模型响应里落成，等待门禁。
@@ -102,7 +94,6 @@ agnes_ecs::component!(
     ActiveTurn,
     TurnPhase,
     TurnClock,
-    TurnFailed,
     ToolCallEntry,
     TurnOwner,
     InFlightCall

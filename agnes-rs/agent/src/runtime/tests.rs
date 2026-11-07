@@ -1,5 +1,5 @@
 //! 消息管线测试：脚本化的 provider 与工具驱动完整 turn，覆盖正常往返、
-//! 工具轮、门禁、审批、打断与失败收场。
+//! 工具轮、门禁、审批、打断、取消与失败收场。
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -15,13 +15,13 @@ use agnes_core::message::{TokenUsage, ToolArguments, ToolCall, ToolCallId, ToolO
 use agnes_core::tool::{JsonSchema, ToolError, ToolName, ToolSpec};
 use agnes_core::turn::{AgentConfig, Outcome};
 use agnes_ecs::{
-    App, Entity, MessageReader, MessageWriter, Query, Res, ResMut, RuntimeSender, Update,
+    App, Commands, Entity, MessageReader, MessageWriter, Query, Res, ResMut, RuntimeSender, Update,
 };
 use agnes_io::http::TransportError;
 use agnes_io::llm::{LlmCall, LlmCancel, LlmError, LlmProvider, LlmReply};
 use agnes_io::tool::Tool;
 use agnes_plugin_async::TokioPlugin;
-use agnes_plugin_session::{SessionPlugin, SessionState, session_state};
+use agnes_plugin_session::SessionPlugin;
 use agnes_record::{
     Durability, Event, HostEvent, RotateSession, RunEvent, RunEventKind, SessionError,
     SessionStore, SessionStoreResource,
@@ -31,15 +31,17 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 
 use super::messages::{
-    ApprovalDecided, InterruptTurn, TurnFailure, TurnFailureKind, TurnFinished, TurnRequested,
+    ApprovalDecided, CancelTurn, InterruptTurn, TurnFailure, TurnFailureKind, TurnRequested,
     UserMessage,
 };
+use super::request::{TurnRequest, TurnRequestId, TurnRequestSeq, TurnResponder, TurnResponse};
 use super::{ActiveTurn, AgentPlugin, RequestBuilderResource, ToolsPlugin};
+use crate::AgentCore;
 use crate::StandardRequestBuilder;
 use crate::approval::ApprovalChannel;
-use crate::model::{ModelPlugin, ModelSettings, SetModel, SetThinking};
+use crate::host::AgentBuilder;
+use crate::model::{ModelPlugin, SetModel, SetThinking};
 use crate::permission::{PermissionRules, Rule};
-use crate::{AgentCore, Inbox};
 
 const MODEL: &str = "test-model";
 
@@ -60,15 +62,31 @@ fn capture(app: &App) -> Capture {
 #[derive(Default, Clone)]
 struct Capture {
     finished: Vec<Result<Outcome, TurnFailure>>,
+    ids: Vec<TurnRequestId>,
+    goals: Vec<Option<String>>,
     run_events: Vec<RunEvent>,
 }
 
-fn capture_finished(mut reader: MessageReader<TurnFinished>, mut capture: ResMut<Capture>) {
-    for message in reader.read() {
-        capture.finished.push(match &message.result {
+/// 拉取式宿主：读取响应组件后 despawn 请求实体，恰好一次。
+fn capture_finished(
+    mut commands: Commands,
+    responses: Query<(Entity, &TurnRequest, &TurnResponse)>,
+    mut capture: ResMut<Capture>,
+) {
+    for (entity, request, response) in responses.iter() {
+        capture.finished.push(match &response.result {
             Ok(result) => Ok(result.outcome),
             Err(failure) => Err(failure.clone()),
         });
+        capture.ids.push(response.id);
+        capture.goals.push(
+            request
+                .config
+                .goal
+                .as_ref()
+                .map(|goal| goal.as_str().to_owned()),
+        );
+        commands.entity(entity).despawn();
     }
 }
 
@@ -249,33 +267,54 @@ fn config(goal: &str) -> AgentConfig {
     }
 }
 
-/// 宿主装配：spawn 一个挂载核心状态、输入队列与会话能力的 agent 实体。
+fn model(name: &str) -> ModelName {
+    ModelName::from_str(name).expect("static model name is valid")
+}
+
+/// 宿主装配：一次挂齐核心状态、输入队列与会话能力。
 fn spawn_agent(app: &mut App) -> Entity {
-    let SessionState {
-        log,
-        pump,
-        durability,
-    } = session_state(&[]).expect("session state");
-    app.world_mut().spawn_bundle((
-        AgentCore::new(
-            log,
-            ModelSettings::new(
-                ModelName::from_str(MODEL).expect("static name is valid"),
-                Thinking::Off,
-            ),
-        ),
-        Inbox::default(),
-        pump,
-        durability,
-    ))
+    AgentBuilder::new(model(MODEL), Thinking::Off)
+        .spawn(app)
+        .expect("agent spawns")
+        .entity
+}
+
+fn seq_of(app: &App) -> TurnRequestSeq {
+    app.world()
+        .resource::<TurnRequestSeq>()
+        .expect("AgentPlugin or AgentBuilder installs the seq")
+        .clone()
+}
+
+/// 从 `World` 直接提交（同步测试用）。
+fn send_request(app: &mut App, agent: Entity, goal: &str) -> TurnRequestId {
+    let id = seq_of(app).next();
+    app.world_mut().send_message(TurnRequested {
+        id,
+        agent,
+        config: config(goal),
+        responder: None,
+    });
+    id
+}
+
+fn submit(sender: &RuntimeSender, seq: &TurnRequestSeq, agent: Entity, goal: &str) {
+    sender
+        .send_message(TurnRequested {
+            id: seq.next(),
+            agent,
+            config: config(goal),
+            responder: None,
+        })
+        .expect("runtime is alive");
 }
 
 fn app(provider: ProviderState) -> App {
     app_with(provider, ToolsPlugin::empty())
 }
 
-/// 只装插件、不 spawn agent 实体：用于装配校验测试。
-fn bare_app() -> App {
+/// 只装插件、不 spawn agent 实体，也不注册任何响应消费者。
+fn bare_app_without_capture() -> App {
     let mut app = App::new();
     app.add_plugin(SessionPlugin)
         .add_plugin(ModelPlugin)
@@ -285,9 +324,16 @@ fn bare_app() -> App {
         .insert_resource(RequestBuilderResource::new(Box::new(
             StandardRequestBuilder,
         )))
-        .insert_resource(Capture::default())
-        .add_systems(Update, capture_finished)
+        .init_resource::<TurnRequestSeq>()
         .add_plugin(TokioPlugin);
+    app
+}
+
+/// 只装插件、不 spawn agent 实体：用于装配校验测试。
+fn bare_app() -> App {
+    let mut app = bare_app_without_capture();
+    app.insert_resource(Capture::default())
+        .add_systems(Update, capture_finished);
     app
 }
 
@@ -342,15 +388,8 @@ async fn drive(mut app: App, seed: impl FnOnce(&RuntimeSender)) -> Capture {
 async fn a_turn_completes_with_a_final_answer() {
     let app = app(ProviderState::default());
     let agent = agent(&app);
-    let capture = drive(app, |sender| {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config("hello"),
-            })
-            .expect("runtime is alive");
-    })
-    .await;
+    let seq = seq_of(&app);
+    let capture = drive(app, |sender| submit(sender, &seq, agent, "hello")).await;
 
     assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
     assert!(matches!(
@@ -372,9 +411,10 @@ async fn a_model_switch_changes_the_next_request() {
     let last = provider.last_handle();
     let mut app = app(provider);
     let agent = agent(&app);
+    let seq = seq_of(&app);
     app.world_mut().send_message(SetModel {
         agent,
-        model: ModelName::from_str("other-model").expect("static name is valid"),
+        model: model("other-model"),
     });
     app.world_mut().send_message(SetThinking {
         agent,
@@ -382,15 +422,7 @@ async fn a_model_switch_changes_the_next_request() {
     });
     app.pump().expect("settings apply");
 
-    let capture = drive(app, |sender| {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config("hello"),
-            })
-            .expect("runtime is alive");
-    })
-    .await;
+    let capture = drive(app, |sender| submit(sender, &seq, agent, "hello")).await;
 
     assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
     let (model, thinking) = last
@@ -425,8 +457,10 @@ async fn the_active_turn_marker_tracks_the_turn_lifecycle() {
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            id: seq_of(&app).next(),
             agent,
             config: config("hold"),
+            responder: None,
         })
         .expect("runtime is alive");
 
@@ -448,17 +482,13 @@ async fn the_active_turn_marker_tracks_the_turn_lifecycle() {
 
 #[tokio::test]
 async fn queued_turn_requests_run_one_after_another() {
-    let mut app = app(ProviderState::default());
+    let app = app(ProviderState::default());
     let agent = agent(&app);
+    let seq = seq_of(&app);
+    let mut app = app;
     let sender = app.runtime_sender();
-    for goal in ["first", "second"] {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config(goal),
-            })
-            .expect("runtime is alive");
-    }
+    submit(&sender, &seq, agent, "first");
+    submit(&sender, &seq, agent, "second");
     for _ in 0..512 {
         app.pump().expect("schedule runs");
         if capture(&app).finished.len() == 2 {
@@ -466,6 +496,13 @@ async fn queued_turn_requests_run_one_after_another() {
             assert_eq!(
                 capture.finished,
                 vec![Ok(Outcome::Answered), Ok(Outcome::Answered)]
+            );
+            assert_eq!(capture.ids.len(), 2, "each response keeps its request id");
+            assert_ne!(capture.ids[0], capture.ids[1]);
+            assert_eq!(
+                capture.goals,
+                vec![Some("first".to_owned()), Some("second".to_owned())],
+                "each response maps back to its own request"
             );
             return;
         }
@@ -487,18 +524,14 @@ async fn each_agent_runs_its_own_turn_concurrently() {
     app.insert_resource(ActiveCount::default());
     app.add_systems(Update, track_active_count);
 
-    // 第二个 agent 实体：宿主按同样的流程 spawn 并挂上核心状态与输入队列。
+    // 第二个 agent 实体：宿主按同样的装配流程 spawn。
     let first = agent(&app);
     let second = spawn_agent(&mut app);
+    let seq = seq_of(&app);
 
     let sender = app.runtime_sender();
     for agent in [first, second] {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config("hold"),
-            })
-            .expect("runtime is alive");
+        submit(&sender, &seq, agent, "hold");
     }
     app.pump().expect("schedule runs");
 
@@ -520,15 +553,8 @@ async fn a_tool_round_runs_the_tool_and_completes() {
         ToolsPlugin::new(Arc::new(EchoTool::new())),
     );
     let agent = agent(&app);
-    let capture = drive(app, |sender| {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config("use the tool"),
-            })
-            .expect("runtime is alive");
-    })
-    .await;
+    let seq = seq_of(&app);
+    let capture = drive(app, |sender| submit(sender, &seq, agent, "use the tool")).await;
 
     assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
     let tool_events = capture
@@ -561,15 +587,8 @@ async fn a_denied_tool_settles_with_a_synthetic_failure() {
         ask: vec![],
     });
     let agent = agent(&app);
-    let capture = drive(app, |sender| {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config("use the tool"),
-            })
-            .expect("runtime is alive");
-    })
-    .await;
+    let seq = seq_of(&app);
+    let capture = drive(app, |sender| submit(sender, &seq, agent, "use the tool")).await;
 
     assert_eq!(capture.finished, vec![Ok(Outcome::Answered)]);
     assert!(
@@ -599,8 +618,10 @@ async fn an_asked_tool_runs_after_the_host_answers() {
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            id: seq_of(&app).next(),
             agent,
             config: config("use the tool"),
+            responder: None,
         })
         .expect("runtime is alive");
 
@@ -615,6 +636,7 @@ async fn an_asked_tool_runs_after_the_host_answers() {
         {
             sender
                 .send_message(ApprovalDecided {
+                    agent,
                     call_id: ToolCallId::new("c1"),
                     approved: true,
                 })
@@ -641,17 +663,19 @@ async fn an_asked_tool_runs_after_the_host_answers() {
 
 #[tokio::test]
 async fn an_interrupt_closes_the_turn_with_a_not_run_result() {
-    let mut app = app_with(
+    let app = app_with(
         ProviderState::with_replies(vec![Ok(tool_response())]),
         ToolsPlugin::new(Arc::new(SlowTool::new())),
     );
-
+    let mut app = app;
     let agent = agent(&app);
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            id: seq_of(&app).next(),
             agent,
             config: config("use the tool"),
+            responder: None,
         })
         .expect("runtime is alive");
 
@@ -698,8 +722,10 @@ async fn an_interrupt_mid_call_cancels_the_model_request() {
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            id: seq_of(&app).next(),
             agent,
             config: config("hello"),
+            responder: None,
         })
         .expect("runtime is alive");
 
@@ -731,14 +757,10 @@ async fn a_failing_model_fails_the_turn_and_the_app_survives() {
         Err(LlmError::Transport(TransportError::Timeout)),
     ]));
     let agent = agent(&app);
+    let seq = seq_of(&app);
     let sender = app.runtime_sender();
     for _ in 0..2 {
-        sender
-            .send_message(TurnRequested {
-                agent,
-                config: config("hello"),
-            })
-            .expect("runtime is alive");
+        submit(&sender, &seq, agent, "hello");
     }
     for _ in 0..256 {
         app.pump().expect("schedule runs");
@@ -778,8 +800,10 @@ async fn a_session_failure_fails_the_turn_and_the_app_survives() {
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            id: seq_of(&app).next(),
             agent,
             config: config("hello"),
+            responder: None,
         })
         .expect("runtime is alive");
 
@@ -795,8 +819,10 @@ async fn a_session_failure_fails_the_turn_and_the_app_survives() {
             // 应用存活：下一个 turn 不再发请求，同样立即失败收场。
             sender
                 .send_message(TurnRequested {
+                    id: seq_of(&app).next(),
                     agent,
                     config: config("again"),
+                    responder: None,
                 })
                 .expect("runtime is alive");
             for _ in 0..256 {
@@ -855,8 +881,10 @@ async fn the_durability_gate_holds_the_request_back() {
     let sender = app.runtime_sender();
     sender
         .send_message(TurnRequested {
+            id: seq_of(&app).next(),
             agent,
             config: config("hello"),
+            responder: None,
         })
         .expect("runtime is alive");
 
@@ -908,10 +936,7 @@ fn agent_plugin_registers_without_an_agent() {
 fn a_turn_request_to_a_non_agent_entity_finishes_with_an_error() {
     let mut app = bare_app();
     let not_an_agent = app.world_mut().spawn_empty();
-    app.world_mut().send_message(TurnRequested {
-        agent: not_an_agent,
-        config: config("hello"),
-    });
+    send_request(&mut app, not_an_agent, "hello");
     app.pump().expect("the schedule runs without panicking");
 
     let capture = capture(&app);
@@ -924,6 +949,57 @@ fn a_turn_request_to_a_non_agent_entity_finishes_with_an_error() {
         TurnFailureKind::MissingCore,
         "the failure is typed, not a message-string match"
     );
+}
+
+#[test]
+fn a_response_is_a_component_not_a_message() {
+    let mut app = bare_app_without_capture();
+    let not_an_agent = app.world_mut().spawn_empty();
+    let id = send_request(&mut app, not_an_agent, "hello");
+    // 没有注册任何响应消费者：响应仍然落在请求实体上。
+    app.pump().expect("the schedule runs");
+    let entity = app
+        .world()
+        .entity_with::<TurnResponse>()
+        .expect("a response component exists");
+    let response = app
+        .world()
+        .get::<TurnResponse>(entity)
+        .expect("response component");
+    assert_eq!(response.id, id);
+    assert!(matches!(
+        response.result,
+        Err(TurnFailure {
+            kind: TurnFailureKind::MissingCore,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_missing_provider_fails_the_request_instead_of_losing_it() {
+    let mut app = App::new();
+    spawn_agent(&mut app);
+    app.add_plugin(SessionPlugin)
+        .add_plugin(ModelPlugin)
+        .add_plugin(ToolsPlugin::empty())
+        .add_plugin(AgentPlugin)
+        .insert_resource(RequestBuilderResource::new(Box::new(
+            StandardRequestBuilder,
+        )))
+        .insert_resource(Capture::default())
+        .add_systems(Update, capture_finished)
+        .add_plugin(TokioPlugin);
+    let agent = agent(&app);
+    send_request(&mut app, agent, "hello");
+    app.pump().expect("the schedule runs without a provider");
+
+    let capture = capture(&app);
+    assert_eq!(capture.finished.len(), 1);
+    assert!(matches!(
+        &capture.finished[0],
+        Err(failure) if failure.kind == TurnFailureKind::Model
+    ));
 }
 
 #[test]
@@ -973,17 +1049,11 @@ fn losing_core_state_fails_the_turn_and_its_queued_requests() {
         ..Default::default()
     });
     let agent = agent(&app);
-    app.world_mut().send_message(TurnRequested {
-        agent,
-        config: config("first"),
-    });
+    send_request(&mut app, agent, "first");
     app.pump().expect("schedule runs");
 
     // The first turn is waiting for a reply; the second request queues.
-    app.world_mut().send_message(TurnRequested {
-        agent,
-        config: config("second"),
-    });
+    send_request(&mut app, agent, "second");
     app.pump().expect("schedule runs");
 
     // The host removes the core state while the turn is in flight.
@@ -1007,14 +1077,8 @@ async fn an_incomplete_agent_does_not_block_a_complete_one() {
     let complete = agent(&app);
     let incomplete = app.world_mut().spawn_empty();
 
-    app.world_mut().send_message(TurnRequested {
-        agent: incomplete,
-        config: config("bad"),
-    });
-    app.world_mut().send_message(TurnRequested {
-        agent: complete,
-        config: config("good"),
-    });
+    send_request(&mut app, incomplete, "bad");
+    send_request(&mut app, complete, "good");
 
     for _ in 0..256 {
         app.pump().expect("schedule runs");
@@ -1026,18 +1090,19 @@ async fn an_incomplete_agent_does_not_block_a_complete_one() {
 
     let capture = capture(&app);
     assert_eq!(capture.finished.len(), 2);
-    let Err(failure) = &capture.finished[0] else {
-        panic!(
-            "the incomplete agent fails its turn: {:?}",
-            capture.finished
-        );
-    };
-    assert_eq!(
-        failure.kind,
-        TurnFailureKind::MissingCore,
-        "the incomplete agent fails its turn"
+    assert!(
+        capture.finished.iter().any(|result| matches!(
+            result,
+            Err(failure) if failure.kind == TurnFailureKind::MissingCore
+        )),
+        "the incomplete agent fails its turn: {:?}",
+        capture.finished
     );
-    assert_eq!(capture.finished[1], Ok(Outcome::Answered));
+    assert!(
+        capture.finished.contains(&Ok(Outcome::Answered)),
+        "the complete agent still answers: {:?}",
+        capture.finished
+    );
 }
 
 #[test]
@@ -1051,4 +1116,123 @@ fn a_user_message_to_a_non_agent_entity_is_dropped_without_panicking() {
     app.pump().expect("the schedule runs");
 
     assert!(capture(&app).finished.is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_request_settles_it() {
+    let mut app = app(ProviderState::muted());
+    let agent = agent(&app);
+    let seq = seq_of(&app);
+    let sender = app.runtime_sender();
+    let first = seq.next();
+    let second = seq.next();
+    sender
+        .send_message(TurnRequested {
+            id: first,
+            agent,
+            config: config("first"),
+            responder: None,
+        })
+        .expect("runtime is alive");
+    sender
+        .send_message(TurnRequested {
+            id: second,
+            agent,
+            config: config("second"),
+            responder: None,
+        })
+        .expect("runtime is alive");
+    app.pump()
+        .expect("the first turn starts; the second queues");
+
+    sender
+        .send_message(CancelTurn { request: second })
+        .expect("runtime is alive");
+    for _ in 0..256 {
+        app.pump().expect("schedule runs");
+        if capture(&app).ids.contains(&second) {
+            let capture = capture(&app);
+            let failure = capture
+                .ids
+                .iter()
+                .position(|id| *id == second)
+                .map(|index| &capture.finished[index])
+                .expect("the cancelled request has a response");
+            assert!(matches!(
+                failure,
+                Err(TurnFailure {
+                    kind: TurnFailureKind::Cancelled,
+                    ..
+                })
+            ));
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the cancelled request did not finish");
+}
+
+#[tokio::test]
+async fn request_turn_awaits_exactly_one_response() {
+    let mut app = app(ProviderState::default());
+    let agent = agent(&app);
+    let seq = seq_of(&app);
+    let sender = app.runtime_sender();
+    let task = tokio::spawn(async move {
+        crate::host::request_turn(&sender, &seq, agent, config("hello")).await
+    });
+
+    let mut response = None;
+    for _ in 0..256 {
+        app.pump().expect("schedule runs");
+        if task.is_finished() {
+            response = Some(task.await.expect("the request task joins"));
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let response = response.expect("the request finishes").expect("a response");
+    assert!(matches!(
+        response.result,
+        Ok(ref result) if result.outcome == Outcome::Answered
+    ));
+}
+
+#[tokio::test]
+async fn a_pushed_response_arrives_exactly_once_and_the_entity_is_reaped() {
+    let mut app = app(ProviderState::default());
+    let agent = agent(&app);
+    let seq = seq_of(&app);
+    let (tx, rx) = async_channel::bounded(1);
+    let id = seq.next();
+    app.world_mut().send_message(TurnRequested {
+        id,
+        agent,
+        config: config("hello"),
+        responder: Some(TurnResponder::new(tx)),
+    });
+
+    let mut received = None;
+    for _ in 0..256 {
+        app.pump().expect("schedule runs");
+        if let Ok(response) = rx.try_recv() {
+            received = Some(response);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let response = received.expect("the responder receives the response");
+    assert_eq!(response.id, id);
+    assert!(matches!(response.result, Ok(ref result) if result.outcome == Outcome::Answered));
+
+    // 送达后的下一个 tick，推送式请求实体被回收。
+    for _ in 0..4 {
+        app.pump().expect("schedule runs");
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        app.world().entity_with::<TurnResponse>().is_none(),
+        "a pushed request is reaped instead of lingering"
+    );
+    assert!(rx.try_recv().is_err(), "exactly one response is pushed");
 }

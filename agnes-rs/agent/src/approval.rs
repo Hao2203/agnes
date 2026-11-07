@@ -8,6 +8,7 @@
 
 use agnes_core::message::{ToolArguments, ToolCallId};
 use agnes_core::tool::ToolName;
+use agnes_ecs::Entity;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -17,6 +18,8 @@ use tokio::sync::mpsc;
 /// 答覆被丢弃、超时、运行被打断，都按拒绝落定。
 #[derive(Debug)]
 pub struct ApprovalRequest {
+    /// 问询属于哪个 agent；`call_id` 只在 agent 内唯一。
+    pub agent: Entity,
     pub call_id: ToolCallId,
     pub tool_name: ToolName,
     pub arguments: ToolArguments,
@@ -71,6 +74,7 @@ mod tests {
     async fn a_question_travels_to_the_answerer() {
         let (channel, mut questions) = ApprovalChannel::channel(Some(Duration::from_secs(3)));
         let request = ApprovalRequest {
+            agent: Entity::PLACEHOLDER,
             call_id: ToolCallId::new("c1"),
             tool_name: ToolName::from_str("run_shell").unwrap(),
             arguments: ToolArguments::new("{}"),
@@ -86,6 +90,7 @@ mod tests {
     async fn a_second_in_flight_question_is_refused() {
         let (channel, mut questions) = ApprovalChannel::channel(None);
         let make = || ApprovalRequest {
+            agent: Entity::PLACEHOLDER,
             call_id: ToolCallId::new("c1"),
             tool_name: ToolName::from_str("run_shell").unwrap(),
             arguments: ToolArguments::new("{}"),

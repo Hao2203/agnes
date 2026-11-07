@@ -5,10 +5,11 @@
 //! 消息（定义在 `agnes_io::llm`），provider 插件负责编解码与网络往返。
 //!
 //! 入口是 [`runtime::AgentPlugin`]：注册后宿主经 `RuntimeSender` 注入
-//! turn 请求 / 用户消息 / 审批答覆 / 打断，收场结果经
-//! [`runtime::TurnFinished`] 消息交还。工具表用 [`runtime::ToolsPlugin`]
-//! 注册；权限规则用 [`permission::PermissionRules`]；审批问询通道用
-//! [`approval::ApprovalChannel`]。
+//! turn 请求 / 用户消息 / 审批答覆 / 打断。每个请求是一个实体，收场结果
+//! 落在 [`runtime::TurnResponse`] 组件上（可选 [`runtime::TurnResponder`]
+//! 推送）。工具表用 [`runtime::ToolsPlugin`] 注册；权限规则用
+//! [`permission::PermissionRules`]；审批问询通道用
+//! [`approval::ApprovalChannel`]；agent 装配与提交用 [`host`]。
 //!
 //! 异步任务由宿主安装的 `agnes_plugin_async::TokioPlugin`（或
 //! `ExecutorPlugin`）提供，运行时选择与本 crate 无关。
@@ -16,6 +17,7 @@
 pub mod activity;
 pub mod approval;
 mod core;
+pub mod host;
 pub mod model;
 pub mod permission;
 
@@ -25,11 +27,13 @@ pub mod tools;
 pub use activity::{Activity, ActivityPlugin, Phase};
 pub use approval::{ApprovalChannel, ApprovalRequest};
 pub use core::{AgentCore, Inbox};
+pub use host::{AgentBuilder, AgentHandle, RequestError, request_turn, submit_turn};
 pub use model::{ModelPlugin, ModelSettings, ModelSettingsChanged, SetModel, SetThinking};
 pub use permission::{PermissionRules, Rule, RuleError};
 pub use runtime::{
-    ActiveTurn, AgentPlugin, ApprovalDecided, InterruptTurn, RequestBuilderResource, ToolFinished,
-    ToolsPlugin, TurnFailure, TurnFailureKind, TurnFinished, TurnOwner, TurnRequested, UserMessage,
+    ActiveTurn, AgentPlugin, ApprovalDecided, CancelTurn, InterruptTurn, RequestBuilderResource,
+    ToolFinished, ToolsPlugin, TurnFailure, TurnFailureKind, TurnOwner, TurnQueued, TurnRequest,
+    TurnRequestId, TurnRequestSeq, TurnRequested, TurnResponder, TurnResponse, UserMessage,
 };
 
 use agnes_core::llm::LlmRequest;
