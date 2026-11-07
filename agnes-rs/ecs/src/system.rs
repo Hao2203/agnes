@@ -1,3 +1,4 @@
+use std::fmt;
 use std::marker::PhantomData;
 
 use crate::access::AccessSet;
@@ -24,38 +25,87 @@ pub enum SystemError {
         system: &'static str,
         /// The error the system returned.
         #[source]
-        source: BoxError,
+        source: anyhow::Error,
     },
 }
 
-/// A thread-safe error, used for errors returned by systems.
-pub type BoxError = anyhow::Error;
+/// A failure reported by a system function.
+///
+/// System functions may return any error convertible into [`anyhow::Error`].
+/// The runtime wraps it in this crate-owned type so the [`SystemOut`] and
+/// [`SystemParamFunction`] contracts do not expose a third-party error type,
+/// then attributes it to the system as [`SystemError::Failed`].
+///
+/// The original error is preserved: recover it with
+/// [`downcast_ref`](SystemFailure::downcast_ref) or through the `source` field
+/// of [`SystemError::Failed`].
+#[derive(Debug)]
+pub struct SystemFailure(anyhow::Error);
+
+impl SystemFailure {
+    /// Wraps any error convertible into [`anyhow::Error`].
+    pub fn new(source: impl Into<anyhow::Error>) -> Self {
+        Self(source.into())
+    }
+
+    /// The original error, if it has type `E`.
+    pub fn downcast_ref<E>(&self) -> Option<&E>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.0.downcast_ref::<E>()
+    }
+
+    fn into_inner(self) -> anyhow::Error {
+        self.0
+    }
+}
+
+impl From<anyhow::Error> for SystemFailure {
+    fn from(source: anyhow::Error) -> Self {
+        Self(source)
+    }
+}
+
+impl fmt::Display for SystemFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for SystemFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
 
 /// The output of a system function.
 ///
 /// A system function may return nothing or a `Result<(), E>`; an `Err` is
-/// reported to the caller of [`System::run`] as [`SystemError::Failed`].
+/// wrapped in a [`SystemFailure`] and reported to the caller of
+/// [`System::run`] as [`SystemError::Failed`].
 pub trait SystemOut {
     /// Converts the function output into the fallible system result.
     ///
     /// # Errors
     ///
-    /// Returns the error carried by a `Result` output, or `Ok` for `()`.
-    fn into_system_result(self) -> Result<(), BoxError>;
+    /// Returns [`SystemFailure`] carrying the error of a `Result` output, or
+    /// `Ok` for `()`.
+    fn into_system_result(self) -> Result<(), SystemFailure>;
 }
 
 impl SystemOut for () {
-    fn into_system_result(self) -> Result<(), BoxError> {
+    fn into_system_result(self) -> Result<(), SystemFailure> {
         Ok(())
     }
 }
 
 impl<E> SystemOut for Result<(), E>
 where
-    E: Into<BoxError>,
+    E: Into<anyhow::Error>,
 {
-    fn into_system_result(self) -> Result<(), BoxError> {
-        self.map_err(Into::into)
+    fn into_system_result(self) -> Result<(), SystemFailure> {
+        self.map_err(SystemFailure::new)
     }
 }
 
@@ -77,7 +127,8 @@ pub trait System: Send + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`SystemError`] when a required parameter is unavailable.
+    /// Returns [`SystemError`] when a required parameter is unavailable or the
+    /// system function returned an error.
     fn run(&mut self, world: &mut World) -> Result<(), SystemError>;
 }
 
@@ -95,11 +146,11 @@ pub trait SystemParamFunction<Marker>: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns the boxed error when the function itself returned `Err`.
+    /// Returns [`SystemFailure`] when the function itself returned `Err`.
     fn run<'a>(
         &'a mut self,
         input: <Self::In as SystemParam>::Item<'a, 'a>,
-    ) -> Result<(), BoxError>;
+    ) -> Result<(), SystemFailure>;
 }
 
 /// Converts a function into a [`System`].
@@ -184,9 +235,9 @@ where
             } = self;
             let state = state.as_mut().expect("system state initialized above");
             let input = <F::In as SystemParam>::get_param(world, state);
-            function.run(input).map_err(|source| SystemError::Failed {
+            function.run(input).map_err(|failure| SystemError::Failed {
                 system: name,
-                source,
+                source: failure.into_inner(),
             })
         };
 
@@ -214,7 +265,7 @@ macro_rules! impl_system_param_function {
             fn run<'a>(
                 &'a mut self,
                 input: <Self::In as SystemParam>::Item<'a, 'a>,
-            ) -> Result<(), BoxError> {
+            ) -> Result<(), SystemFailure> {
                 fn call_inner<Out, $($param),*>(
                     mut function: impl FnMut($($param),*) -> Out,
                     $($param: $param),*

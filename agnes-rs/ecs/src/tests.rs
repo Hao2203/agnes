@@ -7,7 +7,7 @@ use crate::schedule::Schedule;
 use crate::world::World;
 use crate::{
     App, CancelToken, Commands, Entity, MessageReader, MessageWriter, Plugin, Query, Res, ResMut,
-    ScheduleError, SystemError, Update,
+    ScheduleError, SystemError, SystemFailure, Update,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -720,6 +720,42 @@ fn a_fallible_system_propagates_its_error() {
         .downcast_ref::<Boom>()
         .expect("the original error is preserved");
     assert_eq!(boom.0, "boom");
+}
+
+#[test]
+fn system_failure_preserves_display_downcast_and_source() {
+    let failure = SystemFailure::new(Boom("boom"));
+
+    assert_eq!(failure.to_string(), "boom");
+    let boom = failure.downcast_ref::<Boom>().expect("original error");
+    assert_eq!(boom.0, "boom");
+    let source =
+        std::error::Error::source(&failure).expect("the wrapped error is exposed as the source");
+    assert!(source.downcast_ref::<Boom>().is_some());
+}
+
+fn failing_anyhow(_config: Res<Config>) -> Result<(), anyhow::Error> {
+    Err(anyhow::Error::new(Boom("anyhow")))
+}
+
+#[test]
+fn an_anyhow_system_failure_preserves_its_original_error() {
+    let mut world = World::new();
+    world.insert_resource(Config { value: 1 });
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(failing_anyhow)
+        .expect("fallible systems are supported");
+    let error = schedule.run(&mut world).expect_err("the system fails");
+
+    let SystemError::Failed { source, .. } = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    let boom = source
+        .downcast_ref::<Boom>()
+        .expect("the original error survives the anyhow boundary");
+    assert_eq!(boom.0, "anyhow");
 }
 
 fn fallible_ok(_config: Res<Config>) -> Result<(), Boom> {

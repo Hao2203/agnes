@@ -166,9 +166,6 @@ impl Runner {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RunnerError {
-    /// The async runtime could not be built.
-    #[error("failed to build the async runtime: {0}")]
-    Runtime(#[from] std::io::Error),
     /// A schedule run failed.
     #[error(transparent)]
     System(#[from] SystemError),

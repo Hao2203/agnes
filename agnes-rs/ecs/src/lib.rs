@@ -21,7 +21,7 @@
 //! The runtime initializes per-system state, extracts parameters from the
 //! [`World`], checks access conflicts, and applies deferred [`Commands`].
 //!
-//! A system can also return a [`Result`](std::result::Result) to report
+//! A system can also return a [`Result`] to report
 //! failure to the host:
 //!
 //! ```ignore
@@ -97,7 +97,7 @@ pub use resource::{Res, ResMut, Resource};
 pub use runner::{CancelToken, Runner, RunnerError, RuntimeSendError, RuntimeSender};
 pub use schedule::{Schedule, ScheduleError};
 pub use system::{
-    BoxError, FunctionSystem, IntoSystem, System, SystemError, SystemOut, SystemParamFunction,
+    FunctionSystem, IntoSystem, System, SystemError, SystemFailure, SystemOut, SystemParamFunction,
 };
 pub use system_param::{ParamError, SystemParam};
 pub use world::{Bundle, World};

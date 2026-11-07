@@ -315,9 +315,9 @@ pub fn fail_on_session_failure(
 }
 
 /// 启动不变量：没有 provider 插件时直接失败，而不是让调用消失在消息总线里。
-pub fn require_provider(provider: Option<Res<LlmProvider>>) -> Result<(), BoxError> {
+pub fn require_provider(provider: Option<Res<LlmProvider>>) -> Result<(), anyhow::Error> {
     if provider.is_none() {
-        return Err(BoxError::msg(
+        return Err(anyhow::Error::msg(
             "no LLM provider plugin is installed; add a plugin that installs `LlmProvider`",
         ));
     }
@@ -337,7 +337,7 @@ pub fn issue_model_call(
     mut recorder: Recorder,
     mut outgoing: MessageWriter<LlmCall>,
     mut commands: Commands,
-) -> Result<(), BoxError> {
+) -> Result<(), anyhow::Error> {
     for (entity, owner, mut phase) in phases.iter_mut() {
         if sessions
             .get(owner.0)
@@ -629,7 +629,7 @@ pub fn execute_tools(
     owners: Query<&TurnOwner>,
     mut entries: Query<(Entity, &mut ToolCallEntry)>,
     mut recorder: Recorder,
-) -> Result<(), BoxError> {
+) -> Result<(), anyhow::Error> {
     for (entity, mut entry) in entries.iter_mut() {
         if !matches!(entry.phase, CallPhase::Allowed) {
             continue;
@@ -667,7 +667,7 @@ pub fn execute_tools(
                     output,
                 });
             })
-            .map_err(BoxError::from)?;
+            .map_err(anyhow::Error::from)?;
         entry.phase = CallPhase::Running;
     }
     Ok(())
@@ -937,6 +937,3 @@ pub fn close_turn(
         commands.entity(turn).despawn();
     }
 }
-
-/// 系统错误类型：只有不变量破坏才会走到这里。
-pub(crate) type BoxError = anyhow::Error;

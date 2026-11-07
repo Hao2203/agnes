@@ -152,7 +152,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns [`SystemError`] when a system parameter cannot be prepared.
+    /// Returns [`SystemError`] when a system fails: a required parameter is
+    /// missing or a system function returned an error.
     pub fn update(&mut self) -> Result<(), SystemError> {
         self.run_schedule::<Update>()
     }
@@ -166,7 +167,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns [`SystemError`] when a system parameter cannot be prepared.
+    /// Returns [`SystemError`] when a system fails: a required parameter is
+    /// missing or a system function returned an error.
     pub fn drain(&mut self) -> Result<(), SystemError> {
         const MAX_TICKS: usize = 64;
         for _ in 0..MAX_TICKS {
@@ -183,7 +185,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns [`SystemError`] when a system parameter cannot be prepared.
+    /// Returns [`SystemError`] when a system fails: a required parameter is
+    /// missing or a system function returned an error.
     pub fn run_schedule<L: ScheduleLabel>(&mut self) -> Result<(), SystemError> {
         let Self {
             world, schedules, ..
@@ -198,7 +201,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns [`SystemError`] when a system parameter cannot be prepared.
+    /// Returns [`SystemError`] when a system fails: a required parameter is
+    /// missing or a system function returned an error.
     pub fn pump(&mut self) -> Result<(), SystemError> {
         while let Some(events) = self.events.as_ref() {
             match events.try_recv() {
